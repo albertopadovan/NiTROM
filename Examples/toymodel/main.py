@@ -9,7 +9,7 @@ import pymanopt.manifolds as manifolds
 import pymanopt.optimizers as optimizers
 
 from NiTROM_GPU.Optimization_Functions import classes, nitrom_functions
-from NiTROM_GPU.PyManopt_Functions.my_pymanopt_classes import myAdaptiveLineSearcher
+from NiTROM_GPU.PyManopt_Functions.my_pymanopt_classes import myGPUAdaptiveLineSearcher
 from NiTROM_GPU.PyTorch_Functions import gpu_utils
 import fom_class_pytorch
 
@@ -79,7 +79,7 @@ M = manifolds.Product([Gr,St,Euc_rr,Euc_rrr])
 cost, grad, hess = nitrom_functions.create_objective_and_gradient(M,opt_obj,pool,fom)
 problem = pymanopt.Problem(M,cost,euclidean_gradient=grad)
 
-line_searcher = myAdaptiveLineSearcher(contraction_factor=0.5,sufficient_decrease=0.85,max_iterations=25,initial_step_size=1)
+line_searcher = myGPUAdaptiveLineSearcher(contraction_factor=0.5,sufficient_decrease=0.85,max_iterations=25,initial_step_size=1)
 optimizer = optimizers.ConjugateGradient(max_iterations=40,min_step_size=1e-20,max_time=3600,line_searcher=line_searcher,log_verbosity=1,verbosity=verb)
 
 point = [None]*4
@@ -88,7 +88,7 @@ if rank == 0:
     point[1] = np.load(traj_path + "Psi_pod.npy")
     point[2] = np.load(traj_path + "A2.npy")
     point[3] = np.load(traj_path + "A3.npy")
-dist.broadcast_object_list(point,src=0)
+# dist.broadcast_object_list(point,src=0)
 point = tuple(point)
 cost_val = cost(*point)
 grad_val = grad(*point)
@@ -98,8 +98,8 @@ for tensor in grad_val:
 if rank == 0:
     print(cost_val)
     print(norm)
-torch.distributed.barrier()
-raise Exception("Stopping here to check initial cost.")
+# torch.distributed.barrier()
+# raise Exception("Stopping here to check initial cost.")
 
 result = optimizer.run(problem,initial_point=point)
 

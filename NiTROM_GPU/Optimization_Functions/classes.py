@@ -227,7 +227,7 @@ class optimization_objects:
             Optional keyword arguments:
                 'forcing_interp':   a PyTorch interpolator f that gives us a forcing f(t)
         """
-        if torch.linalg.vector_norm(z) >= 1e4:    
+        if torch.linalg.vector_norm(z) >= 1e6:    
             dzdt = 0.0*z 
         else:
             f = kwargs.get('forcing_interp',None)
@@ -253,7 +253,7 @@ class optimization_objects:
             Optional keyword arguments:
                 'forcing_interp':   a PyTorch interpolator f that gives us a forcing f(t)
         """
-        if torch.linalg.vector_norm(z) >= 1e4:
+        if torch.linalg.vector_norm(z) >= 1e6:
             dzdt = 0.0*z 
         else:
             f = kwargs.get('forcing_interp',None)
@@ -278,7 +278,7 @@ class optimization_objects:
             operators:  (A2,A3,A4,...)
         """
         
-        if torch.linalg.vector_norm(z) >= 1e4:
+        if torch.linalg.vector_norm(z) >= 1e6:
             dzdt = 0.0*z
         else:
             J = torch.zeros((len(z),len(z)),device=z.device,dtype=z.dtype)
@@ -307,7 +307,7 @@ class optimization_objects:
             operators:  (A2,A3,A4,...)
         """
 
-        if torch.linalg.vector_norm(z) >= 1e4:
+        if torch.linalg.vector_norm(z) >= 1e6:
             dzdt = 0.0*z
         else:
             J = torch.zeros((len(z),len(z)),device=z.device,dtype=z.dtype)

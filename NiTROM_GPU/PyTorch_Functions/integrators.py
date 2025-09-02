@@ -139,19 +139,24 @@ def my_etdrk4(etdrk4_coefs, fun_nonlinear, t_vec, x0, args=()):
     x = x0.clone().detach()
 
     for m in range(1, n_steps + 1):
-        t = t_vec_internal[m-1]
-        N1 = fun_nonlinear(t, x, *args)
-        an = E2 @ x + phi @ N1
-        N2 = fun_nonlinear(t + dt/2, an, *args)
-        bn = E2 @ x + phi @ N2
-        N3 = fun_nonlinear(t + dt/2, bn, *args)
-        cn = E2 @ an + phi @ (2 * N3 - N1)
-        N4 = fun_nonlinear(t + dt, cn, *args)
+        if torch.linalg.vector_norm(x) > 1e6:
+            if m % internal_steps == 0:
+                idx = m // internal_steps
+                xs[:, idx] = x.real
+        else:
+            t = t_vec_internal[m-1]
+            N1 = fun_nonlinear(t, x, *args)
+            an = E2 @ x + phi @ N1
+            N2 = fun_nonlinear(t + dt/2, an, *args)
+            bn = E2 @ x + phi @ N2
+            N3 = fun_nonlinear(t + dt/2, bn, *args)
+            cn = E2 @ an + phi @ (2 * N3 - N1)
+            N4 = fun_nonlinear(t + dt, cn, *args)
 
-        x = E @ x + dt**(-2) * L_inv3 @ (coef1 @ N1 + coef2 @ (N2 + N3) + coef3 @ N4)
-        if m % internal_steps == 0:
-            idx = m // internal_steps
-            xs[:, idx] = x.real
+            x = E @ x + dt**(-2) * L_inv3 @ (coef1 @ N1 + coef2 @ (N2 + N3) + coef3 @ N4)
+            if m % internal_steps == 0:
+                idx = m // internal_steps
+                xs[:, idx] = x.real
 
     return xs.real
 

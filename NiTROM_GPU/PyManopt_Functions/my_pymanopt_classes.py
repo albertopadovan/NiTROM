@@ -1,3 +1,5 @@
+import numpy as np
+
 class myAdaptiveLineSearcher:
     """Adaptive line-search algorithm."""
 
@@ -25,19 +27,30 @@ class myAdaptiveLineSearcher:
             alpha = self._initial_step_size / norm_d
         alpha = float(alpha)
 
-        newx = manifold.retraction(x, alpha * d)
+        try:
+            newx = manifold.retraction(x, alpha * d)
+        except np.linalg.LinAlgError:  # Added by Cole: catches singular matrix error
+            if self._rank == 0: print("Singular matrix encountered, reducing step size.")
+            alpha *= self._contraction_factor
+            newx = manifold.retraction(x, alpha * d)
         newf = objective(newx)
-        cost_evaluations = 1
+        cost_evaluations = 0
 
         while (
             newf > f0 + self._sufficient_decrease * alpha * df0
             and cost_evaluations <= self._max_iterations
         ):
+            if self._rank == 0: print('Test 1')
             # Reduce the step size.
             alpha *= self._contraction_factor
 
             # Look closer down the line.
-            newx = manifold.retraction(x, alpha * d)
+            try:
+                newx = manifold.retraction(x, alpha * d)
+            except np.linalg.LinAlgError:  # Added by Cole
+                alpha *= self._contraction_factor
+                cost_evaluations += 1
+                continue
             newf = objective(newx)
 
             cost_evaluations += 1
@@ -56,6 +69,7 @@ class myAdaptiveLineSearcher:
                 newf > 1.01*f0 and cost_evaluations <= self._max_iterations
             ):
                 # Reduce the step size.
+                if self._rank == 0: print('Test 2')
                 alpha *= self._contraction_factor
 
                 # Look closer down the line.
@@ -94,5 +108,6 @@ class myAdaptiveLineSearcher:
         #     print("Resetting _old_alpha. Alpha = %1.5e"%(alpha))
         # ## -------------------------
         self._oldalpha = None
+        # print(alpha)
 
         return step_size, newx

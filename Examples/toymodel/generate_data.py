@@ -32,7 +32,8 @@ n_traj = 4
 
 max_val = 5/20
 
-betas = np.asarray([0.01,0.05,0.1,0.12,0.15,0.2,0.21,0.248])
+# betas = np.asarray([0.01,0.05,0.1,0.12,0.15,0.2,0.21,0.248])
+betas = np.asarray([0.01,0.1,0.2,0.248])
 n_traj = len(betas)
 weights = np.zeros(len(betas))
 for k in range (len(betas)):

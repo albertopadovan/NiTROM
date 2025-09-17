@@ -139,18 +139,10 @@ class optimization_objects:
         self.poly_comp = poly_comp
         self.generate_einsum_subscripts()
 
-        if pool.world_size > 1:
-            local_n_traj = torch.tensor([self.my_n_traj], device=pool.device)
-            all_local_counts = [torch.zeros_like(local_n_traj) for _ in range(pool.world_size)]
-            dist.all_gather(all_local_counts, local_n_traj)
-            self.total_n_traj = sum([count.item() for count in all_local_counts])
-        else:
-            self.total_n_traj = self.my_n_traj
-
         # Count the total number of trajectories in this batch and
         # scale the weight accordingly so that the cost function measures
         # the average error over snapshots and trajectories.
-        self.weights *= self.total_n_traj*self.n_snapshots
+        self.weights *= pool.n_traj*self.n_snapshots
         
         # Parse the keyword arguments
         self.which_fix = kwargs.get('which_fix','fix_none')

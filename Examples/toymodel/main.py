@@ -88,7 +88,7 @@ if rank == 0:
     point[1] = np.load(traj_path + "Psi_pod.npy")
     point[2] = np.load(traj_path + "A2.npy")
     point[3] = np.load(traj_path + "A3.npy")
-# dist.broadcast_object_list(point,src=0)
+if world_size > 1: dist.broadcast_object_list(point,src=0)
 point = tuple(point)
 phi = torch.tensor(point[0],device=device,dtype=torch.float64)
 cost_val = cost(*point)

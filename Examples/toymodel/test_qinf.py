@@ -91,7 +91,6 @@ if rank == 0:
 if world_size > 1: dist.broadcast_object_list(point,src=0)
 point = tuple(point)
 phi = torch.tensor(point[0],device=device,dtype=torch.float64)
-A = torch.tensor(point[2],device=device,dtype=torch.float64)
 cost_val = cost(*point)
 grad_val = grad(*point)
 norm = 0
@@ -102,18 +101,7 @@ if rank == 0:
     print(norm)
 lambdas = [0.0, 0.0]
 A, H = opinf_fun_ep.opinf_ep(pool, phi, lambdas)
-if rank == 0: print(A, H)
-A = A.cpu().numpy()
-H = H.cpu().numpy()
-point = (point[0], point[1], A, H)
-cost_val = cost(*point)
-grad_val = grad(*point)
-norm = 0
-for tensor in grad_val:
-    norm += np.linalg.norm(tensor)
-if rank == 0:
-    print(cost_val)
-    print(norm)
+print(A, H)
 # torch.distributed.barrier()
 # raise Exception("Stopping here to check initial cost.")
 

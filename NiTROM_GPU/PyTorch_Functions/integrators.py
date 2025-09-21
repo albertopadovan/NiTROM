@@ -14,7 +14,7 @@ def rk4_step(fun, t, x, dt, args=()):
     return x_new
 
 
-def my_rk4_adaptive(fun, t_vec, x0, args=(), *, atol=1e-6, rtol=1e-3, safety_factor=0.8, fac_min=0.1, fac_max=5.0):
+def my_rk4_adaptive(fun, t_vec, x0, pool, args=(), *, atol=1e-6, rtol=1e-3, safety_factor=0.8, fac_min=0.1, fac_max=5.0):
     """
     Integrates a system of ordinary differential equations using an adaptive fourth-order Runge-Kutta (RK4) method.
     Compatible with pyTorch tensors.
@@ -53,7 +53,9 @@ def my_rk4_adaptive(fun, t_vec, x0, args=(), *, atol=1e-6, rtol=1e-3, safety_fac
             exponent = 1.0/(4.0+1.0)
             dt_new = dt_trial * safety_factor * (1.0/err)**exponent
             dt = torch.clamp(dt_new, min=dt*fac_min, max=dt*fac_max)
-            dt = (t_vec[1] - t_vec[0])/10
+            # dt = (t_vec[1] - t_vec[0])/10
+            # if pool.rank == 0:
+            #     print(t)
         xs[:, i] = x
 
     return xs
@@ -121,7 +123,7 @@ def etdrk4_setup(linop, dt):
 
 
 def my_etdrk4(etdrk4_coefs, fun_nonlinear, t_vec, x0, args=()):
-    internal_steps = 1
+    internal_steps = 5
     dtype = torch.complex128
     x0 = x0.to(dtype)
     args = tuple(arg.to(dtype) if isinstance(arg, torch.Tensor) else arg for arg in args)

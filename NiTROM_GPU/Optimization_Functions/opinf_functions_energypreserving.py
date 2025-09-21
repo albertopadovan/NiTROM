@@ -22,6 +22,7 @@ def opinf_ep(pool, phi, lambdas):
 
     # Iterate through rows to compute parts of A and H
     for i in range(r):
+        if pool.rank == 0: print(f'{i+1}/{r}')
         F = dZ - H @ vkronf
 
         # Build vkron of remaining pairs
@@ -46,8 +47,11 @@ def opinf_ep(pool, phi, lambdas):
         reg[:r, :r] *= lambdas[0]
         reg[r:, r:] *= lambdas[1]
         lhs_local += reg
+        del reg
         L = torch.linalg.cholesky(lhs_local)
+        del lhs_local
         G = torch.cholesky_solve(rhs_local.unsqueeze(-1), L).squeeze(-1)
+        del rhs_local
 
         A[i, :] = G[:r]
         offset = r
@@ -62,5 +66,7 @@ def opinf_ep(pool, phi, lambdas):
         for j in range(r):
             zstart = r * j
             H[i:r, zstart + i] = -H[i, zstart + i : zstart + r]
+        
+        del vkron, D_local, D_w, f_w, F, L, G, rows
     
-    return A, H.reshape(r, r, r)
+    return  A, H.reshape(r, r, r)

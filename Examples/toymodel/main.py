@@ -115,41 +115,7 @@ if rank == 0:
     print(cost_val)
     print(norm)
 # torch.distributed.barrier()
-# raise Exception("Stopping here to check initial cost.")
-
-
 
 # result = optimizer.run(problem,initial_point=point)
-
-# if rank == 0:
-#     Phi_nit = result.point[0]
-#     Psi_nit = result.point[1]
-#     Phi_nit = Phi_nit@scipy.linalg.inv(Psi_nit.T@Phi_nit)
-#     tensors_nit = tuple(result.point[2:])
-
-#     np.save('results/Phi_nit_gpu_fast.npy',Phi_nit)
-#     np.save('results/Psi_nit_gpu_fast.npy',Psi_nit)
-#     np.save('results/A2_nit_gpu_fast.npy',tensors_nit[0])
-#     np.save('results/A3_nit_gpu_fast.npy',tensors_nit[1])
-
-#     itervec_nit = result.log["iterations"]["iteration"]
-#     costvec_nit = result.log["iterations"]["cost"]
-#     gradvec_nit = result.log["iterations"]["gradient_norm"]
-
-#     np.save('results/nitrom_gpu_itervec_fast.npy',itervec_nit)
-#     np.save('results/nitrom_gpu_costvec_fast.npy',costvec_nit)
-#     np.save('results/nitrom_gpu_gradvec_fast.npy',gradvec_nit)
-
-#     plt.figure()
-#     plt.plot(itervec_nit,costvec_nit,color=cOPT,linestyle=lOPT,label='NiTROM')
-
-#     ax = plt.gca()
-#     ax.set_yscale('log')
-#     ax.set_xlabel('Conj. gradient iteration')
-#     ax.set_ylabel('Cost')
-
-#     plt.legend()
-#     plt.tight_layout()
-#     plt.show()
 
 gpu_utils.cleanup_distributed()

@@ -23,7 +23,7 @@ def setup_distributed_gpus():
         dist.barrier(device_ids=[local_rank])
         return device, rank, world_size
 
-    # single‑GPU fallback
+    # single‑GPU/CPU fallback
     if torch.cuda.is_available():
         return torch.device("cuda"), 0, 1
     else:

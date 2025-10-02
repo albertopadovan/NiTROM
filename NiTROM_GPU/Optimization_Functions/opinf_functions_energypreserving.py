@@ -2,6 +2,11 @@ import torch
 import torch.distributed as dist
 
 def opinf_ep(pool, phi, lambdas):
+    '''
+    Perform operator inference on a set of trajectories to fit a quadratic model
+    where the quadratic term is energy-preserving
+    see https://arxiv.org/abs/2503.10824 for details
+    '''
     # Assemble and preallocate tensors for OpInf EP
     m_local = pool.n_snapshots*pool.my_n_traj
     r = phi.shape[-1]

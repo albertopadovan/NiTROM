@@ -4,14 +4,12 @@ import torch
 import torch.distributed as dist
 from string import ascii_lowercase as ascii
 import pymanopt
-import matplotlib.pyplot as plt
 
 import time as tlib
-from ..PyTorch_Functions.integrators import my_etdrk4, etdrk4_setup, my_rk4_adaptive
+from ..PyTorch_Functions.integrators import my_etdrk4, etdrk4_setup
 from ..PyTorch_Functions.linear_interpolation import Interp1D
 
 def create_objective_and_gradient(manifold,opt_obj,pool,fom):
-# def create_objective_and_gradient(manifold,opt_obj,pool,fom,k_out,axs):
     
     """
     opt_obj:        instance of class "optimization_objects" in file "classes.py"
@@ -39,38 +37,18 @@ def create_objective_and_gradient(manifold,opt_obj,pool,fom):
         D, V = torch.linalg.eig(tensors[0])
         V_inv = torch.linalg.inv(V)
         linop = V, D, V_inv
-        dt = (opt_obj.time[1] - opt_obj.time[0])/5
+        internal_steps = 5
+        dt = (opt_obj.time[1] - opt_obj.time[0])/internal_steps
         etdrk4_coefs = etdrk4_setup(linop, dt)
 
         J = 0.0
         for k in range (pool.my_n_traj):
-            k_glob = pool.traj_indices[k]
-            # print("Rank %d, trajectory %d"%(pool.rank,k_glob))
-
             # Integrate the reduced-order model from time t = 0 to the final time 
             # specified by the last snapshot in the training trajectory
             z0 = Psi.T@opt_obj.X[k,:,0]
             u = Psi.T@opt_obj.F[:,k]
-            sol = my_etdrk4(etdrk4_coefs,opt_obj.evaluate_rom_rhs_nonlinear,opt_obj.time,z0,args=(u,)+tensors)
-            # sol = my_rk4_adaptive(opt_obj.evaluate_rom_rhs,opt_obj.time,z0,pool,args=(u,)+tensors)
+            sol = my_etdrk4(etdrk4_coefs,opt_obj.evaluate_rom_rhs_nonlinear,opt_obj.time,z0,internal_steps,args=(u,)+tensors)
             e = fom.compute_output(opt_obj.X[k,:,:]) - fom.compute_output(PhiF@sol)
-            # tensors_lin = (tensors[0],) + tuple(0*tensor for tensor in tensors[1:])
-            # sol_linear = my_rk4_adaptive(opt_obj.evaluate_rom_rhs,opt_obj.time,z0,pool,args=(u,)+tensors_lin)
-            # energy = torch.linalg.vector_norm(fom.compute_output(PhiF@sol),dim=0)
-            # energy_linear = torch.linalg.vector_norm(fom.compute_output(PhiF@sol_linear),dim=0)
-            # energy_fom = torch.linalg.vector_norm(fom.compute_output(opt_obj.X[k,:,:]),dim=0)
-            # plt.figure()
-            # plt.plot(opt_obj.time.cpu().numpy(), energy.cpu().numpy(), label='ROM')
-            # plt.plot(opt_obj.time.cpu().numpy(), energy_linear.cpu().numpy(), label='Linear ROM', linestyle=':')
-            # plt.plot(opt_obj.time.cpu().numpy(), energy_fom.cpu().numpy(), label='FOM', linestyle='--')
-            # plt.title("Energy of output of traj %d"%(k_glob))
-            # plt.xlabel("Snapshot")
-            # plt.ylabel("Energy")
-            # plt.grid()
-            # plt.legend()
-            # plt.tight_layout()
-            # plt.savefig("figures/energy_trajectory_%d_etdrk4.png"%(k_glob), dpi=300)
-            # plt.close()
             J += (1./opt_obj.weights[k])*torch.trace(e.T@e)
 
         if opt_obj.l2_pen is not None and pool.rank == 0:
@@ -103,7 +81,8 @@ def create_objective_and_gradient(manifold,opt_obj,pool,fom):
         V_inv = torch.linalg.inv(V)
         linop = V, D, V_inv
         linop_T = V_inv.T, D, V.T
-        dt = (opt_obj.time[1] - opt_obj.time[0])/5
+        internal_steps = 5
+        dt = (opt_obj.time[1] - opt_obj.time[0])/internal_steps
         dt2 = dt / (opt_obj.nsave_rom-1)
         etdrk4_coefs = etdrk4_setup(linop, dt)
         etdrk4_coefs_2 = etdrk4_setup(linop, dt2)
@@ -134,12 +113,12 @@ def create_objective_and_gradient(manifold,opt_obj,pool,fom):
 
             z0 = Psi.T@opt_obj.X[k,:,0]
             u = Psi.T@opt_obj.F[:,k]
-            sol = my_etdrk4(etdrk4_coefs,opt_obj.evaluate_rom_rhs_nonlinear,opt_obj.time,z0,args=(u,)+tensors)
+            sol = my_etdrk4(etdrk4_coefs,opt_obj.evaluate_rom_rhs_nonlinear,opt_obj.time,z0,internal_steps,args=(u,)+tensors)
             Z = sol
             X_z = PhiF@Z
             e = fom.compute_output(opt_obj.X[k,:,:]) - fom.compute_output(PhiF@Z)
             Cte = fom.compute_output_derivative(PhiF@Z).T@e
-            # Cte = e.clone()
+            # Cte = e.clone()  # Use if the output is the full state
             PCte = PhiF.T@Cte
             alpha = opt_obj.weights[k]
             
@@ -178,14 +157,14 @@ def create_objective_and_gradient(manifold,opt_obj,pool,fom):
                     print(time_rom_j[-1],tf_j)
                     raise ValueError("Error in euclidean_gradient() - final time is not correct!")
 
-                sol_j = my_etdrk4(etdrk4_coefs_2,opt_obj.evaluate_rom_rhs_nonlinear,time_rom_j,z0_j,args=(u,)+tensors)
+                sol_j = my_etdrk4(etdrk4_coefs_2,opt_obj.evaluate_rom_rhs_nonlinear,time_rom_j,z0_j,internal_steps,args=(u,)+tensors)
                 Z_j = torch.fliplr(sol_j)
                 fZ = Interp1D(time_rom_j,Z_j,extrapolate=True)
                 # --------------------------------------------------------------------------
 
                 # ------ Compute the adj ROM solution between times t0_j and tf_j ----------
                 lam_j_0 += (2/alpha)*PCtej
-                sol_lam = my_etdrk4(etdrk4_coefs_T2,opt_obj.evaluate_rom_adjoint_nonlinear,time_rom_j,lam_j_0,args=(fZ,)+tensors)
+                sol_lam = my_etdrk4(etdrk4_coefs_T2,opt_obj.evaluate_rom_adjoint_nonlinear,time_rom_j,lam_j_0,internal_steps,args=(fZ,)+tensors)
                 Lam = torch.fliplr(sol_lam)
                 lam_j_0 = Lam[:,0]
                 Z_j = torch.fliplr(Z_j)

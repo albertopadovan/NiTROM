@@ -240,7 +240,7 @@ class optimization_objects:
             t:          time instance
             z:          state vector
             u:          a steady forcing vector
-            operators:  (A2,A3,A4,...)
+            operators:  (A3,A4,...)
             
             Optional keyword arguments:
                 'forcing_interp':   a PyTorch interpolator f that gives us a forcing f(t)
@@ -296,7 +296,7 @@ class optimization_objects:
             z:          state vector
             fq:         PyTorch interpolator to evaluate the
                         base flow at time t
-            operators:  (A2,A3,A4,...)
+            operators:  (A3,A4,...)
         """
 
         if torch.linalg.vector_norm(z) >= 1e6:

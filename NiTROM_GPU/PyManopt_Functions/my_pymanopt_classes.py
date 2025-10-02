@@ -208,11 +208,6 @@ class myGPUAdaptiveLineSearcher:
         else:
             self._oldalpha = 100 * alpha # Modified by Alby: used to be 2 * alpha
 
-        # ## ------- Introduced by Alby 
-        # if alpha <= 1e-7: 
-        #     self._oldalpha = None
-        #     print("Resetting _old_alpha. Alpha = %1.5e"%(alpha))
-        # ## -------------------------
         self._oldalpha = None
 
         return step_size, newx

@@ -37,7 +37,7 @@ def create_objective_and_gradient(manifold,opt_obj,pool,fom):
         D, V = torch.linalg.eig(tensors[0])
         V_inv = torch.linalg.inv(V)
         linop = V, D, V_inv
-        internal_steps = 5
+        internal_steps = 1
         dt = (opt_obj.time[1] - opt_obj.time[0])/internal_steps
         etdrk4_coefs = etdrk4_setup(linop, dt)
 
@@ -81,7 +81,7 @@ def create_objective_and_gradient(manifold,opt_obj,pool,fom):
         V_inv = torch.linalg.inv(V)
         linop = V, D, V_inv
         linop_T = V_inv.T, D, V.T
-        internal_steps = 5
+        internal_steps = 1
         dt = (opt_obj.time[1] - opt_obj.time[0])/internal_steps
         dt2 = dt / (opt_obj.nsave_rom-1)
         etdrk4_coefs = etdrk4_setup(linop, dt)

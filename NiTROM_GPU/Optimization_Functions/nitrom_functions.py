@@ -27,7 +27,6 @@ def create_objective_and_gradient(manifold,opt_obj,pool,fom):
             Phi and Psi:    bases (size N x r) that define the projection operator
             tensors:        (A2,A3,...)
         """
-        
         Phi, Psi = params[0], params[1]
         tensors = params[2:]
 
@@ -38,17 +37,17 @@ def create_objective_and_gradient(manifold,opt_obj,pool,fom):
         D, V = torch.linalg.eig(tensors[0])
         V_inv = torch.linalg.inv(V)
         linop = V, D, V_inv
-        dt = opt_obj.time[1] - opt_obj.time[0]
+        internal_steps = 1
+        dt = (opt_obj.time[1] - opt_obj.time[0])/internal_steps
         etdrk4_coefs = etdrk4_setup(linop, dt)
 
         J = 0.0
         for k in range (pool.my_n_traj):
-            
             # Integrate the reduced-order model from time t = 0 to the final time 
             # specified by the last snapshot in the training trajectory
             z0 = Psi.T@opt_obj.X[k,:,0]
             u = Psi.T@opt_obj.F[:,k]
-            sol = my_etdrk4(etdrk4_coefs,opt_obj.evaluate_rom_rhs_nonlinear,opt_obj.time,z0,args=(u,)+tensors)
+            sol = my_etdrk4(etdrk4_coefs,opt_obj.evaluate_rom_rhs_nonlinear,opt_obj.time,z0,internal_steps,args=(u,)+tensors)
             e = fom.compute_output(opt_obj.X[k,:,:]) - fom.compute_output(PhiF@sol)
             J += (1./opt_obj.weights[k])*torch.trace(e.T@e)
 
@@ -82,7 +81,8 @@ def create_objective_and_gradient(manifold,opt_obj,pool,fom):
         V_inv = torch.linalg.inv(V)
         linop = V, D, V_inv
         linop_T = V_inv.T, D, V.T
-        dt = opt_obj.time[1] - opt_obj.time[0]
+        internal_steps = 1
+        dt = (opt_obj.time[1] - opt_obj.time[0])/internal_steps
         dt2 = dt / (opt_obj.nsave_rom-1)
         etdrk4_coefs = etdrk4_setup(linop, dt)
         etdrk4_coefs_2 = etdrk4_setup(linop, dt2)
@@ -91,14 +91,14 @@ def create_objective_and_gradient(manifold,opt_obj,pool,fom):
         
         # Initialize arrays to store the gradients
         n, r = Phi.shape
-        grad_Phi = torch.zeros((n,r), device=pool.device)
-        grad_Psi = torch.zeros((n,r), device=pool.device)
+        grad_Phi = torch.zeros((n,r), device=pool.device, dtype=Phi.dtype)
+        grad_Psi = torch.zeros((n,r), device=pool.device, dtype=Phi.dtype)
         grad_tensors = [torch.zeros_like(tensor) for tensor in tensors]
         
 
         # Initialize arrays needed for future computations
         lam_j_0 = torch.zeros(r, device=pool.device, dtype=Phi.dtype)
-        Int_lambda = torch.zeros(r, device=pool.device)
+        Int_lambda = torch.zeros(r, device=pool.device, dtype=Phi.dtype)
         
         # Biorthogonalize Phi and Psi
         F = torch.linalg.inv(Psi.T@Phi)
@@ -113,24 +113,35 @@ def create_objective_and_gradient(manifold,opt_obj,pool,fom):
 
             z0 = Psi.T@opt_obj.X[k,:,0]
             u = Psi.T@opt_obj.F[:,k]
-            sol = my_etdrk4(etdrk4_coefs,opt_obj.evaluate_rom_rhs_nonlinear,opt_obj.time,z0,args=(u,)+tensors)
+            sol = my_etdrk4(etdrk4_coefs,opt_obj.evaluate_rom_rhs_nonlinear,opt_obj.time,z0,internal_steps,args=(u,)+tensors)
             Z = sol
+            X_z = PhiF@Z
             e = fom.compute_output(opt_obj.X[k,:,:]) - fom.compute_output(PhiF@Z)
+            Cte = fom.compute_output_derivative(PhiF@Z).T@e
+            # Cte = e.clone()  # Use if the output is the full state
+            PCte = PhiF.T@Cte
             alpha = opt_obj.weights[k]
             
             lam_j_0 *= 0.0
             Int_lambda *= 0.0
-            
+
+            PsiPCte = Psi@PCte
+            C_minus = Cte - PsiPCte
+            FZ = F@Z
+
+            # grad_Psi = grad_Psi + (2/alpha) * X_part @ PCte_part.T
+            # grad_Phi = -(2/alpha) * C_minus_part @ FZ_part.T
+            grad_Psi.addmm_(X_z, PCte.T, beta=1.0, alpha=(2.0/alpha))
+            grad_Phi.addmm_(C_minus, FZ.T, beta=1.0, alpha=-(2.0/alpha))
+
+
             for j in range (opt_obj.n_snapshots - 1):
-                ej = e[:,opt_obj.n_snapshots - j - 1]
-                zj = Z[:,opt_obj.n_snapshots - j - 1]
-                Ctej = fom.compute_output_derivative(PhiF@zj).T@ej
+                PCtej = PCte[:,opt_obj.n_snapshots - j - 1]
 
                 # Compute the sums in (2.13) and (2.14) in the arXiv paper. Notice that this loop sums backwards
                 # from j = N-1 to j = 1, so we will compute the term j = 0 after this loop 
-                grad_Psi += (2/alpha)*torch.einsum('i,j',PhiF@zj,PhiF.T@Ctej)
-                grad_Phi += -(2/alpha)*torch.einsum('i,j',Ctej - Psi@(PhiF.T@Ctej),F@zj)
-
+                # grad_Psi += (2/alpha)*torch.einsum('i,j',x_zj,PCtej)
+                # grad_Phi += -(2/alpha)*torch.einsum('i,j',Ctej - Psi@PCtej,F@zj)
 
                 # ------ Compute the fwd ROM solution between times t0_j and tf_j ---------
                 id1 = opt_obj.n_snapshots - 1 - j
@@ -146,14 +157,14 @@ def create_objective_and_gradient(manifold,opt_obj,pool,fom):
                     print(time_rom_j[-1],tf_j)
                     raise ValueError("Error in euclidean_gradient() - final time is not correct!")
 
-                sol_j = my_etdrk4(etdrk4_coefs_2,opt_obj.evaluate_rom_rhs_nonlinear,time_rom_j,z0_j,args=(u,)+tensors)
+                sol_j = my_etdrk4(etdrk4_coefs_2,opt_obj.evaluate_rom_rhs_nonlinear,time_rom_j,z0_j,internal_steps,args=(u,)+tensors)
                 Z_j = torch.fliplr(sol_j)
                 fZ = Interp1D(time_rom_j,Z_j,extrapolate=True)
                 # --------------------------------------------------------------------------
 
                 # ------ Compute the adj ROM solution between times t0_j and tf_j ----------
-                lam_j_0 += (2/alpha)*PhiF.T@Ctej
-                sol_lam = my_etdrk4(etdrk4_coefs_T2,opt_obj.evaluate_rom_adjoint_nonlinear,time_rom_j,lam_j_0,args=(fZ,)+tensors)
+                lam_j_0 += (2/alpha)*PCtej
+                sol_lam = my_etdrk4(etdrk4_coefs_T2,opt_obj.evaluate_rom_adjoint_nonlinear,time_rom_j,lam_j_0,internal_steps,args=(fZ,)+tensors)
                 Lam = torch.fliplr(sol_lam)
                 lam_j_0 = Lam[:,0]
                 Z_j = torch.fliplr(Z_j)
@@ -180,15 +191,12 @@ def create_objective_and_gradient(manifold,opt_obj,pool,fom):
                         grad_tensors[count] -= a*wlg[i]*torch.einsum(equation,*operands)
                     
             
-            # Add the term j = 0 in the sums (2.13) and (2.14). Also add the  
-            # contribution of the initial condition (last term in (2.14)) to grad_Psi.
+            # Add the contribution of the initial condition (last term in (2.14)) to grad_Psi.
             # Add also the contribution of the steady forcing to grad_Psi.
-            ej, zj = e[:,0], Z[:,0]
-            Ctej = fom.compute_output_derivative(PhiF@zj).T@ej
-            grad_Psi += (2/alpha)*torch.einsum('i,j',PhiF@zj,PhiF.T@Ctej) \
-                        - torch.einsum('i,j',opt_obj.X[k,:,0],lam_j_0) \
-                        - torch.einsum('i,j',opt_obj.F[:,k],Int_lambda)
-            grad_Phi += -(2/alpha)*torch.einsum('i,j',Ctej - Psi@(PhiF.T@Ctej),F@zj)
+            x0 = opt_obj.X[k,:,0]
+            f_k = opt_obj.F[:,k]
+            grad_Psi.add_(-torch.outer(x0, lam_j_0))
+            grad_Psi.add_(-torch.outer(f_k, Int_lambda))
 
         # Compute the gradient of the stability-promoting term
         if opt_obj.l2_pen is not None and pool.rank == 0:
@@ -216,9 +224,12 @@ def create_objective_and_gradient(manifold,opt_obj,pool,fom):
                     grad_tensors[idx] += -a*wlg[i]*torch.einsum('i,j',Muk[:,i],Zk[:,i])
 
         if pool.world_size > 1:
+            grad_Phi = grad_Phi.contiguous()
+            grad_Psi = grad_Psi.contiguous()
             dist.all_reduce(grad_Phi, op=dist.ReduceOp.SUM)
             dist.all_reduce(grad_Psi, op=dist.ReduceOp.SUM)
             for k in range (len(grad_tensors)):
+                grad_tensors[k] = grad_tensors[k].contiguous()
                 dist.all_reduce(grad_tensors[k], op=dist.ReduceOp.SUM)
 
         if opt_obj.which_fix == 'fix_bases':

@@ -139,18 +139,10 @@ class optimization_objects:
         self.poly_comp = poly_comp
         self.generate_einsum_subscripts()
 
-        if pool.world_size > 1:
-            local_n_traj = torch.tensor([self.my_n_traj], device=pool.device)
-            all_local_counts = [torch.zeros_like(local_n_traj) for _ in range(pool.world_size)]
-            dist.all_gather(all_local_counts, local_n_traj)
-            self.total_n_traj = sum([count.item() for count in all_local_counts])
-        else:
-            self.total_n_traj = self.my_n_traj
-
         # Count the total number of trajectories in this batch and
         # scale the weight accordingly so that the cost function measures
         # the average error over snapshots and trajectories.
-        self.weights *= self.total_n_traj*self.n_snapshots
+        self.weights *= pool.n_traj*self.n_snapshots
         
         # Parse the keyword arguments
         self.which_fix = kwargs.get('which_fix','fix_none')
@@ -227,7 +219,7 @@ class optimization_objects:
             Optional keyword arguments:
                 'forcing_interp':   a PyTorch interpolator f that gives us a forcing f(t)
         """
-        if torch.linalg.vector_norm(z) >= 1e4:    
+        if torch.linalg.vector_norm(z) >= 1e6:    
             dzdt = 0.0*z 
         else:
             f = kwargs.get('forcing_interp',None)
@@ -248,12 +240,12 @@ class optimization_objects:
             t:          time instance
             z:          state vector
             u:          a steady forcing vector
-            operators:  (A2,A3,A4,...)
+            operators:  (A3,A4,...)
             
             Optional keyword arguments:
                 'forcing_interp':   a PyTorch interpolator f that gives us a forcing f(t)
         """
-        if torch.linalg.vector_norm(z) >= 1e4:
+        if torch.linalg.vector_norm(z) >= 1e6:
             dzdt = 0.0*z 
         else:
             f = kwargs.get('forcing_interp',None)
@@ -278,7 +270,7 @@ class optimization_objects:
             operators:  (A2,A3,A4,...)
         """
         
-        if torch.linalg.vector_norm(z) >= 1e4:
+        if torch.linalg.vector_norm(z) >= 1e6:
             dzdt = 0.0*z
         else:
             J = torch.zeros((len(z),len(z)),device=z.device,dtype=z.dtype)
@@ -304,10 +296,10 @@ class optimization_objects:
             z:          state vector
             fq:         PyTorch interpolator to evaluate the
                         base flow at time t
-            operators:  (A2,A3,A4,...)
+            operators:  (A3,A4,...)
         """
 
-        if torch.linalg.vector_norm(z) >= 1e4:
+        if torch.linalg.vector_norm(z) >= 1e6:
             dzdt = 0.0*z
         else:
             J = torch.zeros((len(z),len(z)),device=z.device,dtype=z.dtype)

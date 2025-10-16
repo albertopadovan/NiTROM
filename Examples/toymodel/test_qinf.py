@@ -8,7 +8,7 @@ import pymanopt
 import pymanopt.manifolds as manifolds
 import pymanopt.optimizers as optimizers
 
-from NiTROM_GPU.Optimization_Functions import classes, nitrom_functions
+from NiTROM_GPU.Optimization_Functions import classes, nitrom_functions, opinf_functions_energypreserving as opinf_fun_ep
 from NiTROM_GPU.PyManopt_Functions.my_pymanopt_classes import myGPUAdaptiveLineSearcher
 from NiTROM_GPU.PyTorch_Functions import gpu_utils
 import fom_class_pytorch
@@ -80,7 +80,7 @@ cost, grad, hess = nitrom_functions.create_objective_and_gradient(M,opt_obj,pool
 problem = pymanopt.Problem(M,cost,euclidean_gradient=grad)
 
 line_searcher = myGPUAdaptiveLineSearcher(contraction_factor=0.5,sufficient_decrease=0.85,max_iterations=25,initial_step_size=1)
-optimizer = optimizers.ConjugateGradient(max_iterations=50,min_step_size=1e-20,max_time=3600,line_searcher=line_searcher,log_verbosity=1,verbosity=verb)
+optimizer = optimizers.ConjugateGradient(max_iterations=40,min_step_size=1e-20,max_time=3600,line_searcher=line_searcher,log_verbosity=1,verbosity=verb)
 
 point = [None]*4
 if rank == 0:
@@ -90,8 +90,54 @@ if rank == 0:
     point[3] = np.load(traj_path + "A3.npy")
 if world_size > 1: dist.broadcast_object_list(point,src=0)
 point = tuple(point)
+phi = torch.tensor(point[0],device=device,dtype=torch.float64)
+cost_val = cost(*point)
+grad_val = grad(*point)
+norm = 0
+for tensor in grad_val:
+    norm += np.linalg.norm(tensor)
+if rank == 0:
+    print(cost_val)
+    print(norm)
+lambdas = [0.0, 0.0]
+A, H = opinf_fun_ep.opinf_ep(pool, phi, lambdas)
+print(A, H)
+# torch.distributed.barrier()
+# raise Exception("Stopping here to check initial cost.")
 
-result = optimizer.run(problem,initial_point=point)
 
-torch.distributed.barrier()
+
+# result = optimizer.run(problem,initial_point=point)
+
+# if rank == 0:
+#     Phi_nit = result.point[0]
+#     Psi_nit = result.point[1]
+#     Phi_nit = Phi_nit@scipy.linalg.inv(Psi_nit.T@Phi_nit)
+#     tensors_nit = tuple(result.point[2:])
+
+#     np.save('results/Phi_nit_gpu_fast.npy',Phi_nit)
+#     np.save('results/Psi_nit_gpu_fast.npy',Psi_nit)
+#     np.save('results/A2_nit_gpu_fast.npy',tensors_nit[0])
+#     np.save('results/A3_nit_gpu_fast.npy',tensors_nit[1])
+
+#     itervec_nit = result.log["iterations"]["iteration"]
+#     costvec_nit = result.log["iterations"]["cost"]
+#     gradvec_nit = result.log["iterations"]["gradient_norm"]
+
+#     np.save('results/nitrom_gpu_itervec_fast.npy',itervec_nit)
+#     np.save('results/nitrom_gpu_costvec_fast.npy',costvec_nit)
+#     np.save('results/nitrom_gpu_gradvec_fast.npy',gradvec_nit)
+
+#     plt.figure()
+#     plt.plot(itervec_nit,costvec_nit,color=cOPT,linestyle=lOPT,label='NiTROM')
+
+#     ax = plt.gca()
+#     ax.set_yscale('log')
+#     ax.set_xlabel('Conj. gradient iteration')
+#     ax.set_ylabel('Cost')
+
+#     plt.legend()
+#     plt.tight_layout()
+#     plt.show()
+
 gpu_utils.cleanup_distributed()

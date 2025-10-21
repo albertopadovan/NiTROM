@@ -1,12 +1,16 @@
 import torch
 
+
 class Interp1D:
-    '''
+    """
     1D linear interpolation for PyTorch tensors.
-    '''
+    """
+
     def __init__(self, t, x, extrapolate=False):
         assert t.ndim == 1, "Input tensor t must be 1D."
-        assert t.shape[0] == x.shape[1], "Input tensors t and x must match along the time dimension."
+        assert t.shape[0] == x.shape[1], (
+            "Input tensors t and x must match along the time dimension."
+        )
         self.t = t
         self.x = x
         self.extrapolate = extrapolate
@@ -26,7 +30,7 @@ class Interp1D:
             above = tq > t[-1]
 
             if below.any():
-                xq[below] = x[:,0].unsqueeze(1)
+                xq[below] = x[:, 0].unsqueeze(1)
             if above.any():
                 xq[above] = x[:, -1].unsqueeze(1)
 

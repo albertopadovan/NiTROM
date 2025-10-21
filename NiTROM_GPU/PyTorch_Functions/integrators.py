@@ -31,7 +31,7 @@ def my_rk4(fun, t_vec, x0, args=()):
     """
 
     x = x0.clone()
-    dt = (t_vec[1] - t_vec[0])/100
+    dt = (t_vec[1] - t_vec[0]) / 100
     xs = torch.zeros((len(x0), len(t_vec)), dtype=x0.dtype, device=x0.device)
     xs[:, 0] = x0
     t = t_vec[0].clone()
@@ -45,7 +45,18 @@ def my_rk4(fun, t_vec, x0, args=()):
     return xs
 
 
-def my_rk4_adaptive(fun, t_vec, x0, args=(), *, atol=1e-6, rtol=1e-3, safety_factor=0.8, fac_min=0.1, fac_max=5.0):
+def my_rk4_adaptive(
+    fun,
+    t_vec,
+    x0,
+    args=(),
+    *,
+    atol=1e-6,
+    rtol=1e-3,
+    safety_factor=0.8,
+    fac_min=0.1,
+    fac_max=5.0,
+):
     """
     Integrates a system of ordinary differential equations using an adaptive fourth-order Runge-Kutta (RK4) method.
     Compatible with PyTorch tensors.
@@ -61,7 +72,7 @@ def my_rk4_adaptive(fun, t_vec, x0, args=(), *, atol=1e-6, rtol=1e-3, safety_fac
     """
 
     x = x0.clone().detach()
-    dt = (t_vec[1] - t_vec[0])/10
+    dt = (t_vec[1] - t_vec[0]) / 10
     xs = torch.zeros((len(x0), len(t_vec)), dtype=x0.dtype, device=x0.device)
     xs[:, 0] = x0
     t = t_vec[0]
@@ -70,22 +81,20 @@ def my_rk4_adaptive(fun, t_vec, x0, args=(), *, atol=1e-6, rtol=1e-3, safety_fac
             dt_trial = min(dt, T - t)
             x_full = rk4_step(fun, t, x, dt_trial, args)
             x_half1 = rk4_step(fun, t, x, dt_trial / 2, args)
-            x_half2 = rk4_step(fun, t + dt_trial / 2,
-                               x_half1, dt_trial / 2, args)
+            x_half2 = rk4_step(fun, t + dt_trial / 2, x_half1, dt_trial / 2, args)
 
             dx = x_half2 - x_full
-            scale = atol + rtol * \
-                torch.max(torch.abs(x_full), torch.abs(x_half2))
-            err_vec = torch.abs(dx)/scale
+            scale = atol + rtol * torch.max(torch.abs(x_full), torch.abs(x_half2))
+            err_vec = torch.abs(dx) / scale
             err = torch.max(err_vec)
 
             if err <= 1.0:
                 t = t + dt_trial
                 x = x_half2
 
-            exponent = 1.0/(4.0+1.0)
-            dt_new = dt_trial * safety_factor * (1.0/err)**exponent
-            dt = torch.clamp(dt_new, min=dt*fac_min, max=dt*fac_max)
+            exponent = 1.0 / (4.0 + 1.0)
+            dt_new = dt_trial * safety_factor * (1.0 / err) ** exponent
+            dt = torch.clamp(dt_new, min=dt * fac_min, max=dt * fac_max)
         xs[:, i] = x
 
     return xs
@@ -108,31 +117,32 @@ def etdrk4_setup(linop, dt):
     V, D, V_inv = linop
     L = V @ torch.diag(D) @ V_inv
     E = V @ torch.diag(torch.exp(D * dt)) @ V_inv
-    E2 = V @ torch.diag(torch.exp(D * dt/2)) @ V_inv
-    phi = V @ torch.diag(D**(-1) * (torch.exp(D * dt/2) - 1)) @ V_inv
-    L_inv3 = V @ torch.diag(D**(-3)) @ V_inv
+    E2 = V @ torch.diag(torch.exp(D * dt / 2)) @ V_inv
+    phi = V @ torch.diag(D ** (-1) * (torch.exp(D * dt / 2) - 1)) @ V_inv
+    L_inv3 = V @ torch.diag(D ** (-3)) @ V_inv
     L_sq = V @ torch.diag(D**2) @ V_inv
 
     I = torch.eye(n, device=V.device, dtype=V.dtype)
 
-    coef1 = -4*I - L*dt + E @ (4*I - 3*L*dt + L_sq * dt**2)
-    coef2 = 2 * (2*I + L*dt + E @ (-2*I + L*dt))
-    coef3 = -4*I - 3*L*dt - L_sq * dt**2 + E @ (4*I - L*dt)
+    coef1 = -4 * I - L * dt + E @ (4 * I - 3 * L * dt + L_sq * dt**2)
+    coef2 = 2 * (2 * I + L * dt + E @ (-2 * I + L * dt))
+    coef3 = -4 * I - 3 * L * dt - L_sq * dt**2 + E @ (4 * I - L * dt)
 
     return E, E2, phi, L_inv3, coef1, coef2, coef3
 
 
 def my_etdrk4(etdrk4_coefs, fun_nonlinear, t_vec, x0, internal_steps=1, args=()):
-    '''
+    """
     Integrates a system of ordinary differential equations using the Exponential Time Differencing Runge-Kutta 4 (ETDRK4) method.
     Assumes linear operator has been diagonalized and all necessary constant matrices have been precomputed from `etdrk4_setup`.
     See https://epubs.siam.org/doi/10.1137/S1064827502410633
-    '''
+    """
 
     dtype = torch.complex128
     x0 = x0.to(dtype)
-    args = tuple(arg.to(dtype) if isinstance(
-        arg, torch.Tensor) else arg for arg in args)
+    args = tuple(
+        arg.to(dtype) if isinstance(arg, torch.Tensor) else arg for arg in args
+    )
 
     n = len(x0)
     dt = (t_vec[1] - t_vec[0]) / internal_steps
@@ -141,7 +151,7 @@ def my_etdrk4(etdrk4_coefs, fun_nonlinear, t_vec, x0, internal_steps=1, args=())
 
     n_outputs = len(t_vec)
     n_steps = (n_outputs - 1) * internal_steps
-    t_vec_internal = torch.arange(n_steps+1, device=x0.device) * dt + t_vec[0]
+    t_vec_internal = torch.arange(n_steps + 1, device=x0.device) * dt + t_vec[0]
     xs = torch.zeros((n, n_outputs), device=x0.device, dtype=x0.dtype)
     xs[:, 0] = x0
     x = x0.clone().detach()
@@ -152,17 +162,18 @@ def my_etdrk4(etdrk4_coefs, fun_nonlinear, t_vec, x0, internal_steps=1, args=())
                 idx = m // internal_steps
                 xs[:, idx] = x.real
         else:
-            t = t_vec_internal[m-1]
+            t = t_vec_internal[m - 1]
             N1 = fun_nonlinear(t, x, *args)
             an = E2 @ x + phi @ N1
-            N2 = fun_nonlinear(t + dt/2, an, *args)
+            N2 = fun_nonlinear(t + dt / 2, an, *args)
             bn = E2 @ x + phi @ N2
-            N3 = fun_nonlinear(t + dt/2, bn, *args)
+            N3 = fun_nonlinear(t + dt / 2, bn, *args)
             cn = E2 @ an + phi @ (2 * N3 - N1)
             N4 = fun_nonlinear(t + dt, cn, *args)
 
-            x = E @ x + dt**(-2) * L_inv3 @ (coef1 @ N1 +
-                                             coef2 @ (N2 + N3) + coef3 @ N4)
+            x = E @ x + dt ** (-2) * L_inv3 @ (
+                coef1 @ N1 + coef2 @ (N2 + N3) + coef3 @ N4
+            )
             if m % internal_steps == 0:
                 idx = m // internal_steps
                 xs[:, idx] = x.real

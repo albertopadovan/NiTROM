@@ -92,8 +92,12 @@ if world_size > 1: dist.broadcast_object_list(point,src=0)
 point = tuple(point)
 
 # result = optimizer.run(problem,initial_point=point)
-cost_val = cost(*point)
-print(cost_val)
+grad_vals = grad(*point)
+grad_norm = 0.0
+for g in grad_vals:
+    grad_norm += np.linalg.norm(g)**2
+grad_norm = np.sqrt(grad_norm)
+print(grad_norm)
 
 if world_size > 1: torch.distributed.barrier()
 gpu_utils.cleanup_distributed()

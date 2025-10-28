@@ -212,25 +212,64 @@ class optimization_objects:
         """
             Function that can be fed into a PyTorch integrator routine. 
             t:          time instance
-            z:          state vector
-            u:          a steady forcing vector
+            z:          state vector (n,) or (B, n)
+            u:          a steady forcing vector (n,) or (B, n) or callable returning (n,)
             operators:  (A2,A3,A4,...)
             
             Optional keyword arguments:
                 'forcing_interp':   a PyTorch interpolator f that gives us a forcing f(t)
         """
-        if torch.linalg.vector_norm(z) >= 1e6:    
-            dzdt = 0.0*z 
+        n = z.shape[-1]
+        thresh = 1e6
+
+        if z.ndim == 1:
+            if torch.linalg.vector_norm(z) >= thresh:
+                return torch.zeros_like(z)
         else:
-            f = kwargs.get('forcing_interp',None)
-            f = f(t) if f != None else torch.zeros(len(z), device=z.device, dtype=z.dtype)
-            u = u.clone() if isinstance(u,torch.Tensor) else u(t)
-            dzdt = u + f
+            norms = torch.linalg.vector_norm(z, dim=-1)
+            mask = norms < thresh
+            if not mask.any():
+                return torch.zeros_like(z)
+
+        f_fun = kwargs.get('forcing_interp', None)
+        f = f_fun(t) if f_fun is not None else torch.zeros(n, device=z.device, dtype=z.dtype)
+        f = f.to(device=z.device, dtype=z.dtype)
+
+        if isinstance(u, torch.Tensor):
+            u_vec = u.to(device=z.device, dtype=z.dtype)
+        else:
+            u_vec = u(t).to(device=z.device, dtype=z.dtype)
+
+        if z.ndim == 1:
+            dzdt = u_vec + f
             for (i, k) in enumerate(self.poly_comp):
                 equation = ",".join(self.einsum_ss[i])
                 operands = [operators[i]] + [z for _ in range(k)]
-                dzdt += torch.einsum(equation,*operands)
-        
+                dzdt = dzdt + torch.einsum(equation, *operands)
+            return dzdt
+
+        # Batched path
+        B = z.shape[0]
+        if f.ndim == 1:
+            f = f.unsqueeze(0).expand(B, -1)
+        if u_vec.ndim == 1:
+            u_vec = u_vec.unsqueeze(0).expand(B, -1)
+
+        dzdt = torch.zeros_like(z)
+        z_stable = z[mask]
+        f_stable = f[mask]
+        u_stable = u_vec[mask]
+
+        dzdt_stable = u_stable + f_stable
+
+        for (i, k) in enumerate(self.poly_comp):
+            parts = self.einsum_ss[i]
+            eq_parts = [parts[0]] + [f"...{p}" for p in parts[1:]]
+            equation = ",".join(eq_parts)
+            operands = [operators[i]] + [z_stable for _ in range(k)]
+            dzdt_stable = dzdt_stable + torch.einsum(equation, *operands)
+
+        dzdt[mask] = dzdt_stable
         return dzdt
     
 
@@ -238,25 +277,64 @@ class optimization_objects:
         """
             Function that can be fed into a PyTorch integrator routine (nonlinear terms only). 
             t:          time instance
-            z:          state vector
-            u:          a steady forcing vector
-            operators:  (A3,A4,...)
+            z:          state vector (n,) or (B, n)
+            u:          a steady forcing vector (n,) or (B, n) or callable returning (n,)
+            operators:  (A2,A3,A4,...)
             
             Optional keyword arguments:
                 'forcing_interp':   a PyTorch interpolator f that gives us a forcing f(t)
         """
-        if torch.linalg.vector_norm(z) >= 1e6:
-            dzdt = 0.0*z 
+        n = z.shape[-1]
+        thresh = 1e6
+
+        if z.ndim == 1:
+            if torch.linalg.vector_norm(z) >= thresh:
+                return torch.zeros_like(z)
         else:
-            f = kwargs.get('forcing_interp',None)
-            f = f(t) if f != None else torch.zeros(len(z), device=z.device, dtype=z.dtype)
-            u = u.clone() if isinstance(u,torch.Tensor) else u(t)
-            dzdt = u + f
-            for (i, k) in enumerate(self.poly_comp[1:], start=1):
+            norms = torch.linalg.vector_norm(z, dim=-1)
+            mask = norms < thresh
+            if not mask.any():
+                return torch.zeros_like(z)
+
+        f_fun = kwargs.get('forcing_interp', None)
+        f = f_fun(t) if f_fun is not None else torch.zeros(n, device=z.device, dtype=z.dtype)
+        f = f.to(device=z.device, dtype=z.dtype)
+
+        if isinstance(u, torch.Tensor):
+            u_vec = u.to(device=z.device, dtype=z.dtype)
+        else:
+            u_vec = u(t).to(device=z.device, dtype=z.dtype)
+
+        if z.ndim == 1:
+            dzdt = u_vec + f
+            for (i, k) in enumerate(self.poly_comp):
                 equation = ",".join(self.einsum_ss[i])
                 operands = [operators[i]] + [z for _ in range(k)]
-                dzdt += torch.einsum(equation,*operands)
-        
+                dzdt = dzdt + torch.einsum(equation, *operands)
+            return dzdt
+
+        # Batched path
+        B = z.shape[0]
+        if f.ndim == 1:
+            f = f.unsqueeze(0).expand(B, -1)
+        if u_vec.ndim == 1:
+            u_vec = u_vec.unsqueeze(0).expand(B, -1)
+
+        dzdt = torch.zeros_like(z)
+        z_stable = z[mask]
+        f_stable = f[mask]
+        u_stable = u_vec[mask]
+
+        dzdt_stable = u_stable + f_stable
+
+        for (i, k) in enumerate(self.poly_comp[1:], start=1):
+            parts = self.einsum_ss[i]
+            eq_parts = [parts[0]] + [f"...{p}" for p in parts[1:]]
+            equation = ",".join(eq_parts)
+            operands = [operators[i]] + [z_stable for _ in range(k)]
+            dzdt_stable = dzdt_stable + torch.einsum(equation, *operands)
+
+        dzdt[mask] = dzdt_stable
         return dzdt
     
     

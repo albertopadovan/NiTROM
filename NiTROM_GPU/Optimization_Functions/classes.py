@@ -342,28 +342,75 @@ class optimization_objects:
         """
             Function that can be fed into a PyTorch integrator routine. 
             t:          time instance
-            z:          state vector
-            fq:         PyTorch interpolator to evaluate the
-                        base flow at time t
+            z:          state vector (n,) or (B, n)
+            fq:         interpolator/Callable returning base flow at time t; shape (n,) or (B, n)
             operators:  (A2,A3,A4,...)
         """
-        
-        if torch.linalg.vector_norm(z) >= 1e6:
-            dzdt = 0.0*z
+        n = z.shape[-1]
+        thresh = 1e6
+
+        # Early stability check
+        if z.ndim == 1:
+            if torch.linalg.vector_norm(z) >= thresh:
+                return torch.zeros_like(z)
         else:
-            J = torch.zeros((len(z),len(z)),device=z.device,dtype=z.dtype)
+            norms = torch.linalg.vector_norm(z, dim=-1)
+            mask = norms < thresh
+            if not mask.any():
+                return torch.zeros_like(z)
+
+        # Evaluate base flow
+        fq_t = fq(t)
+        fq_t = fq_t.to(device=z.device, dtype=z.dtype)
+
+        if z.ndim == 1:
+            # Unbatched J
+            J = torch.zeros((n, n), device=z.device, dtype=z.dtype)
             for (i, k) in enumerate(self.poly_comp):
-                
-                combs = list(combinations(self.einsum_ss[i][1:],r=k-1))
-                operands = [operators[i]] + [fq(t) for _ in range(k-1)]
+                combs = list(combinations(self.einsum_ss[i][1:], r=k-1))
+                operands = [operators[i]] + [fq_t for _ in range(k-1)]
+                for comb in combs:
+                    equation = [self.einsum_ss[i][0]] + list(comb)  # e.g., ['abc','b']
+                    equation = ",".join(equation)
+                    J = J + torch.einsum(equation, *operands)
+            # dzdt = J^T @ z == z @ J
+            return z @ J
+
+        # Batched path
+        B = z.shape[0]
+        dzdt = torch.zeros_like(z)
+
+        if fq_t.ndim == 1:
+            # Single J for all batch items
+            J = torch.zeros((n, n), device=z.device, dtype=z.dtype)
+            for (i, k) in enumerate(self.poly_comp):
+                combs = list(combinations(self.einsum_ss[i][1:], r=k-1))
+                operands = [operators[i]] + [fq_t for _ in range(k-1)]
                 for comb in combs:
                     equation = [self.einsum_ss[i][0]] + list(comb)
                     equation = ",".join(equation)
-                    
-                    J += torch.einsum(equation,*operands)
-                    
-            dzdt = J.T@z
-            
+                    J = J + torch.einsum(equation, *operands)
+            z_stable = z[mask]
+            dzdt_stable = z_stable @ J
+            dzdt[mask] = dzdt_stable
+            return dzdt
+
+        # Batched J per-sample using ellipsis
+        Jb = torch.zeros((fq_t.shape[0], n, n), device=z.device, dtype=z.dtype)
+        for (i, k) in enumerate(self.poly_comp):
+            combs = list(combinations(self.einsum_ss[i][1:], r=k-1))
+            for comb in combs:
+                eq = [self.einsum_ss[i][0]] + [f"...{p}" for p in comb]
+                equation = ",".join(eq)
+                operands = [operators[i]] + [fq_t for _ in range(k-1)]
+                Jb = Jb + torch.einsum(equation, *operands)  # (B, n, n)
+
+        idxs = mask.nonzero(as_tuple=False).squeeze(-1)
+        if idxs.numel() > 0:
+            z_stable = z.index_select(0, idxs)
+            Jb_stable = Jb.index_select(0, idxs)
+            dzdt_stable = torch.einsum('bn,bnm->bm', z_stable, Jb_stable)
+            dzdt.index_copy_(0, idxs, dzdt_stable)
         return dzdt
     
 
@@ -371,26 +418,72 @@ class optimization_objects:
         """
             Function that can be fed into a PyTorch integrator routine (nonlinear terms only). 
             t:          time instance
-            z:          state vector
-            fq:         PyTorch interpolator to evaluate the
-                        base flow at time t
+            z:          state vector (n,) or (B, n)
+            fq:         interpolator/Callable returning base flow at time t; shape (n,) or (B, n)
             operators:  (A3,A4,...)
         """
+        n = z.shape[-1]
+        thresh = 1e6
 
-        if torch.linalg.vector_norm(z) >= 1e6:
-            dzdt = 0.0*z
+        # Early stability check
+        if z.ndim == 1:
+            if torch.linalg.vector_norm(z) >= thresh:
+                return torch.zeros_like(z)
         else:
-            J = torch.zeros((len(z),len(z)),device=z.device,dtype=z.dtype)
+            norms = torch.linalg.vector_norm(z, dim=-1)
+            mask = norms < thresh
+            if not mask.any():
+                return torch.zeros_like(z)
+
+        # Evaluate base flow
+        fq_t = fq(t)
+        fq_t = fq_t.to(device=z.device, dtype=z.dtype)
+
+        if z.ndim == 1:
+            # Unbatched J (nonlinear components only)
+            J = torch.zeros((n, n), device=z.device, dtype=z.dtype)
             for (i, k) in enumerate(self.poly_comp[1:], start=1):
-                
-                combs = list(combinations(self.einsum_ss[i][1:],r=k-1))
-                operands = [operators[i]] + [fq(t).to(z.dtype) for _ in range(k-1)]
+                combs = list(combinations(self.einsum_ss[i][1:], r=k-1))
+                operands = [operators[i]] + [fq_t for _ in range(k-1)]
                 for comb in combs:
                     equation = [self.einsum_ss[i][0]] + list(comb)
                     equation = ",".join(equation)
-                    
-                    J += torch.einsum(equation,*operands)
-                    
-            dzdt = J.T@z
-            
+                    J = J + torch.einsum(equation, *operands)
+            return z @ J
+
+        # Batched path
+        B = z.shape[0]
+        dzdt = torch.zeros_like(z)
+
+        if fq_t.ndim == 1:
+            # Single J for all batch items
+            J = torch.zeros((n, n), device=z.device, dtype=z.dtype)
+            for (i, k) in enumerate(self.poly_comp[1:], start=1):
+                combs = list(combinations(self.einsum_ss[i][1:], r=k-1))
+                operands = [operators[i]] + [fq_t for _ in range(k-1)]
+                for comb in combs:
+                    equation = [self.einsum_ss[i][0]] + list(comb)
+                    equation = ",".join(equation)
+                    J = J + torch.einsum(equation, *operands)
+            z_stable = z[mask]
+            dzdt_stable = z_stable @ J
+            dzdt[mask] = dzdt_stable
+            return dzdt
+
+        # Batched J per-sample using ellipsis (nonlinear components only)
+        Jb = torch.zeros((fq_t.shape[0], n, n), device=z.device, dtype=z.dtype)
+        for (i, k) in enumerate(self.poly_comp[1:], start=1):
+            combs = list(combinations(self.einsum_ss[i][1:], r=k-1))
+            for comb in combs:
+                eq = [self.einsum_ss[i][0]] + [f"...{p}" for p in comb]
+                equation = ",".join(eq)
+                operands = [operators[i]] + [fq_t for _ in range(k-1)]
+                Jb = Jb + torch.einsum(equation, *operands)  # (B, n, n)
+
+        idxs = mask.nonzero(as_tuple=False).squeeze(-1)
+        if idxs.numel() > 0:
+            z_stable = z.index_select(0, idxs)
+            Jb_stable = Jb.index_select(0, idxs)
+            dzdt_stable = torch.einsum('bn,bnm->bm', z_stable, Jb_stable)
+            dzdt.index_copy_(0, idxs, dzdt_stable)
         return dzdt

@@ -91,7 +91,9 @@ if rank == 0:
 if world_size > 1: dist.broadcast_object_list(point,src=0)
 point = tuple(point)
 
-result = optimizer.run(problem,initial_point=point)
+# result = optimizer.run(problem,initial_point=point)
+cost_val = cost(*point)
+print(cost_val)
 
-torch.distributed.barrier()
+if world_size > 1: torch.distributed.barrier()
 gpu_utils.cleanup_distributed()

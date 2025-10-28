@@ -42,19 +42,29 @@ def create_objective_and_gradient(manifold,opt_obj,pool,fom):
         etdrk4_coefs = etdrk4_setup(linop, dt)
 
         J = 0.0
-        for k in range (pool.my_n_traj):
-            # Integrate the reduced-order model from time t = 0 to the final time 
-            # specified by the last snapshot in the training trajectory
-            z0 = Psi.T@opt_obj.X[k,:,0]
-            u = Psi.T@opt_obj.F[:,k]
-            sol = my_etdrk4(etdrk4_coefs,opt_obj.evaluate_rom_rhs_nonlinear,opt_obj.time,z0,internal_steps,args=(u,)+tensors)
-            e = fom.compute_output(opt_obj.X[k,:,:]) - fom.compute_output(PhiF@sol)
-            J += (1./opt_obj.weights[k])*torch.trace(e.T@e)
+        B = opt_obj.my_n_traj
+        if B > 0:
+            # z0_k = Psi.T @ X[k,:,0] => z0 = X0 @ Psi  -> (B, r)
+            X0 = opt_obj.X[:, :, 0]                       # (B, N)
+            z0 = X0 @ Psi                                  # (B, r)
+
+            # u_k = Psi.T @ F[:,k] => u = F.T @ Psi -> (B, r)
+            u_batch = opt_obj.F.T @ Psi                  # (B, r)
+
+            sol = my_etdrk4(etdrk4_coefs, opt_obj.evaluate_rom_rhs_nonlinear, opt_obj.time, z0, internal_steps, args=(u_batch,)+tensors)  # (B, r, T)
+
+            # Compute outputs in batch
+            # y_true = C @ X  -> (B, 1, T); y_model = C @ (PhiF @ Z) -> (B, 1, T)
+            Y_true = fom.compute_output(opt_obj.X)          # (B, 1, T)
+            Y_model = fom.compute_output(torch.matmul(PhiF, sol))         # (B, 1, T)
+
+            e = Y_true - Y_model                              # (B, 1, T)
+            err_per_traj = (e * e).sum(dim=(1, 2))            # (B,)
+            J = J + torch.sum(err_per_traj / opt_obj.weights) # scalar tensor
 
         if opt_obj.l2_pen is not None and pool.rank == 0:
             time_pen = torch.linspace(0,opt_obj.pen_tf,opt_obj.n_snapshots*opt_obj.nsave_rom,device=pool.device)
             Z = my_etdrk4(etdrk4_coefs,lambda t,z: 0*z,time_pen,opt_obj.randic)
-
             J += opt_obj.l2_pen*torch.dot(Z[:,-1],Z[:,-1])
         
         if pool.world_size > 1:

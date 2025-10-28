@@ -127,44 +127,64 @@ def my_etdrk4(etdrk4_coefs, fun_nonlinear, t_vec, x0, internal_steps=1, args=())
     Integrates a system of ordinary differential equations using the Exponential Time Differencing Runge-Kutta 4 (ETDRK4) method.
     Assumes linear operator has been diagonalized and all necessary constant matrices have been precomputed from `etdrk4_setup`.
     See https://epubs.siam.org/doi/10.1137/S1064827502410633
+
+    Batched support:
+      - x0 can be shape (n,) or (B, n). In batched mode, fun_nonlinear should accept x with shape (B, n)
+        and return the same shape.
     '''
 
     dtype = torch.complex128
+    # Cast x0 and any tensor args to complex dtype
     x0 = x0.to(dtype)
-    args = tuple(arg.to(dtype) if isinstance(
-        arg, torch.Tensor) else arg for arg in args)
+    args = tuple(arg.to(dtype) if isinstance(arg, torch.Tensor) else arg for arg in args)
 
-    n = len(x0)
+    # Normalize to batched shape (B, n)
+    if x0.ndim == 1:
+        batched = False
+        n = x0.shape[0]
+        x_b = x0.unsqueeze(0)  # (1, n)
+    elif x0.ndim == 2:
+        batched = True
+        B, n = x0.shape
+        x_b = x0  # (B, n)
+    else:
+        raise ValueError("x0 must be 1D (n,) or 2D (B, n).")
+
     dt = (t_vec[1] - t_vec[0]) / internal_steps
-
     E, E2, phi, L_inv3, coef1, coef2, coef3 = etdrk4_coefs
 
     n_outputs = len(t_vec)
     n_steps = (n_outputs - 1) * internal_steps
-    t_vec_internal = torch.arange(n_steps+1, device=x0.device) * dt + t_vec[0]
-    xs = torch.zeros((n, n_outputs), device=x0.device, dtype=x0.dtype)
-    xs[:, 0] = x0
-    x = x0.clone().detach()
+    t_vec_internal = torch.arange(n_steps + 1, device=x_b.device, dtype=t_vec.dtype) * dt + t_vec[0]
+
+    xs_b = torch.zeros((x_b.shape[0], n, n_outputs), device=x_b.device, dtype=x_b.dtype)
+    xs_b[:, :, 0] = x_b
+    x = x_b.clone().detach()
+
+    # Helper for left-multiplication A @ X for batched X: returns (B, n)
+    # Implemented as (B, n) @ (n, n)^T to avoid expanding A to batches.
+    def matvec(A, X):
+        return X @ A.transpose(0, 1)
 
     for m in range(1, n_steps + 1):
-        if torch.linalg.vector_norm(x) > 1e6:
-            if m % internal_steps == 0:
-                idx = m // internal_steps
-                xs[:, idx] = x.real
-        else:
-            t = t_vec_internal[m-1]
-            N1 = fun_nonlinear(t, x, *args)
-            an = E2 @ x + phi @ N1
-            N2 = fun_nonlinear(t + dt/2, an, *args)
-            bn = E2 @ x + phi @ N2
-            N3 = fun_nonlinear(t + dt/2, bn, *args)
-            cn = E2 @ an + phi @ (2 * N3 - N1)
-            N4 = fun_nonlinear(t + dt, cn, *args)
+        t = t_vec_internal[m - 1]
+        N1 = fun_nonlinear(t, x, *args)
+        an = matvec(E2, x) + matvec(phi, N1)
+        N2 = fun_nonlinear(t + dt / 2, an, *args)
+        bn = matvec(E2, x) + matvec(phi, N2)
+        N3 = fun_nonlinear(t + dt / 2, bn, *args)
+        cn = matvec(E2, an) + matvec(phi, (2 * N3 - N1))
+        N4 = fun_nonlinear(t + dt, cn, *args)
 
-            x = E @ x + dt**(-2) * L_inv3 @ (coef1 @ N1 +
-                                             coef2 @ (N2 + N3) + coef3 @ N4)
-            if m % internal_steps == 0:
-                idx = m // internal_steps
-                xs[:, idx] = x.real
+        combo = matvec(coef1, N1) + matvec(coef2, (N2 + N3)) + matvec(coef3, N4)
+        x = matvec(E, x) + (dt ** (-2)) * matvec(L_inv3, combo)
 
-    return xs.real
+        if m % internal_steps == 0:
+            out_idx = m // internal_steps
+            xs_b[:, :, out_idx] = x.real
+
+    # Match original return shape
+    if batched:
+        return xs_b.real
+    else:
+        return xs_b[0].real

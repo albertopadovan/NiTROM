@@ -37,7 +37,7 @@ class full_order_model:
         return vec
     
     def compute_output(self,q):
-        return self.C@q
+        return torch.matmul(self.C,q)
     
     def compute_output_derivative(self,q):
         return self.C

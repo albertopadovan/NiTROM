@@ -234,10 +234,9 @@ def create_objective_and_gradient(manifold,opt_obj,pool,fom):
                 
                 Int_lambda.add_(a * torch.einsum('ijk, k -> ij', Lam_lg, wlg))
                 for (count,p) in enumerate(opt_obj.poly_comp):
-                    equation = 'k' + 'i,k'.join(ascii[:p+1]) + 'i -> k' + ''.join(ascii[:p+1]) + 'i'
-                    operands = [Lam_lg] + [Z_j_lg for _ in range (p)]
-                    tmp = torch.einsum('...i, i -> ...', -a * torch.einsum(equation,*operands), wlg)
-                    grad_tensors[count].add_(tmp)
+                    equation = 'k' + 'i,k'.join(ascii[:p+1]) + 'i,i -> k' + ''.join(ascii[:p+1])
+                    operands = [Lam_lg] + [Z_j_lg for _ in range (p)] + [wlg]
+                    grad_tensors[count].add_(-a * torch.einsum(equation,*operands))
 
                     
             

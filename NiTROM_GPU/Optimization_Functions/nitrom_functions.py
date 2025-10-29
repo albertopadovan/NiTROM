@@ -181,35 +181,34 @@ def create_objective_and_gradient(manifold,opt_obj,pool,fom):
                 b = (tf_j + t0_j) / 2
                 time_j_lg = a * tlg + b
 
-                for bidx in range(B):
-                    # Build interpolants for Z_j and integrate adjoint
-                    fZ = Interp1D(time_rom_j, Z_j[bidx], extrapolate=True)
-                    sol_lam = my_etdrk4(etdrk4_coefs_T2, opt_obj.evaluate_rom_adjoint_nonlinear,
-                                        time_rom_j, lam_j_0[bidx], internal_steps, args=(fZ,)+tensors)  # (r, nsave_rom)
-                    Lam = torch.fliplr(sol_lam)                                    # (r, nsave_rom)
-                    lam_j_0[bidx] = Lam[:, 0]
+                # Batched adjoint integration using batched interpolant fZ
+                fZ = Interp1D(time_rom_j, Z_j, extrapolate=True)                     # Z_j: (B, r, nsave_rom)
+                sol_lam = my_etdrk4(etdrk4_coefs_T2, opt_obj.evaluate_rom_adjoint_nonlinear,
+                                    time_rom_j, lam_j_0, internal_steps, args=(fZ,)+tensors)  # (B, r, nsave_rom)
+                Lam = torch.fliplr(sol_lam)                                          # (B, r, nsave_rom)
+                lam_j_0 = Lam[:, :, 0]                                               # (B, r)
 
-                    # Interpolants for quadrature
-                    fL = Interp1D(time_rom_j, Lam, extrapolate=True)
-                    Z_j_lg = fZ(time_j_lg)                                         # (r, leggauss_deg)
-                    Lam_lg = fL(time_j_lg)                                         # (r, leggauss_deg)
+                # Interpolants for quadrature (batched)
+                fL = Interp1D(time_rom_j, Lam, extrapolate=True)
+                Z_j_lg = fZ(time_j_lg)                                              # (B, r, leggauss_deg)
+                Lam_lg = fL(time_j_lg)                                              # (B, r, leggauss_deg)
 
-                    # Accumulate Int_lambda and grad_tensors
+                # Accumulate Int_lambda across Gauss-Legendre points
+                Int_lambda += a * torch.einsum('q,brq->br', wlg, Lam_lg)             # (B, r)
+
+                # Accumulate grad_tensors across batch and quadrature
+                for (count, p) in enumerate(opt_obj.poly_comp):
+                    # Sum over quadrature points with weights, then reduce batch
+                    acc = torch.zeros_like(grad_tensors[count])
                     for i_lg in range(opt_obj.leggauss_deg):
-                        Int_lambda[bidx] += a * wlg[i_lg] * Lam_lg[:, i_lg]
-                        for (count, p) in enumerate(opt_obj.poly_comp):
-                            equation = ','.join(ascii[:p+1])
-                            operands = [Lam_lg[:, i_lg]] + [Z_j_lg[:, i_lg] for _ in range(p)]
-                            grad_tensors[count] -= a * wlg[i_lg] * torch.einsum(equation, *operands)
+                        # Build batched einsum: operands are (B, r)
+                        eq_parts = [f"...{ch}" for ch in ascii[:p+1]]                # ['...a','...b', ...]
+                        equation = ",".join(eq_parts)                                 # e.g., '...a,...b,...c'
+                        operands = [Lam_lg[..., i_lg]] + [Z_j_lg[..., i_lg] for _ in range(p)]
+                        tmp = torch.einsum(equation, *operands)                       # (B, r, r, ..., r)
+                        acc -= a * wlg[i_lg] * tmp.sum(dim=0)                         # sum over batch -> (r, r, ..., r)
+                    grad_tensors[count].add_(acc)
 
-            # Add contributions from IC and steady forcing to grad_Psi (batched sum over trajectories)
-            x0_batch = opt_obj.X[:, :, 0].to(Phi.dtype)                              # (B, N)
-            f_batch = opt_obj.F.T.to(Phi.dtype)                                      # (B, N)
-            grad_Psi.add_(-torch.einsum('bn,br->nr', x0_batch, lam_j_0))             # (N, r)
-            grad_Psi.add_(-torch.einsum('bn,br->nr', f_batch, Int_lambda))           # (N, r)
-        # ---- end batched section ----
-
-        # Compute the gradient of the stability-promoting term
         if opt_obj.l2_pen is not None and pool.rank == 0:
             idx = opt_obj.poly_comp.index(1)    # index of the linear tensor
 

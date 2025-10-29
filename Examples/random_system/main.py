@@ -28,9 +28,11 @@ else:
     verb = 0
 
 n = 2000
-n_traj = 6
+n_traj = 30
 C = torch.eye(n, device=device, dtype=torch.float64)
 fom = fom_class.full_order_model(C)
+
+# torch.backends.opt_einsum.is_available()
 
 traj_path = "./trajectories/"
 
@@ -105,16 +107,24 @@ point = tuple(point)
 t1 = time.time()
 grad_vals = grad_batch(*point)
 t2 = time.time()
-print("Batched", t2 - t1)
+t1 = time.time()
+grad_vals = grad_batch(*point)
+t2 = time.time()
+tb = t2 - t1
+print("Batched", tb)
 
 # print()
 t1 = time.time()
 grad_vals_unbatched = grad(*point)
 t2 = time.time()
+tu = t2 - t1
 # t1 = time.time()
 # grad_vals = grad(*point)
 # t2 = time.time()
-print("Not batched", t2 - t1)
+print("Not batched", tu)
+
+print("Speedup = %1.5f"%(tu/tb))
+
 
 for i in range(len(grad_vals)):
     g = grad_vals[i]

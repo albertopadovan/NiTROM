@@ -9,6 +9,12 @@ import time as tlib
 from ..PyTorch_Functions.integrators import my_etdrk4, etdrk4_setup
 from ..PyTorch_Functions.linear_interpolation import Interp1D
 
+from opt_einsum import contract
+
+import nvtx
+
+# torch.backends.opt_einsum.enabled = True
+
 def create_objective_and_gradient(manifold,opt_obj,pool,fom):
     
     """
@@ -226,14 +232,13 @@ def create_objective_and_gradient(manifold,opt_obj,pool,fom):
                 Z_j_lg = fZ(time_j_lg) # (B, r, tlg)
                 Lam_lg = fL(time_j_lg) # (B, r, tlg)
                 
-                for i in range (opt_obj.leggauss_deg):
-                    
-                    Int_lambda += a*wlg[i]*Lam_lg[:, :, i]
-                    
-                    for (count,p) in enumerate(opt_obj.poly_comp):
-                        equation = 'k' + ',k'.join(ascii[:p+1]) + ' -> k' + ''.join(ascii[:p+1])
-                        operands = [Lam_lg[:, :, i]] + [Z_j_lg[:, :, i] for _ in range (p)]
-                        grad_tensors[count] -= a*wlg[i]*torch.einsum(equation,*operands)
+                Int_lambda.add_(a * torch.einsum('ijk, k -> ij', Lam_lg, wlg))
+                for (count,p) in enumerate(opt_obj.poly_comp):
+                    equation = 'k' + 'i,k'.join(ascii[:p+1]) + 'i -> k' + ''.join(ascii[:p+1]) + 'i'
+                    operands = [Lam_lg] + [Z_j_lg for _ in range (p)]
+                    tmp = torch.einsum('...i, i -> ...', -a * torch.einsum(equation,*operands), wlg)
+                    grad_tensors[count].add_(tmp)
+
                     
             
             # Add the contribution of the initial condition (last term in (2.14)) to grad_Psi.

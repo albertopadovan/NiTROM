@@ -8,9 +8,9 @@ import pymanopt
 import pymanopt.manifolds as manifolds
 import pymanopt.optimizers as optimizers
 
-from NiTROM_GPU_Batch.Optimization_Functions import classes as classes_batch, nitrom_functions as nitrom_functions_batch
-from NiTROM_GPU.Optimization_Functions import classes, nitrom_functions
-from NiTROM_GPU_Batch.PyTorch_Functions import gpu_utils
+from NiTROM_GPU.Optimization_Functions import classes as classes_batch, nitrom_functions as nitrom_functions_batch
+from NiTROM_GPU_unbatched.Optimization_Functions import classes, nitrom_functions
+from NiTROM_GPU_unbatched.PyTorch_Functions import gpu_utils
 import fom_class
 
 plt.rcParams.update({"font.family":"serif","font.sans-serif":["Computer Modern"],'font.size':18,'text.usetex':True})
@@ -115,6 +115,9 @@ print("Batched", t2 - t1)
 t1 = time.time()
 grad_vals = grad(*point)
 t2 = time.time()
+# t1 = time.time()
+# grad_vals = grad(*point)
+# t2 = time.time()
 grad_norm = 0.0
 for g in grad_vals:
     grad_norm += np.linalg.norm(g)**2

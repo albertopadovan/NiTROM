@@ -56,7 +56,7 @@ def create_objective_and_gradient(manifold,opt_obj,pool,fom):
             # Compute outputs in batch
             # y_true = C @ X  -> (B, 1, T); y_model = C @ (PhiF @ Z) -> (B, 1, T)
             Y_true = fom.compute_output(opt_obj.X)          # (B, 1, T)
-            Y_model = fom.compute_output(torch.matmul(PhiF, sol))         # (B, 1, T)
+            Y_model = fom.compute_output(torch.matmul(PhiF, sol))           # (B, 1, T)
 
             e = Y_true - Y_model                              # (B, 1, T)
             err_per_traj = (e * e).sum(dim=(1, 2))            # (B,)
@@ -119,96 +119,96 @@ def create_objective_and_gradient(manifold,opt_obj,pool,fom):
         tlg, wlg = np.polynomial.legendre.leggauss(opt_obj.leggauss_deg)
         tlg = torch.from_numpy(tlg).to(pool.device); wlg = torch.from_numpy(wlg).to(pool.device)
 
-        B = opt_obj.my_n_traj
-        if B > 0:
-            # Forward ROM integration (batched)
-            X0 = opt_obj.X[:, :, 0]                            # (B, N)
-            z0 = X0 @ Psi                                      # (B, r)
-            u_batch = opt_obj.F.T @ Psi                        # (B, r)
-            sol = my_etdrk4(etdrk4_coefs, opt_obj.evaluate_rom_rhs_nonlinear,
-                            opt_obj.time, z0, internal_steps, args=(u_batch,)+tensors)   # (B, r, T)
-            Z = sol                                            # (B, r, T)
+        for k in range (pool.my_n_traj):
 
-            # Outputs and errors (batched)
-            # Y_true = C @ X, Y_model = C @ (PhiF @ Z)
-            Cb = fom.C.to(device=pool.device, dtype=Phi.dtype).expand(B, -1, -1)  # (B, 1, N)
-            Y_true = torch.bmm(Cb, opt_obj.X.to(Phi.dtype))                        # (B, 1, T)
-            X_z = torch.einsum('nr,brt->bnt', PhiF, Z)                             # (B, N, T)
-            Y_model = torch.bmm(Cb, X_z)                                           # (B, 1, T)
-            e = Y_true - Y_model                                                   # (B, 1, T)
+            z0 = Psi.T@opt_obj.X[k,:,0]
+            u = Psi.T@opt_obj.F[:,k]
+            sol = my_etdrk4(etdrk4_coefs,opt_obj.evaluate_rom_rhs_nonlinear,opt_obj.time,z0,internal_steps,args=(u,)+tensors)
+            Z = sol
+            X_z = PhiF@Z
+            e = fom.compute_output(opt_obj.X[k,:,:]) - fom.compute_output(PhiF@Z)
+            Cte = fom.compute_output_derivative(PhiF@Z).T@e
+            # Cte = e.clone()  # Use if the output is the full state
+            PCte = PhiF.T@Cte
+            alpha = opt_obj.weights[k]
+            
+            lam_j_0 *= 0.0
+            Int_lambda *= 0.0
 
-            # Cte, PCte, PsiPCte, C_minus, FZ (batched)
-            CTb = fom.compute_output_derivative(X_z).T.to(Phi.dtype).expand(B, -1, -1)  # (B, N, 1)
-            Cte = torch.bmm(CTb, e).squeeze(2)                                         # (B, N, T)
-            PCte = torch.einsum('rn,bnT->brT', PhiF.T, Cte)                            # (B, r, T)
-            PsiPCte = torch.einsum('nr,brT->bnT', Psi, PCte)                           # (B, N, T)
-            C_minus = Cte - PsiPCte                                                    # (B, N, T)
-            FZ = torch.einsum('rs,brT->bsT', F, Z)                                     # (B, r, T)
+            PsiPCte = Psi@PCte
+            C_minus = Cte - PsiPCte
+            FZ = F@Z
 
-            # Accumulate grad_Psi and grad_Phi across batch with weights 2/alpha_k
-            w = (2.0 / opt_obj.weights).view(B, 1, 1).to(Phi.dtype)                    # (B,1,1)
-            grad_Psi.add_(torch.einsum('bnT,brT->nr', X_z * w, PCte))                  # (N, r)
-            grad_Phi.add_(-torch.einsum('bnT,brT->nr', C_minus * w, FZ))               # (N, r)
+            # grad_Psi = grad_Psi + (2/alpha) * X_part @ PCte_part.T
+            # grad_Phi = -(2/alpha) * C_minus_part @ FZ_part.T
+            grad_Psi.addmm_(X_z, PCte.T, beta=1.0, alpha=(2.0/alpha))
+            grad_Phi.addmm_(C_minus, FZ.T, beta=1.0, alpha=-(2.0/alpha))
 
-            # Initialize batched adjoint state and integral
-            lam_j_0 = torch.zeros((B, r), device=pool.device, dtype=Phi.dtype)
-            Int_lambda = torch.zeros((B, r), device=pool.device, dtype=Phi.dtype)
 
-            # Adjoint integration (not batched)
-            for j in range(opt_obj.n_snapshots - 1):
+            for j in range (opt_obj.n_snapshots - 1):
+                PCtej = PCte[:,opt_obj.n_snapshots - j - 1]
+
+                # Compute the sums in (2.13) and (2.14) in the arXiv paper. Notice that this loop sums backwards
+                # from j = N-1 to j = 1, so we will compute the term j = 0 after this loop 
+                # grad_Psi += (2/alpha)*torch.einsum('i,j',x_zj,PCtej)
+                # grad_Phi += -(2/alpha)*torch.einsum('i,j',Ctej - Psi@PCtej,F@zj)
+
+                # ------ Compute the fwd ROM solution between times t0_j and tf_j ---------
                 id1 = opt_obj.n_snapshots - 1 - j
                 id0 = id1 - 1
+                
                 tf_j = opt_obj.time[id1]
                 t0_j = opt_obj.time[id0]
-                z0_j = Z[:, :, id0]                                                 # (B, r)
+                z0_j = Z[:,id0]
 
                 delta = tf_j - t0_j
-                time_rom_j = t0_j + t_unit * delta                                  # (nsave_rom,)
+                time_rom_j = t0_j + t_unit * delta
                 if torch.abs(time_rom_j[-1] - tf_j) >= 1e-6:
-                    print(time_rom_j[-1], tf_j)
+                    print(time_rom_j[-1],tf_j)
                     raise ValueError("Error in euclidean_gradient() - final time is not correct!")
 
-                # Forward ROM over [t0_j, tf_j] (batched)
-                sol_j = my_etdrk4(etdrk4_coefs_2, opt_obj.evaluate_rom_rhs_nonlinear,
-                                   time_rom_j, z0_j, internal_steps, args=(u_batch,)+tensors)  # (B, r, nsave_rom)
-                Z_j = torch.fliplr(sol_j)                                           # (B, r, nsave_rom)
+                sol_j = my_etdrk4(etdrk4_coefs_2,opt_obj.evaluate_rom_rhs_nonlinear,time_rom_j,z0_j,internal_steps,args=(u,)+tensors)
+                Z_j = torch.fliplr(sol_j)
+                fZ = Interp1D(time_rom_j,Z_j,extrapolate=True)
+                # --------------------------------------------------------------------------
 
-                # Update initial adjoint condition: lam_j_0 += (2/alpha)*PCtej
-                PCtej = PCte[:, :, id1]                                             # (B, r)
-                lam_j_0 = lam_j_0 + (2.0 / opt_obj.weights).to(Phi.dtype).view(B, 1) * PCtej
+                # ------ Compute the adj ROM solution between times t0_j and tf_j ----------
+                lam_j_0 += (2/alpha)*PCtej
+                sol_lam = my_etdrk4(etdrk4_coefs_T2,opt_obj.evaluate_rom_adjoint_nonlinear,time_rom_j,lam_j_0,internal_steps,args=(fZ,)+tensors)
+                Lam = torch.fliplr(sol_lam)
+                lam_j_0 = Lam[:,0]
+                Z_j = torch.fliplr(Z_j)
+                # --------------------------------------------------------------------------
+                
+                # Interpolate Z_j and Lam onto Gauss-Legendre points
+                a = (tf_j - t0_j)/2
+                b = (tf_j + t0_j)/2
+                time_j_lg = a*tlg + b
 
-                a = (tf_j - t0_j) / 2
-                b = (tf_j + t0_j) / 2
-                time_j_lg = a * tlg + b
+                fZ = Interp1D(time_rom_j,Z_j,extrapolate=True)
+                fL = Interp1D(time_rom_j,Lam,extrapolate=True)
+                Z_j_lg = fZ(time_j_lg)
+                Lam_lg = fL(time_j_lg)
+                
+                for i in range (opt_obj.leggauss_deg):
+                    
+                    
+                    Int_lambda += a*wlg[i]*Lam_lg[:,i]
+                    
+                    for (count,p) in enumerate(opt_obj.poly_comp):
+                        equation = ','.join(ascii[:p+1])
+                        operands = [Lam_lg[:,i]] + [Z_j_lg[:,i] for _ in range (p)]
+                        grad_tensors[count] -= a*wlg[i]*torch.einsum(equation,*operands)
+                    
+            
+            # Add the contribution of the initial condition (last term in (2.14)) to grad_Psi.
+            # Add also the contribution of the steady forcing to grad_Psi.
+            x0 = opt_obj.X[k,:,0]
+            f_k = opt_obj.F[:,k]
+            grad_Psi.add_(-torch.outer(x0, lam_j_0))
+            grad_Psi.add_(-torch.outer(f_k, Int_lambda))
 
-                # Batched adjoint integration using batched interpolant fZ
-                fZ = Interp1D(time_rom_j, Z_j, extrapolate=True)                     # Z_j: (B, r, nsave_rom)
-                sol_lam = my_etdrk4(etdrk4_coefs_T2, opt_obj.evaluate_rom_adjoint_nonlinear,
-                                    time_rom_j, lam_j_0, internal_steps, args=(fZ,)+tensors)  # (B, r, nsave_rom)
-                Lam = torch.fliplr(sol_lam)                                          # (B, r, nsave_rom)
-                lam_j_0 = Lam[:, :, 0]                                               # (B, r)
-
-                # Interpolants for quadrature (batched)
-                fL = Interp1D(time_rom_j, Lam, extrapolate=True)
-                Z_j_lg = fZ(time_j_lg)                                              # (B, r, leggauss_deg)
-                Lam_lg = fL(time_j_lg)                                              # (B, r, leggauss_deg)
-
-                # Accumulate Int_lambda across Gauss-Legendre points
-                Int_lambda += a * torch.einsum('q,brq->br', wlg, Lam_lg)             # (B, r)
-
-                # Accumulate grad_tensors across batch and quadrature
-                for (count, p) in enumerate(opt_obj.poly_comp):
-                    # Sum over quadrature points with weights, then reduce batch
-                    acc = torch.zeros_like(grad_tensors[count])
-                    for i_lg in range(opt_obj.leggauss_deg):
-                        # Build batched einsum: operands are (B, r)
-                        eq_parts = [f"...{ch}" for ch in ascii[:p+1]]                # ['...a','...b', ...]
-                        equation = ",".join(eq_parts)                                 # e.g., '...a,...b,...c'
-                        operands = [Lam_lg[..., i_lg]] + [Z_j_lg[..., i_lg] for _ in range(p)]
-                        tmp = torch.einsum(equation, *operands)                       # (B, r, r, ..., r)
-                        acc -= a * wlg[i_lg] * tmp.sum(dim=0)                         # sum over batch -> (r, r, ..., r)
-                    grad_tensors[count].add_(acc)
-
+        # Compute the gradient of the stability-promoting term
         if opt_obj.l2_pen is not None and pool.rank == 0:
             idx = opt_obj.poly_comp.index(1)    # index of the linear tensor
 
@@ -259,3 +259,104 @@ def create_objective_and_gradient(manifold,opt_obj,pool,fom):
 
     return cost, euclidean_gradient, euclidean_hessian
 
+
+def check_gradient_using_finite_difference(M,Phi,Psi,A2,A3,A4,opt_obj,mpi_pool,fom,eps):
+
+    cost, grad, _ = create_objective_and_gradient(M,opt_obj,mpi_pool,fom)
+    gPhi, gPsi, gA2, gA3, gA4 = grad(Phi,Psi,A2,A3,A4)
+
+    # Check Phi gradient 
+    delta = sp.linalg.orth(np.random.randn(3,2))
+    if mpi_pool.rank == 0: 
+        for k in range (1,mpi_pool.size):
+            mpi_pool.comm.send(delta,dest=k)
+    else:
+        delta = mpi_pool.comm.recv(source=0)
+
+    dfd = (0.5/eps)*(cost(Phi + eps*delta,Psi,A2,A3,A4) - cost(Phi - eps*delta,Psi,A2,A3,A4))
+    dgrad = np.trace(delta.T@gPhi)
+    error = np.abs(dfd - dgrad)
+    percent_error = error/np.abs(dfd)
+
+    if mpi_pool.rank == 0:
+        print("------ Error for Phi ------------")
+        print("dfd = %1.5e,\t dfgrad = %1.5e,\t error = %1.5e,\t percent error = %1.5e"%(dfd,dgrad,error,percent_error))
+        print("---------------------------------")
+
+
+    # Check Psi gradient 
+    delta = sp.linalg.orth(np.random.randn(3,2))
+    if mpi_pool.rank == 0: 
+        for k in range (1,mpi_pool.size):
+            mpi_pool.comm.send(delta,dest=k)
+    else:
+        delta = mpi_pool.comm.recv(source=0)
+
+    dfd = (0.5/eps)*(cost(Phi,Psi + eps*delta,A2,A3,A4) - cost(Phi,Psi - eps*delta,A2,A3,A4))
+    dgrad = np.trace(delta.T@gPsi)
+    error = np.abs(dfd - dgrad)
+    percent_error = 100*error/np.abs(dfd)
+
+    if mpi_pool.rank == 0:
+        print("------ Error for Psi ------------")
+        print("dfd = %1.5e,\t dfgrad = %1.5e,\t error = %1.5e,\t percent error = %1.5e"%(dfd,dgrad,error,percent_error))
+        print("---------------------------------")
+
+
+    # Check A2 gradient 
+    delta = np.random.randn(2,2)
+    delta = delta/np.sqrt(np.trace(delta.T@delta))
+    if mpi_pool.rank == 0: 
+        for k in range (1,mpi_pool.size):
+            mpi_pool.comm.send(delta,dest=k)
+    else:
+        delta = mpi_pool.comm.recv(source=0)
+
+    dfd = (0.5/eps)*(cost(Phi,Psi,A2 + eps*delta,A3,A4) - cost(Phi,Psi,A2 - eps*delta,A3,A4))
+    dgrad = np.trace(delta.T@gA2)
+    error = np.abs(dfd - dgrad)
+    percent_error = 100*error/np.abs(dfd)
+
+    if mpi_pool.rank == 0:
+        print("------ Error for A2 -------------")
+        print("dfd = %1.5e,\t dfgrad = %1.5e,\t error = %1.5e,\t percent error = %1.5e"%(dfd,dgrad,error,percent_error))
+        print("---------------------------------")
+
+    # Check A3 gradient 
+    delta = np.random.randn(2,2,2)
+    delta = delta/np.sqrt(np.einsum('ijk,ijk',delta,delta))
+    if mpi_pool.rank == 0: 
+        for k in range (1,mpi_pool.size):
+            mpi_pool.comm.send(delta,dest=k)
+    else:
+        delta = mpi_pool.comm.recv(source=0)
+
+    dfd = (0.5/eps)*(cost(Phi,Psi,A2,A3 + eps*delta,A4) - cost(Phi,Psi,A2,A3 - eps*delta,A4))
+    dgrad = np.einsum('ijk,ijk',delta,gA3)
+    error = np.abs(dfd - dgrad)
+    percent_error = 100*error/np.abs(dfd)
+
+    if mpi_pool.rank == 0:
+        print("------ Error for A3 -------------")
+        print("dfd = %1.5e,\t dfgrad = %1.5e,\t error = %1.5e,\t percent error = %1.5e"%(dfd,dgrad,error,percent_error))
+        print("---------------------------------")
+
+
+    # Check A4 gradient 
+    delta = np.random.randn(2,2,2,2)
+    delta = delta/np.sqrt(np.einsum('ijkl,ijkl',delta,delta))
+    if mpi_pool.rank == 0: 
+        for k in range (1,mpi_pool.size):
+            mpi_pool.comm.send(delta,dest=k)
+    else:
+        delta = mpi_pool.comm.recv(source=0)
+        
+    dfd = (0.5/eps)*(cost(Phi,Psi,A2,A3,A4 + eps*delta) - cost(Phi,Psi,A2,A3,A4 - eps*delta))
+    dgrad = np.einsum('ijkl,ijkl',delta,gA4)
+    error = np.abs(dfd - dgrad)
+    percent_error = 100*error/np.abs(dfd)
+
+    if mpi_pool.rank == 0:
+        print("------ Error for A4 -------------")
+        print("dfd = %1.5e,\t dfgrad = %1.5e,\t error = %1.5e,\t percent error = %1.5e"%(dfd,dgrad,error,percent_error))
+        print("---------------------------------")

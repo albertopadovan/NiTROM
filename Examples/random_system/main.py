@@ -28,7 +28,7 @@ else:
     verb = 0
 
 n = 2000
-n_traj = 30
+n_traj = 6
 C = torch.eye(n, device=device, dtype=torch.float64)
 fom = fom_class.full_order_model(C)
 
@@ -105,24 +105,22 @@ point = tuple(point)
 t1 = time.time()
 grad_vals = grad_batch(*point)
 t2 = time.time()
-grad_norm = 0.0
-for g in grad_vals:
-    grad_norm += np.linalg.norm(g)**2
-print(grad_norm)
 print("Batched", t2 - t1)
 
 # print()
 t1 = time.time()
-grad_vals = grad(*point)
+grad_vals_unbatched = grad(*point)
 t2 = time.time()
 # t1 = time.time()
 # grad_vals = grad(*point)
 # t2 = time.time()
-grad_norm = 0.0
-for g in grad_vals:
-    grad_norm += np.linalg.norm(g)**2
-print(grad_norm)
 print("Not batched", t2 - t1)
+
+for i in range(len(grad_vals)):
+    g = grad_vals[i]
+    gu = grad_vals_unbatched[i]
+    error = np.linalg.norm(g - gu) / np.linalg.norm(gu) * 100
+    print("Percent error = %1.15e"%error)
 
 if world_size > 1: torch.distributed.barrier()
 gpu_utils.cleanup_distributed()

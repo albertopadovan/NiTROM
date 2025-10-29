@@ -100,13 +100,14 @@ def create_objective_and_gradient(manifold,opt_obj,pool,fom):
         t_unit = torch.linspace(0.0, 1.0, steps=opt_obj.nsave_rom, device=pool.device, dtype=torch.float64)
         
 
+        
         B = opt_obj.my_n_traj
 
         # Initialize arrays to store the gradients
         n, r = Phi.shape
         grad_Phi = torch.zeros((B, n,r), device=pool.device, dtype=Phi.dtype)
         grad_Psi = torch.zeros((B, n,r), device=pool.device, dtype=Phi.dtype)
-        grad_tensors = [torch.zeros_like(tensor) for tensor in tensors]
+        grad_tensors = [torch.zeros((B, *tensor.shape), device=pool.device, dtype=Phi.dtype) for tensor in tensors]
         
 
         # Initialize arrays needed for future computations
@@ -215,25 +216,24 @@ def create_objective_and_gradient(manifold,opt_obj,pool,fom):
 
                 # --------------------------------------------------------------------------
                 
-                # # Interpolate Z_j and Lam onto Gauss-Legendre points
-                # a = (tf_j - t0_j)/2
-                # b = (tf_j + t0_j)/2
-                # time_j_lg = a*tlg + b
+                # Interpolate Z_j and Lam onto Gauss-Legendre points
+                a = (tf_j - t0_j)/2
+                b = (tf_j + t0_j)/2
+                time_j_lg = a*tlg + b
 
-                # fZ = Interp1D(time_rom_j,Z_j,extrapolate=True)
-                # fL = Interp1D(time_rom_j,Lam,extrapolate=True)
-                # Z_j_lg = fZ(time_j_lg)
-                # Lam_lg = fL(time_j_lg)
+                fZ = Interp1D(time_rom_j,Z_j,extrapolate=True)
+                fL = Interp1D(time_rom_j,Lam,extrapolate=True)
+                Z_j_lg = fZ(time_j_lg) # (B, r, tlg)
+                Lam_lg = fL(time_j_lg) # (B, r, tlg)
                 
-                # for i in range (opt_obj.leggauss_deg):
+                for i in range (opt_obj.leggauss_deg):
                     
+                    Int_lambda += a*wlg[i]*Lam_lg[:, :, i]
                     
-                #     Int_lambda += a*wlg[i]*Lam_lg[:,i]
-                    
-                #     for (count,p) in enumerate(opt_obj.poly_comp):
-                #         equation = ','.join(ascii[:p+1])
-                #         operands = [Lam_lg[:,i]] + [Z_j_lg[:,i] for _ in range (p)]
-                #         grad_tensors[count] -= a*wlg[i]*torch.einsum(equation,*operands)
+                    for (count,p) in enumerate(opt_obj.poly_comp):
+                        equation = 'k' + ',k'.join(ascii[:p+1]) + ' -> k' + ''.join(ascii[:p+1])
+                        operands = [Lam_lg[:, :, i]] + [Z_j_lg[:, :, i] for _ in range (p)]
+                        grad_tensors[count] -= a*wlg[i]*torch.einsum(equation,*operands)
                     
             
             # Add the contribution of the initial condition (last term in (2.14)) to grad_Psi.
@@ -247,6 +247,7 @@ def create_objective_and_gradient(manifold,opt_obj,pool,fom):
 
         # Compute the gradient of the stability-promoting term
         if opt_obj.l2_pen is not None and pool.rank == 0:
+            print("Inside stability-promoting penalty")
             idx = opt_obj.poly_comp.index(1)    # index of the linear tensor
 
             time_pen = torch.linspace(0,opt_obj.pen_tf,opt_obj.n_snapshots*opt_obj.nsave_rom,device=pool.device)
@@ -271,6 +272,7 @@ def create_objective_and_gradient(manifold,opt_obj,pool,fom):
                     grad_tensors[idx] += -a*wlg[i]*torch.einsum('i,j',Muk[:,i],Zk[:,i])
 
         if pool.world_size > 1:
+            print("Inside multi GPU")
             grad_Phi = grad_Phi.contiguous()
             grad_Psi = grad_Psi.contiguous()
             dist.all_reduce(grad_Phi, op=dist.ReduceOp.SUM)
@@ -280,16 +282,23 @@ def create_objective_and_gradient(manifold,opt_obj,pool,fom):
                 dist.all_reduce(grad_tensors[k], op=dist.ReduceOp.SUM)
 
         if opt_obj.which_fix == 'fix_bases':
-
+            print("Inside fix_bases")
             grad_Phi *= 0.0; grad_Psi *= 0.0
 
         elif opt_obj.which_fix == 'fix_tensors':    
-            
+            print("Inside fix_tensors")
             for k in range (len(grad_tensors)): grad_tensors[k] *= 0.0
+
+        grad_Phi = torch.sum(grad_Phi, dim=0) # (n, r)
+        grad_Psi = torch.sum(grad_Psi, dim=0)
+        for i in range (len(grad_tensors)):
+            grad_tensors[i] = torch.sum(grad_tensors[i], dim=0)
+
 
         grad_Phi = grad_Phi.cpu().numpy()
         grad_Psi = grad_Psi.cpu().numpy()
         grad_tensors = tuple(tensor.cpu().numpy() for tensor in grad_tensors)
+
 
         return grad_Phi, grad_Psi, *grad_tensors
     

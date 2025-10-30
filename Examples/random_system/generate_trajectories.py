@@ -1,6 +1,6 @@
 import numpy as np
 from scipy.linalg import qr
-import fom_class
+# import fom_class
 
 n = 2000
 r = 250

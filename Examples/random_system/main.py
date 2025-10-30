@@ -8,9 +8,9 @@ import pymanopt
 import pymanopt.manifolds as manifolds
 import pymanopt.optimizers as optimizers
 
-from NiTROM_GPU_Batch.Optimization_Functions import classes as classes_batch, nitrom_functions as nitrom_functions_batch
-from NiTROM_GPU.Optimization_Functions import classes, nitrom_functions
-from NiTROM_GPU_Batch.PyTorch_Functions import gpu_utils
+from NiTROM_GPU.Optimization_Functions import classes as classes_batch, nitrom_functions as nitrom_functions_batch
+from NiTROM_GPU_unbatched.Optimization_Functions import classes, nitrom_functions
+from NiTROM_GPU_unbatched.PyTorch_Functions import gpu_utils
 import fom_class
 
 plt.rcParams.update({"font.family":"serif","font.sans-serif":["Computer Modern"],'font.size':18,'text.usetex':True})
@@ -31,6 +31,8 @@ n = 2000
 n_traj = 30
 C = torch.eye(n, device=device, dtype=torch.float64)
 fom = fom_class.full_order_model(C)
+
+# torch.backends.opt_einsum.is_available()
 
 traj_path = "./trajectories/"
 
@@ -105,21 +107,30 @@ point = tuple(point)
 t1 = time.time()
 grad_vals = grad_batch(*point)
 t2 = time.time()
-grad_norm = 0.0
-for g in grad_vals:
-    grad_norm += np.linalg.norm(g)**2
-print(grad_norm)
-print("Batched", t2 - t1)
+t1 = time.time()
+grad_vals = grad_batch(*point)
+t2 = time.time()
+tb = t2 - t1
+print("Batched", tb)
 
 # print()
 t1 = time.time()
-grad_vals = grad(*point)
+grad_vals_unbatched = grad(*point)
 t2 = time.time()
-grad_norm = 0.0
-for g in grad_vals:
-    grad_norm += np.linalg.norm(g)**2
-print(grad_norm)
-print("Not batched", t2 - t1)
+tu = t2 - t1
+# t1 = time.time()
+# grad_vals = grad(*point)
+# t2 = time.time()
+print("Not batched", tu)
+
+print("Speedup = %1.5f"%(tu/tb))
+
+
+for i in range(len(grad_vals)):
+    g = grad_vals[i]
+    gu = grad_vals_unbatched[i]
+    error = np.linalg.norm(g - gu) / np.linalg.norm(gu) * 100
+    print("Percent error = %1.15e"%error)
 
 if world_size > 1: torch.distributed.barrier()
 gpu_utils.cleanup_distributed()

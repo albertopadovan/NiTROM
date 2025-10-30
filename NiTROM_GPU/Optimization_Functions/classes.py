@@ -325,6 +325,7 @@ class optimization_objects:
         f_stable = f[mask]
         u_stable = u_vec[mask]
 
+        # print(u_stable.shape, f_stable.shape)
         dzdt_stable = u_stable + f_stable
 
         for (i, k) in enumerate(self.poly_comp[1:], start=1):

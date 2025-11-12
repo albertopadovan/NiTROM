@@ -5,6 +5,8 @@ import time
 def rk4_step(fun, t, x, dt, args=()):
     """
     Performs a single integration step using the fourth-order Runge-Kutta (RK4) method.
+
+    Supports x of shape (n,) or (B, n). fun(t, x, *args) must return the same shape as x.
     """
 
     k1 = fun(t, x, *args)
@@ -17,76 +19,110 @@ def rk4_step(fun, t, x, dt, args=()):
 
 def my_rk4(fun, t_vec, x0, args=()):
     """
-    Integrates a system of ordinary differential equations using a fourth-order Runge-Kutta (RK4) method.
-    Compatible with pyTorch tensors.
+    Integrates ODEs using RK4. PyTorch-compatible.
 
-    Args:
-        fun (callable): The function that computes the derivatives, with signature `fun(t, x, *args)`.
-        t_vec (torch.Tensor): 1D tensor or array of time points at which to solve for the state.
-        x0 (torch.Tensor): Initial state vector.
-        args (tuple, optional): Additional arguments to pass to `fun`.
+    Supports:
+      - x0: (n,) -> returns (n, T)
+      - x0: (B, n) -> returns (B, n, T)
 
-    Returns:
-        xs: A tensor containing the state at each time point in `t_vec`. Each column corresponds to the state at a time step.
+    fun(t, x, *args) must support batched x.
     """
 
     x = x0.clone()
-    dt = (t_vec[1] - t_vec[0])/100
-    xs = torch.zeros((len(x0), len(t_vec)), dtype=x0.dtype, device=x0.device)
-    xs[:, 0] = x0
+    dt = (t_vec[1] - t_vec[0]) / 10  # 0-dim tensor
+    Tlen = t_vec.shape[0]
+
+    if x0.ndim == 1:
+        xs = torch.zeros((x0.shape[0], Tlen), dtype=x0.dtype, device=x0.device)
+        xs[:, 0] = x0
+    elif x0.ndim == 2:
+        B, n = x0.shape
+        xs = torch.zeros((B, n, Tlen), dtype=x0.dtype, device=x0.device)
+        xs[:, :, 0] = x0
+    else:
+        raise ValueError("x0 must be 1D (n,) or 2D (B, n).")
+
     t = t_vec[0].clone()
     for i, T in enumerate(t_vec[1:], start=1):
-        while t < T:
-            dt_trial = min(dt, T - t)
+        while (t < T).item():
+            dt_trial = torch.minimum(dt, T - t)
             x = rk4_step(fun, t, x, dt_trial, args)
-            t += dt_trial
-        xs[:, i] = x
+            t = t + dt_trial
+        if x0.ndim == 1:
+            xs[:, i] = x
+        else:
+            xs[:, :, i] = x
 
     return xs
 
 
-def my_rk4_adaptive(fun, t_vec, x0, args=(), *, atol=1e-6, rtol=1e-3, safety_factor=0.8, fac_min=0.1, fac_max=5.0):
+def my_rk4_adaptive(
+    fun,
+    t_vec,
+    x0,
+    args=(),
+    *,
+    atol=1e-6,
+    rtol=1e-3,
+    safety_factor=0.8,
+    fac_min=0.1,
+    fac_max=5.0
+):
     """
-    Integrates a system of ordinary differential equations using an adaptive fourth-order Runge-Kutta (RK4) method.
-    Compatible with PyTorch tensors.
+    Adaptive RK4 with shared step across batch.
 
-    Args:
-        fun (callable): The function that computes the derivatives, with signature `fun(t, x, *args)`.
-        t_vec (torch.Tensor): 1D tensor or array of time points at which to solve for the state.
-        x0 (torch.Tensor): Initial state vector.
-        args (tuple, optional): Additional arguments to pass to `fun`.
+    Supports:
+      - x0: (n,) -> returns (n, T)
+      - x0: (B, n) -> returns (B, n, T)
 
-    Returns:
-        xs: A tensor containing the state at each time point in `t_vec`. Each column corresponds to the state at a time step.
+    fun(t, x, *args) must support batched x.
     """
 
     x = x0.clone().detach()
-    dt = (t_vec[1] - t_vec[0])/10
-    xs = torch.zeros((len(x0), len(t_vec)), dtype=x0.dtype, device=x0.device)
-    xs[:, 0] = x0
+    dt = (t_vec[1] - t_vec[0]) / 10  # 0-dim tensor
+    Tlen = t_vec.shape[0]
+
+    if x0.ndim == 1:
+        xs = torch.zeros((x0.shape[0], Tlen), dtype=x0.dtype, device=x0.device)
+        xs[:, 0] = x0
+    elif x0.ndim == 2:
+        B, n = x0.shape
+        xs = torch.zeros((B, n, Tlen), dtype=x0.dtype, device=x0.device)
+        xs[:, :, 0] = x0
+    else:
+        raise ValueError("x0 must be 1D (n,) or 2D (B, n).")
+
     t = t_vec[0]
     for i, T in enumerate(t_vec[1:], start=1):
-        while t < T:
-            dt_trial = min(dt, T - t)
+        while (t < T).item():
+            dt_trial = torch.minimum(dt, T - t)
+
             x_full = rk4_step(fun, t, x, dt_trial, args)
             x_half1 = rk4_step(fun, t, x, dt_trial / 2, args)
-            x_half2 = rk4_step(fun, t + dt_trial / 2,
-                               x_half1, dt_trial / 2, args)
+            x_half2 = rk4_step(fun, t + dt_trial / 2, x_half1, dt_trial / 2, args)
 
             dx = x_half2 - x_full
-            scale = atol + rtol * \
-                torch.max(torch.abs(x_full), torch.abs(x_half2))
-            err_vec = torch.abs(dx)/scale
-            err = torch.max(err_vec)
+            scale = atol + rtol * torch.maximum(torch.abs(x_full), torch.abs(x_half2))
+            err_vec = torch.abs(dx) / scale
 
-            if err <= 1.0:
+            # Global error across all batch items and states
+            err = torch.amax(err_vec)
+
+            if (err <= 1.0).item():
                 t = t + dt_trial
                 x = x_half2
 
-            exponent = 1.0/(4.0+1.0)
-            dt_new = dt_trial * safety_factor * (1.0/err)**exponent
-            dt = torch.clamp(dt_new, min=dt*fac_min, max=dt*fac_max)
-        xs[:, i] = x
+            # Update dt (guard for err == 0)
+            exponent = 1.0 / 5.0
+            dt_growth = dt_trial * safety_factor * torch.where(
+                err > 0, (1.0 / err) ** exponent, torch.tensor(fac_max, device=dt_trial.device, dtype=dt_trial.dtype)
+            )
+            dt = torch.clamp(dt_growth, min=dt * fac_min, max=dt * fac_max)
+
+        if x0.ndim == 1:
+            xs[:, i] = x
+        else:
+            xs[:, :, i] = x
 
     return xs
 

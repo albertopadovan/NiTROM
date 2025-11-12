@@ -6,14 +6,8 @@ from string import ascii_lowercase as ascii
 import pymanopt
 
 import time as tlib
-from ..PyTorch_Functions.integrators import my_etdrk4, etdrk4_setup
+from ..PyTorch_Functions.integrators import my_etdrk4, etdrk4_setup, my_rk4_adaptive
 from ..PyTorch_Functions.linear_interpolation import Interp1D
-
-from opt_einsum import contract
-
-import nvtx
-
-# torch.backends.opt_einsum.enabled = True
 
 def create_objective_and_gradient(manifold,opt_obj,pool,fom):
     
@@ -57,7 +51,8 @@ def create_objective_and_gradient(manifold,opt_obj,pool,fom):
             # u_k = Psi.T @ F[:,k] => u = F.T @ Psi -> (B, r)
             u_batch = opt_obj.F.T @ Psi                  # (B, r)
 
-            sol = my_etdrk4(etdrk4_coefs, opt_obj.evaluate_rom_rhs_nonlinear, opt_obj.time, z0, internal_steps, args=(u_batch,)+tensors)  # (B, r, T)
+            # sol = my_etdrk4(etdrk4_coefs, opt_obj.evaluate_rom_rhs_nonlinear, opt_obj.time, z0, internal_steps, args=(u_batch,)+tensors)  # (B, r, T)
+            sol = my_rk4_adaptive(opt_obj.evaluate_rom_rhs, opt_obj.time, z0, args=(u_batch,)+tensors)
 
             # Compute outputs in batch
             # y_true = C @ X  -> (B, 1, T); y_model = C @ (PhiF @ Z) -> (B, 1, T)

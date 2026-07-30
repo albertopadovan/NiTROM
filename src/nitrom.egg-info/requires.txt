@@ -1,0 +1,10 @@
+numpy
+scipy
+numba
+matplotlib
+torch
+dill
+
+[dev]
+pytest
+ruff

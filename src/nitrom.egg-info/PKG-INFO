@@ -1,0 +1,27 @@
+Metadata-Version: 2.4
+Name: nitrom
+Version: 0.1.0
+Summary: Non-intrusive Trajectory-based Reduced-Order Modelling
+Home-page: https://github.com/albertopadovan/NiTROM
+Author: Alberto Padovan
+Author-email: Alberto Padovan <alberto.padovan.94@gmail.com>
+License-Expression: MIT
+Requires-Python: >=3.6
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: numpy
+Requires-Dist: scipy
+Requires-Dist: numba
+Requires-Dist: matplotlib
+Requires-Dist: torch
+Requires-Dist: dill
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: ruff; extra == "dev"
+Dynamic: author
+Dynamic: home-page
+Dynamic: license-file
+Dynamic: requires-python
+
+# NiTROM
+Non-intrusive Trajectory-based Reduced-Order Modelling

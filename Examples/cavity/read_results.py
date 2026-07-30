@@ -1,336 +1,475 @@
-import numpy as np 
-import scipy 
+import os
+import pickle
+import numpy as np
+import scipy as sp
 import matplotlib.pyplot as plt
-from mpi4py import MPI
+from matplotlib.ticker import AutoMinorLocator, LogLocator, NullFormatter
+
+import classes_cavity
 import time_steppers as tstep
-
-from scipy.interpolate import interp1d
-from scipy.integrate import solve_ivp
-import sys, os
-
-# sys.path.append("/Users/alberto/Documents/SIAM_nitrom/OptimizationFunctions/")
 import post_process as pp
+from nitrom.backend import set_backend
+from nitrom.latent_space_models.polynomial_model import PolynomialModel
+from nitrom.plotting import COLORS, STYLES, set_plot_style
+from nitrom.projections.linear_projection import LinearProjection
+from nitrom.time_steppers.time_stepper import solve_ivp
+from nitrom.training_data import TrainingPool
 
-import pymanopt
-import pymanopt.manifolds as manifolds
-import pymanopt.optimizers as optimizers
-from pymanopt.tools.diagnostics import check_gradient
+# Pure-numpy CPU run.
+set_backend("numpy")
+set_plot_style()
+
+dtype = np.float64
+
+FIG_WIDTH = 3.4
+FIG_WIDTH_WIDE = 6.8
+FIG_HEIGHT = 2.6
+TRAINING_SHADE = "#ececec"
+rtol = 1e-4
+atol = 1e-8
 
 
-plt.rcParams.update({"font.family":"serif","font.sans-serif":["Computer Modern"],'font.size':18,'text.usetex':True})
-plt.rc('text.latex',preamble=r'\usepackage{amsmath}')
-
-sys.path.append(os.path.abspath("../../OptimizationFunctions/"))
-
-
-from my_pymanopt_classes import myAdaptiveLineSearcher
-
-import classes
-import nitrom_functions 
-import opinf_functions as opinf_fun
-import troop_functions
-import classes_cavity 
+def make_figure(*, wide=False):
+    width = FIG_WIDTH_WIDE if wide else FIG_WIDTH
+    return plt.subplots(figsize=(width, FIG_HEIGHT))
 
 
-cPOD, cOI, cTR, cOPT = '#66c2a5', '#fc8d62', '#8da0cb', '#e78ac3'
-lPOD, lOI, lTR, lOPT = 'solid', 'dotted', 'dashed', 'dashdot'
+def style_axes(ax, *, xlabel="", ylabel="", xlim=None, ylim=None, log_y=False):
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    if xlim is not None:
+        ax.set_xlim(xlim)
+    if ylim is not None:
+        bottom, top = ylim
+        ax.set_ylim(bottom=bottom, top=top)
+    if log_y:
+        ax.set_yscale("log")
+        ax.yaxis.set_major_locator(LogLocator(base=10.0))
+        ax.yaxis.set_minor_locator(LogLocator(base=10.0, subs=np.arange(2, 10) * 0.1))
+        ax.yaxis.set_minor_formatter(NullFormatter())
+    else:
+        ax.yaxis.set_minor_locator(AutoMinorLocator())
+    ax.xaxis.set_minor_locator(AutoMinorLocator())
+    ax.grid(which="major", color="#d7d7d7", linewidth=0.55, alpha=0.7)
+    ax.grid(which="minor", color="#efefef", linewidth=0.4, alpha=0.8)
 
-#%%
 
+def add_training_window(ax, x_end=20.0):
+    ax.axvspan(0.0, x_end, color=TRAINING_SHADE, alpha=0.9, zorder=0)
+    ax.text(
+        0.25,
+        0.12,
+        "Training window",
+        transform=ax.transAxes,
+        ha="center",
+        va="bottom",
+        fontsize=11,
+        bbox=dict(facecolor="white", edgecolor="#6f6f6f", linewidth=0.6, alpha=0.95, boxstyle="round,pad=0.25"),
+    )
+
+
+def save_figure(fig, stem):
+    os.makedirs("figures", exist_ok=True)
+    fig.savefig(f"figures/{stem}.eps", format="eps")
+    fig.savefig(f"figures/{stem}.png", format="png")
+    plt.close(fig)
+
+
+# Cavity physical dimensions/parameters
 Lx = 1
 Ly = 1
 Nx = 100
 Ny = 100
-
 dx = Lx/Nx
 dy = Ly/Ny
 Re = 8300
 
-flow = classes_cavity.flow_parameters(Lx,Ly,Nx,Ny,Re)
-
 n = 400
 dt = 1.0/n
+dt_orig = dt
 
-lops = classes_cavity.linear_operators_2D(flow,dt)
-flow.q_sbf = np.load("bflow_Re%d_Nx%d_Ny%d.npy"%(Re,Nx,Ny))
-fom = classes_cavity.fom_class(flow,lops)
+# Setup the flow & FOM
+flow = classes_cavity.flow_class(Lx, Ly, Nx, Ny, Re)
+lops = classes_cavity.linear_operators_2D(flow, dt)
+flow.q_sbf = np.load("bflow_Re%d_Nx%d_Ny%d.npy" % (Re, Nx, Ny))
+fom = classes_cavity.fom_class(flow, lops)
 fom.assemble_forcing_profile(0.95, 0.05)
+B = fom.f.copy()  # shape (19700,)
 
-#%%
-
+# Trajectory details
 traj_path = "./trajectories/"
+which = 'train'  # 'train' or 'test'
 
-fname_traj = traj_path + "traj_%03d.npy"
-fname_weight = traj_path + "weight_%03d.npy"
-fname_deriv = traj_path + "deriv_%03d.npy"
-fname_time = traj_path + "time.npy"
+if which == 'train':
+    fname_traj = traj_path + "traj_%03d.npy"
+    fname_weight = traj_path + "weight_%03d.npy"
+    fname_deriv = traj_path + "deriv_%03d.npy"
+    fname_time = traj_path + "time.npy"
+    amps = np.load(traj_path + "amps.npy")
+else:
+    fname_traj = traj_path + "traj_%03d_testing.npy"
+    fname_weight = traj_path + "weight_%03d_testing.npy"
+    fname_deriv = traj_path + "deriv_%03d_testing.npy"
+    fname_time = traj_path + "time.npy"
+    amps = np.load(traj_path + "amps_testing.npy")
 
-
-amps = np.load(traj_path + "amps.npy")
-Phi_pre = np.load(traj_path + "Phi_pre.npy")
+phi_pre = np.load(traj_path + "phi_pre.npy")  # (19700, 200)
 n_traj = len(amps)
+n = phi_pre.shape[-1]
 
-n = Phi_pre.shape[-1]
+# Load the trajectories into a TrainingPool
+pool = TrainingPool(
+    n_traj=n_traj,
+    fname_traj=fname_traj,
+    fname_time=fname_time,
+    dtype=dtype,
+    fname_weights=fname_weight,
+    fname_derivs=fname_deriv,
+)
 
-#%%
-pool_inputs = (MPI.COMM_WORLD, n_traj, fname_traj, fname_time)
-pool_kwargs = {'fname_weights':fname_weight,'fname_derivs':fname_deriv}
-pool = classes.mpi_pool(*pool_inputs,**pool_kwargs)
-
-
-r = 50               # ROM dimension
-poly_comp = [1,2]   # Model with a linear part and a quadratic part
-
-
-#%%
-Phi_pod = np.zeros((n,r))
-Phi_pod[:r,:r] = np.eye(r)
-Psi_pod = Phi_pod.copy()
+# Load the trained ROMs
+models_dir = "./models/"
 
 
-tensors_pod, _ = fom.assemble_petrov_galerkin_tensors(Phi_pre@Phi_pod,Phi_pre@Psi_pod)
-
-#%%
-which_trajs = np.arange(0,pool.my_n_traj,1)
-which_times = np.arange(0,pool.n_snapshots,1)
-leggauss_deg = 5
-nsave_rom = 15
-
-opt_obj_inputs = (pool,which_trajs,which_times,leggauss_deg,nsave_rom,[1,2])
-opt_obj_kwargs = {'stab_promoting_pen':0.0,'stab_promoting_tf':150,'stab_promoting_ic':(np.random.randn(r),)}
-
-
-opt_obj = classes.optimization_objects(*opt_obj_inputs)
-
-St = manifolds.Stiefel(n,r)
-Gr = manifolds.Grassmann(n,r)
-Euc_rr = manifolds.Euclidean(r,r)
-Euc_rrr = manifolds.Euclidean(r,r,r)
-
-M = manifolds.Product([Gr,St,Euc_rr,Euc_rrr])
-cost, grad, hess = nitrom_functions.create_objective_and_gradient(M,opt_obj,pool,fom)
-problem = pymanopt.Problem(M,cost,euclidean_gradient=grad)
+def load_rom(fname):
+    with open(os.path.join(models_dir, fname), "rb") as f:
+        ckpt = pickle.load(f)
+    rom = PolynomialModel(
+        ckpt["r"],
+        ckpt["poly_comp"],
+        dtype=dtype,
+        tensors=[np.asarray(t, dtype=dtype) for t in ckpt["tensors"]],
+        forcing_config=ckpt["forcing_config"],
+    )
+    Phi = np.asarray(ckpt["Phi"], dtype=dtype)
+    Psi = np.asarray(ckpt.get("Psi", ckpt["Phi"]), dtype=dtype)
+    return rom, Phi, Psi
 
 
-#%%
+rom_pod, Phi_pod, Psi_pod = load_rom("galerkin_model.pkl")
+proj_pod = LinearProjection([Phi_pod, Psi_pod])
 
-pool_inputs = (MPI.COMM_WORLD, n_traj, fname_traj, fname_time)
-pool_kwargs = {'fname_weights':fname_weight,'fname_derivs':fname_deriv}
-pool = classes.mpi_pool(*pool_inputs,**pool_kwargs)
+rom_oi, Phi_oi, Psi_oi = load_rom("opinf_model.pkl")
+proj_oi = LinearProjection([Phi_oi, Psi_oi])
 
-print(pool.weights)
+rom_oi_gs, Phi_oi_gs, Psi_oi_gs = load_rom("gas_opinf_model.pkl")
+proj_oi_gs = LinearProjection([Phi_oi_gs, Psi_oi_gs])
 
-weights = pool.weights.copy()
-pool.weights *= pool.n_traj*pool.n_snapshots
+rom_nit, Phi_nit, Psi_nit = load_rom("nitrom_model.pkl")
+proj_nit = LinearProjection([Phi_nit, Psi_nit])
 
-print(pool.weights)
-lam = np.logspace(3,4,num=20)
-cost_oi = []
-for (count,l) in enumerate(lam):
-    tensors_opinf = opinf_fun.operator_inference(pool,Phi_pod,poly_comp,[0.0,l])
-    point = (Phi_pod,Psi_pod) + tensors_opinf
-    cost_oi.append(cost(*point))
-    print("Computing OpInf with lambda = %1.2e (%d/%d). Cost = %1.7e"%(l,count + 1,len(lam),cost_oi[-1]))
-    
-pool.weights = weights
+rom_nit_gs, Phi_nit_gs, Psi_nit_gs = load_rom("gas_nitrom_model.pkl")
+proj_nit_gs = LinearProjection([Phi_nit_gs, Psi_nit_gs])
 
-print(pool.weights)
+r = rom_pod._r
 
-#%%
-# plt.figure()
-# plt.plot(lam[0:],cost_oi[0:])
+# --- 1) Energy of perturbations (only plotted for training) ---
+if which == 'train':
+    fig, ax = make_figure()
+    for k in range(pool.my_n_traj):
+        Qk = pool.X[k]
+        energy_k = np.linalg.norm(Qk, axis=0)**2
+        ax.plot(pool.time, energy_k, color='k', alpha=0.85)
+    style_axes(ax, xlabel=r'Time $t$', ylabel='Energy of perturbations', xlim=(0.0, pool.time[-1]))
+    ax.set_ylim(bottom=0)
+    add_training_window(ax, x_end=20.0)
+    save_figure(fig, "cavity_energy_perturbations")
 
-pool_inputs = (MPI.COMM_WORLD, n_traj, fname_traj, fname_time)
-pool_kwargs = {'fname_weights':fname_weight,'fname_derivs':fname_deriv}
-pool = classes.mpi_pool(*pool_inputs,**pool_kwargs)
+# --- 2) Validation Error ---
+t_eval = pool.time
+t0, tf = float(t_eval[0]), float(t_eval[-1])
+dt = float(t_eval[1] - t_eval[0])
+idx_final = len(t_eval) // 2
 
+error_pod = np.zeros_like(t_eval)
+error_oi = np.zeros_like(t_eval)
+error_oi_gs = np.zeros_like(t_eval)
+error_nit = np.zeros_like(t_eval)
+error_nit_gs = np.zeros_like(t_eval)
 
-weights = pool.weights.copy()
-pool.weights *= pool.n_traj*pool.n_snapshots
-
-
-tensors_oi = opinf_fun.operator_inference(pool,Phi_pod,poly_comp,[0,0.01])
-point = (Phi_pod,Psi_pod) + tensors_pod
-print(cost(*point))
-
-pool.weights = weights
-# np.save("data/A2_oi.npy",tensors_oi[0])
-# np.save("data/A3_oi.npy",tensors_oi[1].reshape((r,r**2)))
-
-#%%
-
-Phi_nit = np.load("data/Phi_nit.npy")
-Psi_nit = np.load("data/Psi_nit.npy")
-A2_nit = np.load("data/A2_nit.npy")
-A3_nit = np.load("data/A3_nit.npy").reshape((r,r,r))
-
-tensors_nit = (A2_nit,A3_nit)
-
-#%%
-time = pool.time
-u = np.zeros(r)
-
-plt.figure()
 for k in range(n_traj):
-    
-    mean_en = np.mean(np.linalg.norm(pool.X[k,],axis=0)**2)
-    
-    # pod
-    zpod = Psi_pod.T@pool.X[k,:,0]
-    sol = Phi_pod@(solve_ivp(opt_obj.evaluate_rom_rhs,[0,time[-1]],zpod,'RK45',t_eval=time,args=(u,) + tensors_pod)).y
-    epod = np.linalg.norm(sol - pool.X[k,],axis=0)**2/mean_en
-    plt.plot(time,epod,color=cPOD,linestyle=lPOD)
-    
+    mean_en = np.mean(np.linalg.norm(pool.X[k], axis=0)**2)
+    z0 = Psi_pod.T @ pool.X[k, :, 0]
+
+    # POD-Gal.
+    sol_pod_r = solve_ivp(rom_pod.evaluate_rhs, z0, t0, tf, dt, t_eval, "rk45", rtol=rtol, atol=atol)
+    sol_pod = proj_pod.decode(sol_pod_r.T).T
+    error_pod += np.linalg.norm(sol_pod - pool.X[k], axis=0)**2 / mean_en / n_traj
+
     # OpInf
-    zoi = Psi_pod.T@pool.X[k,:,0]
-    sol = Phi_pod@(solve_ivp(opt_obj.evaluate_rom_rhs,[0,time[-1]],zoi,'RK45',t_eval=time,args=(u,) + tensors_oi)).y
-    eoi = np.linalg.norm(sol - pool.X[k,],axis=0)**2/mean_en
-    plt.plot(time,eoi,color=cOI,linestyle=lOI)
-    
+    z0_oi = Psi_oi.T @ pool.X[k, :, 0]
+    sol_oi_r = solve_ivp(rom_oi.evaluate_rhs, z0_oi, t0, tf, dt, t_eval, "rk45", rtol=rtol, atol=atol)
+    sol_oi = proj_oi.decode(sol_oi_r.T).T
+    error_oi += np.linalg.norm(sol_oi - pool.X[k], axis=0)**2 / mean_en / n_traj
+
+    # GasOpInf
+    z0_oi_gs = Psi_oi_gs.T @ pool.X[k, :, 0]
+    sol_oi_gs_r = solve_ivp(rom_oi_gs.evaluate_rhs, z0_oi_gs, t0, tf, dt, t_eval, "rk45", rtol=rtol, atol=atol)
+    sol_oi_gs = proj_oi_gs.decode(sol_oi_gs_r.T).T
+    error_oi_gs += np.linalg.norm(sol_oi_gs - pool.X[k], axis=0)**2 / mean_en / n_traj
+
     # NiTROM
-    znit = Psi_nit.T@pool.X[k,:,0]
-    sol = Phi_nit@(solve_ivp(opt_obj.evaluate_rom_rhs,[0,time[-1]],znit,'RK45',t_eval=time,args=(u,) + tensors_nit)).y
-    eoi = np.linalg.norm(sol - pool.X[k,],axis=0)**2/mean_en
-    plt.plot(time,eoi,color=cOPT,linestyle=lOPT)
-    
-    
-ax = plt.gca()
-ax.set_yscale('log')
-ax.set_ylim([1e-3,ax.get_ylim()[1]])
+    z0_nit = Psi_nit.T @ pool.X[k, :, 0]
+    sol_nit_r = solve_ivp(rom_nit.evaluate_rhs, z0_nit, t0, tf, dt, t_eval, "rk45", rtol=rtol, atol=atol)
+    sol_nit = proj_nit.decode(sol_nit_r.T).T
+    error_nit += np.linalg.norm(sol_nit - pool.X[k], axis=0)**2 / mean_en / n_traj
 
-    
-#%%
-# np.save("data/A2_oi.npy",tensors_oi[0])
-# np.save("data/A3_oi.npy",tensors_oi[1].reshape((r,r**2)))
+    # GasNiTROM
+    z0_nit_gs = Psi_nit_gs.T @ pool.X[k, :, 0]
+    sol_nit_gs_r = solve_ivp(rom_nit_gs.evaluate_rhs, z0_nit_gs, t0, tf, dt, t_eval, "rk45", rtol=rtol, atol=atol)
+    sol_nit_gs = proj_nit_gs.decode(sol_nit_gs_r.T).T
+    error_nit_gs += np.linalg.norm(sol_nit_gs - pool.X[k], axis=0)**2 / mean_en / n_traj
 
-#%%
+# Plot training validation errors
+fig, ax = make_figure()
+ax.semilogy(t_eval[:idx_final], error_pod[:idx_final], label='POD-Gal.', color=COLORS["galerkin"], linestyle=STYLES["galerkin"])
+ax.semilogy(t_eval[:idx_final], error_oi[:idx_final], label='OpInf', color=COLORS["opinf"], linestyle=STYLES["notgas"])
+ax.semilogy(t_eval[:idx_final], error_oi_gs[:idx_final], label='GasOpInf', color=COLORS["opinf"], linestyle=STYLES["gas"])
+ax.semilogy(t_eval[:idx_final], error_nit[:idx_final], label='NiTROM', color=COLORS["nitrom"], linestyle=STYLES["notgas"])
+ax.semilogy(t_eval[:idx_final], error_nit_gs[:idx_final], label='GasNiTROM', color=COLORS["nitrom"], linestyle=STYLES["gas"])
+style_axes(ax, xlabel='Time $t$', ylabel='Error', xlim=(0.0, float(t_eval[idx_final])), ylim=(1e-3, 1e2), log_y=True)
+save_figure(fig, f'cavity_50_error_{which}_trained')
 
-flow.ff = fom.f.copy()
+# Plot full validation errors
+fig, ax = make_figure(wide=True)
+ax.semilogy(t_eval, error_pod, label='POD-Gal.', color=COLORS["galerkin"], linestyle=STYLES["galerkin"])
+ax.semilogy(t_eval, error_oi, label='OpInf', color=COLORS["opinf"], linestyle=STYLES["notgas"])
+ax.semilogy(t_eval, error_oi_gs, label='GasOpInf', color=COLORS["opinf"], linestyle=STYLES["gas"])
+ax.semilogy(t_eval, error_nit, label='NiTROM', color=COLORS["nitrom"], linestyle=STYLES["notgas"])
+ax.semilogy(t_eval, error_nit_gs, label='GasNiTROM', color=COLORS["nitrom"], linestyle=STYLES["gas"])
+style_axes(ax, xlabel='Time $t$', ylabel='Error', xlim=(0.0, float(t_eval[-1])), ylim=(1e-3, 1e3), log_y=True)
+if which == 'train':
+    add_training_window(ax, x_end=float(t_eval[idx_final]))
+ax.legend(loc='upper right', ncol=3, columnspacing=1.0, handletextpad=0.5)
+save_figure(fig, f'cavity_50_error_{which}_full')
 
-nn = 400
-dt = 1.0/nn
-freq = 5
-tf = np.arange(0,2*np.pi*freq,0.001)
-time = dt*np.arange(0,40*nn,1)
-nsave = 50
+# --- 3) Sinusoidal Forcing ---
+time_np = dt_orig * np.arange(0, 80 * n, 1)
+nsave = 5
+amp = 0.9
+energies = []
+ks = [1, 2, 4]
 
-eps = 0.05
-fint = scipy.interpolate.interp1d(tf,eps*np.sin(freq*tf),kind='linear',fill_value='extrapolate')
+# For filename, format the amp variable (e.g. 0.1 -> 0p1)
+amp_str = str(amp).replace('.', 'p')
 
+# For tracking final simulation snapshot
+sol_pod = None
+sol_oi = None
+sol_oi_gs = None
+sol_nit = None
+sol_nit_gs = None
+dataf = None
+tsavef = None
 
-# qic = np.random.randn(len(flow.q_sbf))
-# qic /= np.linalg.norm(qic)
-# qic = 0.5*flow.ff
+# For tracking contour plot simulation snapshot
+harmonic_contour = 1
+sol_pod_contour = None
+sol_oi_contour = None
+sol_oi_gs_contour = None
+sol_nit_contour = None
+sol_nit_gs_contour = None
+dataf_contour = None
+tsavef_contour = None
 
-dataf, tsavef = tstep.nonlinear_solver_2D(flow,lops,flow.q_sbf,time,nsave,fint,2*np.pi*freq)
+for harmonic in ks:
+    freq = 1.00 * harmonic
+    tf_f = np.arange(0, 2 * np.pi / freq, dt)
+    fint = sp.interpolate.interp1d(tf_f, amp * np.sin(freq * tf_f), kind='linear', fill_value="extrapolate")
+    print("Forcing frequency %.2f..." % freq)
 
-energy_true = np.linalg.norm(dataf - flow.q_sbf.reshape(-1,1),axis=0)**2
+    qic = flow.q_sbf.copy()
+    dataf, tsavef = tstep.solver_2D(
+        flow, lops, qic, time_np, nsave, [0, 1, 1, 0, 0, 0, 0, 0],
+        [1], [fint], [2 * np.pi / freq], vol_forcing=B
+    )
+    energy_true = np.linalg.norm(dataf - qic.reshape(-1, 1), axis=0)**2
 
+    z0 = np.zeros(r)
 
-#%%
+    def make_forcing_fn(Psi_):
+        F_spatial = Psi_.T @ (phi_pre.T @ B)
+        return [lambda t, Fs=F_spatial, f=freq: Fs * amp * np.sin(f * t)]
 
-z0 = np.zeros(r)
+    t0_f, tf_f = float(tsavef[0]), float(tsavef[-1])
+    dt_f = float(tsavef[1] - tsavef[0])
 
+    # POD
+    sol_pod_r = solve_ivp(rom_pod.evaluate_rhs, z0, t0_f, tf_f, dt_f, tsavef, "rk45", external_forcing=make_forcing_fn(Psi_pod), rtol=rtol, atol=atol)
+    sol_pod = proj_pod.decode(sol_pod_r.T).T
+    energy_pod = np.linalg.norm(sol_pod, axis=0)**2
 
-# NiTROM
-fnit = np.einsum('i,j',Psi_nit.T@Phi_pre.T@flow.ff,eps*np.sin(freq*time))
-fnit = scipy.interpolate.interp1d(time,fnit,kind='linear',fill_value='extrapolate')
-sol_nit = Phi_nit@(solve_ivp(opt_obj.evaluate_rom_rhs,[0,time[-1]],z0,'RK45',t_eval=time[::nsave],args=(fnit,) + tensors_nit)).y
-energy_nit = np.linalg.norm(sol_nit,axis=0)**2
+    # OpInf
+    sol_oi_r = solve_ivp(rom_oi.evaluate_rhs, z0, t0_f, tf_f, dt_f, tsavef, "rk45", external_forcing=make_forcing_fn(Psi_oi), rtol=rtol, atol=atol)
+    sol_oi = proj_oi.decode(sol_oi_r.T).T
+    energy_oi = np.linalg.norm(sol_oi, axis=0)**2
 
+    # GasOpInf
+    sol_oi_gs_r = solve_ivp(rom_oi_gs.evaluate_rhs, z0, t0_f, tf_f, dt_f, tsavef, "rk45", external_forcing=make_forcing_fn(Psi_oi_gs), rtol=rtol, atol=atol)
+    sol_oi_gs = proj_oi_gs.decode(sol_oi_gs_r.T).T
+    energy_oi_gs = np.linalg.norm(sol_oi_gs, axis=0)**2
 
-# OpInf
-foi = np.einsum('i,j',Psi_pod.T@Phi_pre.T@flow.ff,eps*np.sin(freq*time))
-foi = scipy.interpolate.interp1d(time,foi,kind='linear',fill_value='extrapolate')
-sol_oi = Phi_pod@(solve_ivp(opt_obj.evaluate_rom_rhs,[0,time[-1]],z0,'RK45',t_eval=time[::nsave],args=(foi,) + tensors_oi)).y
-energy_oi = np.linalg.norm(sol_oi,axis=0)**2
+    # NiTROM
+    sol_nit_r = solve_ivp(rom_nit.evaluate_rhs, z0, t0_f, tf_f, dt_f, tsavef, "rk45", external_forcing=make_forcing_fn(Psi_nit), rtol=rtol, atol=atol)
+    sol_nit = proj_nit.decode(sol_nit_r.T).T
+    energy_nit = np.linalg.norm(sol_nit, axis=0)**2
 
+    # GasNiTROM
+    sol_nit_gs_r = solve_ivp(rom_nit_gs.evaluate_rhs, z0, t0_f, tf_f, dt_f, tsavef, "rk45", external_forcing=make_forcing_fn(Psi_nit_gs), rtol=rtol, atol=atol)
+    sol_nit_gs = proj_nit_gs.decode(sol_nit_gs_r.T).T
+    energy_nit_gs = np.linalg.norm(sol_nit_gs, axis=0)**2
 
-# POD
-fpod = np.einsum('i,j',Psi_pod.T@Phi_pre.T@flow.ff,eps*np.sin(freq*time))
-fpod = scipy.interpolate.interp1d(time,fpod,kind='linear',fill_value='extrapolate')
-sol_pod = Phi_pod@(solve_ivp(opt_obj.evaluate_rom_rhs,[0,time[-1]],z0,'RK45',t_eval=time[::nsave],args=(fpod,) + tensors_pod)).y
-energy_pod = np.linalg.norm(sol_pod,axis=0)**2
+    energy_lst = [energy_true, energy_pod, energy_oi, energy_oi_gs, energy_nit, energy_nit_gs]
+    energies.append(energy_lst)
 
+    if harmonic == harmonic_contour:
+        sol_pod_contour = sol_pod.copy() if sol_pod is not None else None
+        sol_oi_contour = sol_oi.copy() if sol_oi is not None else None
+        sol_oi_gs_contour = sol_oi_gs.copy() if sol_oi_gs is not None else None
+        sol_nit_contour = sol_nit.copy() if sol_nit is not None else None
+        sol_nit_gs_contour = sol_nit_gs.copy() if sol_nit_gs is not None else None
+        dataf_contour = dataf.copy() if dataf is not None else None
+        tsavef_contour = tsavef.copy() if tsavef is not None else None
 
-plt.figure()
-plt.plot(tsavef,energy_true,color='k')
-# plt.plot(tsavef,energy_pod,color=cPOD,linestyle=lPOD)
-# plt.plot(tsavef,energy_oi,color=cOI,linestyle=lOI)
-plt.plot(tsavef,energy_nit,color=cOPT,linestyle=lOPT)
+colors = ['k', COLORS["galerkin"], COLORS["opinf"], COLORS["opinf"], COLORS["nitrom"], COLORS["nitrom"]]
+lstyle = ['-', STYLES["galerkin"], STYLES["notgas"], STYLES["gas"], STYLES["notgas"], STYLES["gas"]]
 
-#%%
+fig, ax = plt.subplots(nrows=3, ncols=1, figsize=(6.8, 6.6), constrained_layout=True)
+for k in range(len(energies)):
+    for i, vec in enumerate(energies[k]):
+        ax[k].plot(tsavef, vec, color=colors[i], linestyle=lstyle[i])
+    if k < len(energies) - 1:
+        ax[k].set_xticklabels([])
+    ax[k].text(
+        0.03, 0.65, rf'$k = {ks[k]}$',
+        transform=ax[k].transAxes,
+        ha='left', va='bottom',
+        fontsize=22,
+    )
+    style_axes(ax[k], xlabel='' if k < 2 else r'Time $t$', ylabel='Energy' if k == 1 else '', xlim=(0.0, tsavef[-1]))
+    ax[k].grid(which="minor", visible=False)
+    if k == 0:
+        ax[k].set_ylim(0, energies[k][-1].max()*1.1)
+    elif k == 1:
+        ax[k].set_ylim(0, energies[k][-2].max()*1.1)
+    else:
+        ax[k].set_ylim(0, energies[k][-1].max()*1.1)
+    ax[k].xaxis.label.set_fontsize(16)
+    ax[k].xaxis.set_tick_params(labelsize=16)
+    ax[k].yaxis.label.set_fontsize(16)
+    ax[k].yaxis.set_tick_params(labelsize=16)
 
-idx = np.argmin(np.abs(tsavef - 20))
+save_figure(fig, f"cavity_50_forcing_{amp_str}_energy")
 
-ii = 2
-X, Y, fields = pp.output_fields(flow,dataf[:,idx] - flow.q_sbf)
-
-vmin = np.min(fields[ii]) 
+# --- 4) Snapshot contour plots ---
+idx = np.argmin(np.abs(tsavef_contour - 30))
+ii = 2  # index for vorticity output
+X, Y, fields = pp.output_fields(flow, dataf_contour[:, idx] - flow.q_sbf)
+fields_window = np.flipud(fields[ii])[:39, :]
+vmin = np.min(fields_window)
 vmax = -vmin
+print(vmin, vmax)
 
-plt.figure()
-plt.contourf(X[ii],Y[ii],np.flipud(fields[ii]),levels=100,cmap='bwr',vmin=vmin,vmax=vmax)
+snapshots = [
+    ("FOM", dataf_contour[:, idx] - flow.q_sbf),
+    ("POD-Gal.", phi_pre @ sol_pod_contour[:, idx]),
+    ("OpInf", phi_pre @ sol_oi_contour[:, idx]),
+    ("GasOpInf", phi_pre @ sol_oi_gs_contour[:, idx]),
+    ("NiTROM", phi_pre @ sol_nit_contour[:, idx]),
+    ("GasNiTROM", phi_pre @ sol_nit_gs_contour[:, idx]),
+]
 
-ax = plt.gca()
-ax.set_aspect('equal')
-ax.set_xlabel('$x$')
-ax.set_ylabel('$y$')
+fig, axes = plt.subplots(3, 2, figsize=(FIG_WIDTH_WIDE, 5.0), constrained_layout=True)
+axes = axes.ravel()
 
-plt.tight_layout()
+for idx_subplot, (ax, (title, state_vec)) in enumerate(zip(axes, snapshots)):
+    X, Y, fields = pp.output_fields(flow, state_vec)
+    if title == "OpInf" and amp_str == '0p9':
+        fields[ii] = np.zeros_like(fields[ii])
+        title += " (blew up)"
+    cf = ax.contourf(
+        X[ii][:39, :],
+        Y[ii][:39, :],
+        np.flipud(fields[ii])[:39, :],
+        levels=100,
+        cmap='RdBu_r',
+        vmin=vmin,
+        vmax=vmax
+    )
+    ax.set_aspect('equal', adjustable='box')
+    ax.tick_params(direction='out', top=False, right=False)
 
+    if idx_subplot < 4:
+        ax.set_xticklabels([])
+    else:
+        ax.set_xlabel(r'$x$')
 
-X, Y, fields = pp.output_fields(flow,Phi_pre@sol_nit[:,idx])
+    if idx_subplot % 2 != 0:
+        ax.set_yticks([])
+    else:
+        ax.set_ylabel(r'$y$')
 
-plt.figure()
-plt.contourf(X[ii],Y[ii],np.flipud(fields[ii]),levels=100,cmap='bwr',vmin=vmin,vmax=vmax)
+    ax.text(
+        0.5, 0.65, title,
+        transform=ax.transAxes,
+        ha='center', va='bottom',
+        fontsize=20,
+    )
+    ax.xaxis.label.set_fontsize(16)
+    ax.xaxis.set_tick_params(labelsize=16)
+    ax.yaxis.label.set_fontsize(16)
+    ax.yaxis.set_tick_params(labelsize=16)
 
-ax = plt.gca()
-ax.set_aspect('equal')
-ax.set_xlabel('$x$')
-ax.set_ylabel('$y$')
+save_figure(fig, f"cavity_50_forcing_{amp_str}_k{harmonic_contour}_snapshot_all")
 
-plt.tight_layout()
+# --- 5) Training History Plots ---
+with open(os.path.join(models_dir, "gas_opinf_history.pkl"), "rb") as f:
+    hist_gas_opinf = pickle.load(f)
+with open(os.path.join(models_dir, "nitrom_history.pkl"), "rb") as f:
+    hist_nitrom = pickle.load(f)
+with open(os.path.join(models_dir, "gas_nitrom_history.pkl"), "rb") as f:
+    hist_gas_nitrom = pickle.load(f)
 
-X, Y, fields = pp.output_fields(flow,Phi_pre@sol_oi[:,idx])
+# Timings
+time_gas_opinf = hist_gas_opinf["time"]
+time_nitrom = hist_nitrom["time"]
+time_gas_nitrom = hist_gas_nitrom["time"]
+print("GasOpInf time (hours):", time_gas_opinf/60/60)
+print("NiTROM time (hours):", time_nitrom/60/60)
+print("GasNiTROM time (hours):", time_gas_nitrom/60/60)
 
-plt.figure()
-plt.contourf(X[ii],Y[ii],np.flipud(fields[ii]),levels=100,cmap='bwr',vmin=vmin,vmax=vmax)
+# Cost vs Iteration Plot
+fig, ax1 = make_figure()
+ax2 = ax1.twinx()
 
-ax = plt.gca()
-ax.set_aspect('equal')
-ax.set_xlabel('$x$')
-ax.set_ylabel('$y$')
+l1 = ax1.semilogy(hist_nitrom["iters"], hist_nitrom["loss"], label='NiTROM', color=COLORS["nitrom"], linestyle=STYLES["notgas"])
+l2 = ax1.semilogy(hist_gas_nitrom["iters"], hist_gas_nitrom["loss"], label='GasNiTROM', color=COLORS["nitrom"], linestyle=STYLES["gas"])
+style_axes(ax1, xlabel='Iteration', ylabel=r'$J_{\text{NiTROM}}$', log_y=True)
+ax1.yaxis.label.set_color(COLORS["nitrom"])
+ax1.tick_params(axis='y', colors=COLORS["nitrom"])
 
-plt.tight_layout()
+l3 = ax2.semilogy(hist_gas_opinf["iters"], hist_gas_opinf["loss"], label='GasOpInf', color=COLORS["opinf"], linestyle=STYLES["gas"])
+ax2.set_ylabel(r'$J_{\text{OpInf}}$', color=COLORS["opinf"])
+ax2.tick_params(axis='y', colors=COLORS["opinf"])
+ax2.set_yscale("log")
+ax2.yaxis.set_major_locator(LogLocator(base=10.0))
+ax2.yaxis.set_minor_locator(LogLocator(base=10.0, subs=np.arange(2, 10) * 0.1))
+ax2.yaxis.set_minor_formatter(NullFormatter())
 
-X, Y, fields = pp.output_fields(flow,Phi_pre@sol_pod[:,idx])
+lines = l1 + l2 + l3
+labels = [l.get_label() for l in lines]
+ax1.legend(lines, labels, loc='upper right')
 
-plt.figure()
-plt.contourf(X[ii],Y[ii],np.flipud(fields[ii]),levels=100,cmap='bwr',vmin=vmin,vmax=vmax)
+save_figure(fig, 'cost_history_cavity')
 
-ax = plt.gca()
-ax.set_aspect('equal')
-ax.set_xlabel('$x$')
-ax.set_ylabel('$y$')
+# Gradient Norm vs Iteration Plot
+fig, ax = make_figure()
+ax.semilogy(hist_nitrom["iters"], hist_nitrom["gradnorm"], label='NiTROM', color=COLORS["nitrom"], linestyle=STYLES["notgas"], linewidth=1.0)
+ax.semilogy(hist_gas_nitrom["iters"], hist_gas_nitrom["gradnorm"], label='GasNiTROM', color=COLORS["nitrom"], linestyle=STYLES["gas"], linewidth=1.0)
+ax.semilogy(hist_gas_opinf["iters"], hist_gas_opinf["gradnorm"], label='GasOpInf', color=COLORS["opinf"], linestyle=STYLES["gas"], linewidth=1.0)
+style_axes(ax, xlabel='Iteration', ylabel='Gradient Norm', log_y=True)
+# ax.legend(loc='upper right')
 
-plt.tight_layout()
+save_figure(fig, 'gradnorm_history_cavity')
 
-#%%
-
-qic = np.random.randn(len(flow.q_sbf))
-qic /= np.linalg.norm(qic)
-dataf, tsavef = tstep.nonlinear_solver_2D(flow,lops,flow.q_sbf + qic,time,nsave)
-
-#%%
-dhat = np.fft.rfft(dataf - flow.q_sbf.reshape(-1,1),axis=-1)/len(tsavef)
-freqvec = 2*np.pi/(tsavef[-1])*np.arange(0,dhat.shape[-1],1)
-
-en = np.linalg.norm(dhat,axis=0)**2
-
-#%%
-plt.figure()
-plt.stem(freqvec,en)
-plt.gca().set_yscale('log')
-
-
+print("All figures plotted and saved successfully!")

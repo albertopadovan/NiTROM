@@ -10,6 +10,7 @@ readme = "README.md"
 license = "MIT"
 authors = [
     { name = "Alberto Padovan", email = "alberto.padovan.94@gmail.com" },
+    { name = "Cole Errico", email = "cerrico2@illinois.edu" },
 ]
 requires-python = ">=3.10"
 dependencies = [

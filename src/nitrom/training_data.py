@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -12,6 +14,7 @@ from .backend import (
     get_backend,
     mpi_comm_world,
 )
+from .finite_difference import time_derivative
 
 
 class TrainingPool:
@@ -44,7 +47,21 @@ class TrainingPool:
         PyTorch, single-process otherwise -- so a parallel job shards correctly
         without the caller having to wire up rank/size by hand.
     **kwargs
-        Optional ``fname_weights``, ``fname_forcing``, ``fname_derivs``.
+        Optional ``fname_weights``, ``fname_forcing``, ``fname_derivs``,
+        ``fd_stencil_size``.
+
+    Notes
+    -----
+    Time derivatives are read from the ``fname_derivs`` files if given and
+    present on disk. Whenever a derivative file is missing -- whether
+    ``fname_derivs`` was omitted entirely or simply hasn't been generated
+    yet for that trajectory -- it is synthesized with a high-order
+    finite-difference stencil (:func:`nitrom.finite_difference.time_derivative`,
+    fourth-order accurate by default via ``fd_stencil_size=5``) applied to
+    the loaded trajectory and cached to disk at that path (or, if
+    ``fname_derivs`` was omitted, at a ``deriv_<idx>.npy`` path derived from
+    ``fname_traj``) so later calls load the cached file instead of
+    recomputing it.
     """
 
     def __init__(
@@ -106,10 +123,10 @@ class TrainingPool:
         self.load_trajectories(fname_traj)
         self.load_weights(kwargs)
         self.load_forcing(kwargs)
-        self.load_time_derivatives(kwargs)
         self.time = self.backend.asarray(
             np.load(fname_time), dtype=self.dtype, device=self.device
         )
+        self.load_time_derivatives(kwargs, fname_traj)
 
     def load_trajectories(self, fname_traj: str) -> None:
         """Load trajectory snapshots from ``.npy`` files into :attr:`X`."""
@@ -159,21 +176,63 @@ class TrainingPool:
 
         return wrapped
 
-    def load_time_derivatives(self, kwargs: dict[str, Any]) -> None:
-        """Load precomputed time derivatives (default: zeros)."""
+    @staticmethod
+    def _default_deriv_pattern(fname_traj: str) -> str:
+        """Default derivative-file pattern for a trajectory pattern, e.g.
+        ``'traj_%03d.npy'`` -> ``'deriv_%03d.npy'``."""
+        dirname, basename = os.path.split(fname_traj)
+        ext = os.path.splitext(basename)[1]
+        spec = re.search(r"%[-+0# ]*\d*d", basename).group(0)
+        return os.path.join(dirname, f"deriv_{spec}{ext}")
+
+    @staticmethod
+    def _atomic_save(path: str, array: np.ndarray) -> None:
+        """Write ``array`` to ``path`` via a temp file + atomic rename.
+
+        Avoids corrupt files from partial writes, and makes it safe for
+        multiple ranks to independently (and redundantly) regenerate the
+        same missing derivative file -- each writes its own temp file, so
+        the final rename never observes a half-written result.
+        """
+        dirpath = os.path.dirname(path)
+        if dirpath:
+            os.makedirs(dirpath, exist_ok=True)
+        root, ext = os.path.splitext(path)
+        tmp_path = f"{root}.tmp{os.getpid()}{ext}"
+        np.save(tmp_path, array)
+        os.replace(tmp_path, path)
+
+    def load_time_derivatives(self, kwargs: dict[str, Any], fname_traj: str) -> None:
+        """Load time derivatives, generating and caching any that are missing.
+
+        If ``fname_derivs`` is given, its files are used (and generated at
+        that path if absent); otherwise a ``deriv_<idx>.npy`` pattern
+        derived from ``fname_traj`` is used. Any file not already on disk is
+        synthesized from the loaded trajectory with a high-order
+        finite-difference stencil and saved, so it doesn't need to be
+        regenerated on subsequent calls.
+        """
         fname_deriv: str | None = kwargs.get("fname_derivs")
-        if fname_deriv is not None:
-            self.fnames_deriv = [fname_deriv % (k // self.num_shifts) for k in self.traj_indices]
-            dX = [np.load(f) for f in self.fnames_deriv]
-            self.dX = self.backend.asarray(
-                np.stack(dX), dtype=self.dtype, device=self.device
-            )
-        else:
-            self.dX = self.backend.zeros(
-                (self.my_n_traj, self.N, self.n_snapshots),
-                dtype=self.dtype,
-                device=self.device,
-            )
+        if fname_deriv is None:
+            fname_deriv = self._default_deriv_pattern(fname_traj)
+        stencil_size = int(kwargs.get("fd_stencil_size", 5))
+
+        self.fnames_deriv = [fname_deriv % (k // self.num_shifts) for k in self.traj_indices]
+        time_np = self.backend.to_numpy(self.time)
+
+        dX = []
+        for local_idx, f in enumerate(self.fnames_deriv):
+            if os.path.exists(f):
+                dX.append(np.load(f))
+                continue
+            X_np = self.backend.to_numpy(self.X[local_idx])
+            d = time_derivative(X_np, time_np, stencil_size=stencil_size)
+            self._atomic_save(f, d)
+            dX.append(d)
+
+        self.dX = self.backend.asarray(
+            np.stack(dX), dtype=self.dtype, device=self.device
+        )
 
 
 class TrainingData:

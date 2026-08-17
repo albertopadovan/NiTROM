@@ -6,12 +6,11 @@ import fom_class
 import numpy as np
 
 from nitrom.backend import mpi_allreduce_scalar, mpi_rank_size, set_backend
-from nitrom.latent_space_models.polynomial_model import PolynomialModel
+from nitrom.latent_space_models.gas_polynomial_model import GasPolynomialModel
 from nitrom.optimization import NitromModule, train
 from nitrom.projections.linear_projection import LinearProjection
 from nitrom.roms.param_registry import ParamRegistry
 from nitrom.training_data import TrainingData, TrainingPool
-from nitrom.utils import compute_POD
 
 # Pure-numpy CPU run (lightweight; no torch). Trajectory-parallel with MPI:
 set_backend("numpy")
@@ -22,6 +21,9 @@ traj_path = "./trajectories/"
 models_dir = "./models/"
 r = 75  # reduced dimension
 poly_comp = [1, 2]
+
+# Initialization model for GAS-NiTROM: "gas_opinf" or "nitrom".
+init_model = "gas_opinf"
 
 if rank == 0:
     os.makedirs(models_dir, exist_ok=True)
@@ -97,24 +99,22 @@ pool = TrainingPool(
     fname_weights=traj_path + "weight_%03d.npy",
 )
 
-# Compute POD basis (rank r) of the pre-projected snapshots (dimension 300)
-U, _, _ = compute_POD(pool, normalize=True)
-Phi = U[:, :r]  # (300, r)
-projection = LinearProjection([Phi, Phi])  # orthogonal (Psi = Phi)
+# Alternating optimization parameters
+n_outer_iterations = 20
+epochs_bases = 25
+epochs_operators = 25
 
-training_data = TrainingData(
-    pool,
-    which_trajs=list(range(n_traj)),
-    percent_time_length=1.0,
-    leggauss_deg=5,
-    nsave_rom=15,
-)
+# Loop percent_time_length from 5% to 100% in steps of 5%
+percents = np.arange(0.05, 1.01, 0.05)
 
 
-# Train standard NiTROM
+# Train GAS-NiTROM
+printr(f"\n=== GAS-NiTROM (initialized from {init_model}) ===")
 
-printr("\n=== NiTROM (initialized from OpInf) ===")
-ckpt_name = "opinf_model.pkl"
+ckpt_name = {
+    "gas_opinf": "gas_opinf_model.pkl",
+    "nitrom": "nitrom_model.pkl",
+}[init_model]
 ckpt_path = os.path.join(models_dir, ckpt_name)
 printr(f"Loading initialization from {ckpt_path}...")
 with open(ckpt_path, "rb") as f:
@@ -122,46 +122,47 @@ with open(ckpt_path, "rb") as f:
 
 init_Phi = np.asarray(ckpt["Phi"], dtype=dtype)
 init_Psi = np.asarray(ckpt.get("Psi", ckpt["Phi"]), dtype=dtype)
-tensors = [np.asarray(t, dtype=dtype) for t in ckpt["tensors"]]
 
-nitrom_model = PolynomialModel(
+if init_model == "gas_opinf":
+    gas_init = [np.asarray(t, dtype=dtype) for t in ckpt["gas_params"]]
+else:
+    tensors = [np.asarray(t, dtype=dtype) for t in ckpt["tensors"]]
+    seed = GasPolynomialModel(r, poly_comp, dtype=dtype)
+    seed.retract_general_tensors_to_gas_tensors(tensors[:2], use_P_I=True)
+    gas_init = [*seed.get_params()]
+
+gas_nitrom_model = GasPolynomialModel(
     r,
     poly_comp,
     dtype=dtype,
-    tensors=tensors,
+    gas_params=gas_init,
 )
-registry = ParamRegistry(nitrom_model, projection)
 
+projection_gas = LinearProjection([init_Phi, init_Psi])
+registry_gas = ParamRegistry(gas_nitrom_model, projection_gas)
 # Start with percent_time_length = 0.05
-td_init = TrainingData(
+td_gas_init = TrainingData(
     pool,
     which_trajs=list(range(n_traj)),
     percent_time_length=0.05,
     leggauss_deg=5,
     nsave_rom=15,
 )
-nitrom = NitromModule(
-    td_init, registry, fom=fom, n_substeps=15, adjoint_method="discrete"
+gas_nitrom = NitromModule(
+    td_gas_init, registry_gas, fom=fom, n_substeps=15, adjoint_method="discrete"
 )
-nitrom.set_manifold_types(["Phi", "Psi"], ["grassmann", "stiefel"])
+gas_nitrom.set_manifold_types(["Phi", "Psi"], ["grassmann", "stiefel"])
 
-# Alternating optimization parameters
-n_outer_iterations = 20
-epochs_bases = 25
-epochs_operators = 25
+all_gas_nitrom_loss = []
+all_gas_nitrom_gradnorm = []
 
-all_nitrom_loss = []
-all_nitrom_gradnorm = []
+printr(f"initial cost: {gcost(gas_nitrom):.6e}")
 
-printr(f"initial cost: {gcost(nitrom):.6e}")
+t0_gas = time.perf_counter()
 
-t0 = time.perf_counter()
-
-# Loop percent_time_length from 5% to 100% in steps of 5%
-percents = np.arange(0.05, 1.01, 0.05)
 for p_idx, percent in enumerate(percents):
     printr(
-        f"\n--- NiTROM Stage {p_idx + 1}/{len(percents)} (Time length: {percent * 100:.1f}%) ---"
+        f"\n--- GAS-NiTROM Stage {p_idx + 1}/{len(percents)} (Time length: {percent * 100:.1f}%) ---"
     )
     td_slice = TrainingData(
         pool,
@@ -170,7 +171,7 @@ for p_idx, percent in enumerate(percents):
         leggauss_deg=5,
         nsave_rom=15,
     )
-    update_module_training_data(nitrom, td_slice)
+    update_module_training_data(gas_nitrom, td_slice)
 
     # Alternating optimization
     for outer_iter in range(n_outer_iterations):
@@ -178,55 +179,57 @@ for p_idx, percent in enumerate(percents):
 
         # Optimize bases (Phi, Psi) only
         printr("    Optimizing bases (Phi, Psi)...")
-        set_optimize_bases(nitrom)
+        set_optimize_bases(gas_nitrom)
         train(
-            nitrom,
+            gas_nitrom,
             n_epochs=epochs_bases,
             lr=1.0,
             optimizer_type="lbfgs",
             print_every=1,
             tol=1e-14,
         )
-        all_nitrom_loss.extend(nitrom.loss_history)
-        all_nitrom_gradnorm.extend(nitrom.gradnorm_history)
+        all_gas_nitrom_loss.extend(gas_nitrom.loss_history)
+        all_gas_nitrom_gradnorm.extend(gas_nitrom.gradnorm_history)
 
         # Optimize operators only
         printr("    Optimizing operators...")
-        set_optimize_operators(nitrom)
+        set_optimize_operators(gas_nitrom)
         train(
-            nitrom,
+            gas_nitrom,
             n_epochs=epochs_operators,
             lr=1.0,
             optimizer_type="lbfgs",
             print_every=1,
             tol=1e-14,
         )
-        all_nitrom_loss.extend(nitrom.loss_history)
-        all_nitrom_gradnorm.extend(nitrom.gradnorm_history)
+        all_gas_nitrom_loss.extend(gas_nitrom.loss_history)
+        all_gas_nitrom_gradnorm.extend(gas_nitrom.gradnorm_history)
 
-nitrom_time = time.perf_counter() - t0
-printr(f"training time: {nitrom_time:.4f} s")
-printr(f"final cost:   {gcost(nitrom):.6e}")
+gas_nitrom_time = time.perf_counter() - t0_gas
+printr(f"training time: {gas_nitrom_time:.4f} s")
+printr(f"final cost:   {gcost(gas_nitrom):.6e}")
 
-nitrom._sync_to_registry()
+gas_nitrom._sync_to_registry()
 if rank == 0:
+    gas_params = [np.asarray(t) for t in gas_nitrom_model.get_params()]
     save_checkpoint(
-        nitrom_model.get_params(),
-        "nitrom",
-        os.path.join(models_dir, "nitrom_model.pkl"),
-        nitrom.projection.Phi,
-        nitrom.projection.Psi,
+        gas_nitrom_model.model.get_params(),
+        "gas_nitrom",
+        os.path.join(models_dir, "gas_nitrom_model.pkl"),
+        gas_nitrom.projection.Phi,
+        gas_nitrom.projection.Psi,
+        gas_params=gas_params,
     )
 
-nitrom_loss = np.array(all_nitrom_loss)
-nitrom_gradnorm = np.array(all_nitrom_gradnorm)
-nitrom_iters = np.arange(len(nitrom_loss))
-nitrom_dict = {
-    "iters": nitrom_iters,
-    "loss": nitrom_loss,
-    "gradnorm": nitrom_gradnorm,
-    "time": nitrom_time,
+gas_nitrom_loss = np.array(all_gas_nitrom_loss)
+gas_nitrom_gradnorm = np.array(all_gas_nitrom_gradnorm)
+gas_nitrom_iters = np.arange(len(gas_nitrom_loss))
+gas_nitrom_dict = {
+    "iters": gas_nitrom_iters,
+    "loss": gas_nitrom_loss,
+    "gradnorm": gas_nitrom_gradnorm,
+    "time": gas_nitrom_time,
 }
 if rank == 0:
-    with open(os.path.join(models_dir, "nitrom_history.pkl"), "wb") as f:
-        pickle.dump(nitrom_dict, f)
+    with open(os.path.join(models_dir, "gas_nitrom_history.pkl"), "wb") as f:
+        pickle.dump(gas_nitrom_dict, f)

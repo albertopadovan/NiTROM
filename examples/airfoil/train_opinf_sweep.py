@@ -1,12 +1,13 @@
 import os
 import pickle
-import numpy as np
 
 import fom_class
+import numpy as np
+
 from nitrom.backend import mpi_allreduce_scalar, mpi_rank_size, set_backend
 from nitrom.latent_space_models.gas_polynomial_model import GasPolynomialModel
 from nitrom.latent_space_models.polynomial_model import PolynomialModel
-from nitrom.optimization import OpInfModule, solve_opinf, train, NitromModule
+from nitrom.optimization import NitromModule, OpInfModule, solve_opinf, train
 from nitrom.projections.linear_projection import LinearProjection
 from nitrom.roms.param_registry import ParamRegistry
 from nitrom.training_data import TrainingData, TrainingPool
@@ -28,18 +29,6 @@ def gcost(m):
     return mpi_allreduce_scalar(c) if world_size > 1 else c
 
 
-# Cavity physical dimensions/parameters
-Lx = 1
-Ly = 1
-Nx = 100
-Ny = 100
-dx = Lx / Nx
-dy = Ly / Ny
-Re = 8300
-
-n = 400
-dt = 1.0 / n
-
 # Setup the flow & FOM
 fom = fom_class.fom_class()
 
@@ -48,7 +37,7 @@ traj_path = "./trajectories/"
 parameters = np.load(traj_path + "parameters.npy")
 n_traj = len(parameters)
 
-r = 50  # reduced dimension
+r = 75  # reduced dimension
 poly_comp = [1, 2]
 
 # Load the trajectories into a TrainingPool
@@ -87,13 +76,13 @@ def save_checkpoint(tensors, kind, path, gas_params=None) -> None:
 training_data = TrainingData(
     pool,
     which_trajs=list(range(n_traj)),
-    percent_time_length=0.5,
+    percent_time_length=1.0,
     leggauss_deg=5,
     nsave_rom=1,
 )
 
 # Sweep range
-regs = np.logspace(-6, -1, 50)
+regs = np.logspace(-4.347, -2, 22)
 
 best_opinf_reg = None
 best_opinf_cost = float("inf")
@@ -150,7 +139,7 @@ for reg in regs:
 
     # Train GAS-OpInf silently
     train(
-        gas, n_epochs=epochs, lr=1.0, optimizer_type="lbfgs", print_every=100, tol=1e-10
+        gas, n_epochs=epochs, lr=1.0, optimizer_type="lbfgs", print_every=250, tol=1e-10
     )
 
     # Save the current optimized parameters for the next iteration (warm-start)

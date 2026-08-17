@@ -3,7 +3,6 @@ import torch
 
 
 class fom_class:
-
     def compute_output(self, q):
         return q
 

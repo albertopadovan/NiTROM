@@ -163,6 +163,7 @@ cython_debug/
 
 # PETSc binary files
 *.npy
+*.npz
 *.dat
 *.dat.info
 *.csv

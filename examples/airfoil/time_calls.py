@@ -1,11 +1,12 @@
 import time
-import numpy as np
 
 import classes_cavity
+import numpy as np
+
 from nitrom.backend import set_backend
 from nitrom.latent_space_models.gas_polynomial_model import GasPolynomialModel
 from nitrom.latent_space_models.polynomial_model import PolynomialModel
-from nitrom.optimization import OpInfModule, NitromModule
+from nitrom.optimization import NitromModule, OpInfModule
 from nitrom.projections.linear_projection import LinearProjection
 from nitrom.roms.param_registry import ParamRegistry
 from nitrom.training_data import TrainingData, TrainingPool

@@ -1,15 +1,15 @@
 import os
 import pickle
 import time
-import numpy as np
 
 import fom_class
+import numpy as np
+
 from nitrom.backend import mpi_allreduce_scalar, mpi_rank_size, set_backend
 from nitrom.latent_space_models.gas_polynomial_model import GasPolynomialModel
 from nitrom.latent_space_models.polynomial_model import PolynomialModel
 from nitrom.optimization import OpInfModule, solve_opinf, train
 from nitrom.projections.linear_projection import LinearProjection
-from nitrom.roms.param_registry import ParamRegistry
 from nitrom.training_data import TrainingData, TrainingPool
 from nitrom.utils import compute_POD
 
@@ -29,18 +29,6 @@ def gcost(m):
     return mpi_allreduce_scalar(c) if world_size > 1 else c
 
 
-# Cavity physical dimensions/parameters
-Lx = 1
-Ly = 1
-Nx = 100
-Ny = 100
-dx = Lx / Nx
-dy = Ly / Ny
-Re = 8300
-
-n = 400
-dt = 1.0 / n
-
 # Setup the FOM
 fom = fom_class.fom_class()
 
@@ -49,7 +37,7 @@ traj_path = "./trajectories/"
 parameters = np.load(traj_path + "parameters.npy")
 n_traj = len(parameters)
 
-r = 50  # reduced dimension
+r = 75  # reduced dimension
 poly_comp = [1, 2]
 
 # Load the trajectories into a TrainingPool
@@ -88,7 +76,7 @@ def save_checkpoint(tensors, kind, path, gas_params=None) -> None:
 training_data = TrainingData(
     pool,
     which_trajs=list(range(n_traj)),
-    percent_time_length=0.5,
+    percent_time_length=1.0,
     leggauss_deg=5,
     nsave_rom=1,
 )
@@ -96,7 +84,7 @@ training_data = TrainingData(
 # 1) Solve standard OpInf analytically
 printr("\n=== OpInf ===")
 opinf_model = PolynomialModel(r, poly_comp, dtype=dtype)
-opinf = OpInfModule(training_data, opinf_model, projection, reg=1e-3)
+opinf = OpInfModule(training_data, opinf_model, projection, reg=1e-2)
 solve_opinf(opinf)
 
 if rank == 0:
@@ -120,7 +108,7 @@ gas_model = GasPolynomialModel(
     dtype=dtype,
     gas_params=gas_init,
 )
-gas = OpInfModule(training_data, gas_model, projection, reg=1e-3)
+gas = OpInfModule(training_data, gas_model, projection, reg=2.223e-5)
 
 t0 = time.perf_counter()
 train(gas, n_epochs=10000, lr=1.0, optimizer_type="lbfgs", print_every=259, tol=1e-14)

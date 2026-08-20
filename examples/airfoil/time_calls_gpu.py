@@ -4,6 +4,7 @@ import time
 
 import fom_class
 import numpy as np
+import torch
 
 from nitrom.backend import set_backend
 from nitrom.latent_space_models.gas_polynomial_model import GasPolynomialModel
@@ -14,20 +15,23 @@ from nitrom.roms.param_registry import ParamRegistry
 from nitrom.training_data import TrainingData, TrainingPool
 from nitrom.utils import compute_POD
 
-# Ensure we run in numpy backend
-set_backend("numpy")
-dtype = np.float64
+# Ensure we run in torch backend
+set_backend("torch")
+dtype = torch.float64
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 traj_path = "./trajectories/"
 models_dir = "./models/"
-r = 75  # reduced dimension
+r = 50  # reduced dimension
 poly_comp = [1, 2]
 
 # Setup the FOM
 fom = fom_class.fom_class()
 
 # Trajectory details
-parameters = np.load(traj_path + "parameters.npy")
+parameters = torch.tensor(
+    np.load(traj_path + "parameters.npy"), dtype=dtype, device=device
+)
 n_traj = len(parameters)
 
 # Load the trajectories into a TrainingPool
@@ -54,14 +58,12 @@ training_data = TrainingData(
 )
 
 # Initialize seed for models
-# ckpt_name = "opinf_model.pkl"
-# ckpt_path = os.path.join(models_dir, ckpt_name)
-# with open(ckpt_path, "rb") as f:
-#     ckpt = pickle.load(f)
-# tensors = [np.asarray(t, dtype=dtype) for t in ckpt["tensors"]]
-# A2r, A3r = tensors
-A2r = np.random.rand(r, r).astype(dtype)
-A3r = np.random.rand(r, r, r).astype(dtype)
+ckpt_name = "opinf_model.pkl"
+ckpt_path = os.path.join(models_dir, ckpt_name)
+with open(ckpt_path, "rb") as f:
+    ckpt = pickle.load(f)
+tensors = [torch.tensor(t, dtype=dtype, device=device) for t in ckpt["tensors"]]
+A2r, A3r = tensors
 
 seed = GasPolynomialModel(r, poly_comp, dtype=dtype)
 seed.retract_general_tensors_to_gas_tensors([A2r, A3r])
@@ -125,5 +127,5 @@ if __name__ == "__main__":
     print("-" * 48)
 
     cost_gasopinf, grad_gasopinf = time_module(gasopinf, "GasOpInf", num_calls)
-    # cost_nitrom, grad_nitrom = time_module(nitrom, "NiTROM", num_calls)
+    cost_nitrom, grad_nitrom = time_module(nitrom, "NiTROM", num_calls)
     cost_gasnitrom, grad_gasnitrom = time_module(gasnitrom, "GasNiTROM", num_calls)

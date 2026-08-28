@@ -147,7 +147,9 @@ pool = TrainingPool(
 
 # Compute POD basis (rank r) of the pre-projected snapshots (dimension 300)
 U, _, _ = compute_POD(pool, normalize=True)
-Phi = U[:, :r]  # (300, r), used as the trial/test basis init (Psi = Phi) unless resuming
+Phi = U[
+    :, :r
+]  # (300, r), used as the trial/test basis init (Psi = Phi) unless resuming
 
 # Train standard NiTROM
 
@@ -157,7 +159,7 @@ ckpt_path = os.path.join(models_dir, ckpt_name)
 checkpoint_path = os.path.join(models_dir, "nitrom_checkpoint.pkl")
 
 # Alternating optimization parameters
-n_outer_iterations = 20
+n_outer_iterations = 10
 epochs_bases = 25
 epochs_operators = 25
 

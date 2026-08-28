@@ -37,7 +37,7 @@ traj_path = "./trajectories/"
 parameters = np.load(traj_path + "parameters.npy")
 n_traj = len(parameters)
 
-r = 75  # reduced dimension
+r = 50  # reduced dimension
 poly_comp = [1, 2]
 
 # Load the trajectories into a TrainingPool
@@ -82,7 +82,7 @@ training_data = TrainingData(
 )
 
 # Sweep range
-regs = np.logspace(-4.347, -2, 22)
+regs = np.logspace(-7, -3, 10)
 
 best_opinf_reg = None
 best_opinf_cost = float("inf")

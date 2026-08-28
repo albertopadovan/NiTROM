@@ -5,7 +5,7 @@ import time
 import fom_class
 import numpy as np
 
-from nitrom.backend import set_backend
+from nitrom.backend import mpi_comm_world, mpi_rank_size, set_backend
 from nitrom.latent_space_models.gas_polynomial_model import GasPolynomialModel
 from nitrom.latent_space_models.polynomial_model import PolynomialModel
 from nitrom.optimization import NitromModule, OpInfModule
@@ -14,9 +14,26 @@ from nitrom.roms.param_registry import ParamRegistry
 from nitrom.training_data import TrainingData, TrainingPool
 from nitrom.utils import compute_POD
 
-# Ensure we run in numpy backend
+# Pure-numpy CPU run (lightweight; no torch). Trajectory-parallel with MPI:
 set_backend("numpy")
 dtype = np.float64
+rank, world_size = mpi_rank_size()
+
+
+def printr(*args, **kwargs) -> None:
+    """Print on rank 0 only."""
+    if rank == 0:
+        print(*args, **kwargs)
+
+
+def mpi_max(v: float) -> float:
+    """Reduce a per-rank timing to the slowest rank (the parallel wall time)."""
+    if world_size == 1:
+        return v
+    from mpi4py import MPI
+
+    return mpi_comm_world().allreduce(float(v), op=MPI.MAX)
+
 
 traj_path = "./trajectories/"
 models_dir = "./models/"
@@ -54,14 +71,12 @@ training_data = TrainingData(
 )
 
 # Initialize seed for models
-# ckpt_name = "opinf_model.pkl"
-# ckpt_path = os.path.join(models_dir, ckpt_name)
-# with open(ckpt_path, "rb") as f:
-#     ckpt = pickle.load(f)
-# tensors = [np.asarray(t, dtype=dtype) for t in ckpt["tensors"]]
-# A2r, A3r = tensors
-A2r = np.random.rand(r, r).astype(dtype)
-A3r = np.random.rand(r, r, r).astype(dtype)
+ckpt_name = "opinf_model.pkl"
+ckpt_path = os.path.join(models_dir, ckpt_name)
+with open(ckpt_path, "rb") as f:
+    ckpt = pickle.load(f)
+tensors = [np.asarray(t, dtype=dtype) for t in ckpt["tensors"]]
+A2r, A3r = tensors
 
 seed = GasPolynomialModel(r, poly_comp, dtype=dtype)
 seed.retract_general_tensors_to_gas_tensors([A2r, A3r])
@@ -102,28 +117,29 @@ def time_module(module, name, num_calls=50):
     _ = module()
     _ = module.gradient()
 
-    # Time cost evaluations
+    # Time cost evaluations (each rank times its own trajectory shard)
     t0 = time.perf_counter()
     for _ in range(num_calls):
         _ = module()
-    t_cost = (time.perf_counter() - t0) / num_calls / n_traj
+    t_cost = mpi_max((time.perf_counter() - t0) / num_calls)
 
     # Time gradient evaluations
     t0 = time.perf_counter()
     for _ in range(num_calls):
         _ = module.gradient()
-    t_grad = (time.perf_counter() - t0) / num_calls / n_traj
+    t_grad = mpi_max((time.perf_counter() - t0) / num_calls)
 
-    print(f"{name:<12} | {t_cost:12.6f} | {t_grad:12.6f}")
+    printr(f"{name:<12} | {t_cost:12.6f} | {t_grad:12.6f}")
     return t_cost, t_grad
 
 
 if __name__ == "__main__":
-    num_calls = 5
-    print(f"Timing average of {num_calls} calls for cost and gradient functions...\n")
-    print(f"{'Method':<12} | {'Avg Cost (s)':<12} | {'Avg Grad (s)':<12}")
-    print("-" * 48)
+    num_calls = 50
+    printr(f"Timing average of {num_calls} calls for cost and gradient functions...\n")
+    printr(f"Running with {world_size} MPI rank(s)")
+    printr(f"{'Method':<12} | {'Avg Cost (s)':<12} | {'Avg Grad (s)':<12}")
+    printr("-" * 48)
 
     cost_gasopinf, grad_gasopinf = time_module(gasopinf, "GasOpInf", num_calls)
-    # cost_nitrom, grad_nitrom = time_module(nitrom, "NiTROM", num_calls)
+    cost_nitrom, grad_nitrom = time_module(nitrom, "NiTROM", num_calls)
     cost_gasnitrom, grad_gasnitrom = time_module(gasnitrom, "GasNiTROM", num_calls)

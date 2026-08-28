@@ -148,7 +148,7 @@ pool = TrainingPool(
 )
 
 # Alternating optimization parameters
-n_outer_iterations = 20
+n_outer_iterations = 14
 epochs_bases = 25
 epochs_operators = 25
 

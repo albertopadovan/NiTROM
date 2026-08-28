@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from nitrom.backend import get_backend, set_backend
+from nitrom.latent_space_models.atr_polynomial_model import AtrPolynomialModel
 from nitrom.latent_space_models.gas_polynomial_model import GasPolynomialModel
 from nitrom.latent_space_models.polynomial_model import PolynomialModel
 from nitrom.projections.linear_projection import LinearProjection
@@ -167,6 +168,59 @@ def test_gas_retraction_cross_backend():
     # The retraction chains eigvals -> Lyapunov -> cholesky -> inverse through
     # two different LAPACK stacks, so cross-backend agreement (~1e-8) sits at
     # the retraction's own reconstruction precision (1e-6) rather than at eps.
+    _assert_agree(run, tol=1e-6)
+
+
+def test_atr_polynomial_model_cross_backend():
+    rng = np.random.default_rng(11)
+    eye = np.eye(R)
+    K, Rm, Q = (
+        rng.standard_normal((R, R)),
+        eye + 0.1 * rng.standard_normal((R, R)),
+        eye + 0.1 * rng.standard_normal((R, R)),
+    )
+    S, Bop = 0.3 * rng.standard_normal((R, R, R)), rng.standard_normal((R, 1))
+    Bhat, shift = rng.standard_normal(R), 0.5 * rng.standard_normal(R)
+    z, v = rng.standard_normal(R), rng.standard_normal(R)
+    Z, V = rng.standard_normal((MB, R)), rng.standard_normal((MB, R))
+
+    def run(b):
+        c, f = partial(_cast, b), _force(b)
+        m = AtrPolynomialModel(
+            R, [1, 2],
+            atr_params=[c(K), c(Rm), c(Q), c(S), c(Bhat), c(shift), c(Bop)],
+            forcing_config={"forcing_exists": True, "m": 1},
+        )
+        zc, vc, Zc, Vc = c(z), c(v), c(Z), c(V)
+        return {
+            "assembled": m.assemble_gas_tensors(),
+            "radius": np.asarray(m.trapping_region_radius()),
+            "rhs_vec": m.evaluate_rhs(0.0, zc, external_forcing=[f[0]]),
+            "rhs_batch": m.evaluate_rhs(0.0, Zc, external_forcing=f),
+            "vjp_vec": m.vjp_evaluate_rhs(zc, vc, external_forcing=[f[0]], t=0.0),
+            "vjp_batch": m.vjp_evaluate_rhs(Zc, Vc, external_forcing=f, t=0.0),
+        }
+
+    _assert_agree(run)
+
+
+def test_atr_retraction_cross_backend():
+    rng = np.random.default_rng(12)
+    A = rng.standard_normal((R, R))
+    H = 0.3 * rng.standard_normal((R, R, R))
+    cvec = rng.standard_normal(R)
+    shift = 0.5 * rng.standard_normal(R)
+
+    def run(b):
+        c = partial(_cast, b)
+        m = AtrPolynomialModel(R, [1, 2])
+        m.retract_general_tensors_to_atr_tensors(
+            [c(cvec), c(A), c(H)], m=c(shift)
+        )
+        return {name: getattr(m, name) for name in ["K", "R", "Q", "S", "Bhat", "m"]}
+
+    # As for the GAS retraction, the eigvals -> Lyapunov -> cholesky -> inverse
+    # chain limits cross-backend agreement to the retraction's own precision.
     _assert_agree(run, tol=1e-6)
 
 

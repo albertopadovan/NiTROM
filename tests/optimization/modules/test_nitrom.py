@@ -1,4 +1,4 @@
-"""Finite-difference gradient checks for NitromModule (polynomial and GAS ROMs).
+"""Finite-difference gradient checks for NitromModule (polynomial, GAS, ATR ROMs).
 
 Ambient dimension N = 5, latent dimension r = 2.  The module's analytic gradient
 is a continuous adjoint, so the comparison is against a finite difference of the
@@ -9,6 +9,7 @@ discretization accuracy).
 import pytest
 import torch
 
+from nitrom.latent_space_models.atr_polynomial_model import AtrPolynomialModel
 from nitrom.latent_space_models.gas_polynomial_model import GasPolynomialModel
 from nitrom.latent_space_models.polynomial_model import PolynomialModel
 from nitrom.optimization import NitromModule
@@ -124,6 +125,29 @@ def test_gradient_gas_rom(adjoint_method, time_stepper):
         
     assert_grad_close(
         module.gradient(), finite_diff_grad(module), rtol=rtol_check, atol=atol_check
+    )
+
+
+@pytest.mark.parametrize("adjoint_method", ["discrete", "continuous"])
+def test_gradient_atr_rom(adjoint_method):
+    g = torch.Generator().manual_seed(5)
+    eye = torch.eye(R, dtype=DTYPE)
+    atr_params = [
+        0.3 * torch.randn(R, R, generator=g, dtype=DTYPE),          # K
+        eye + 0.1 * torch.randn(R, R, generator=g, dtype=DTYPE),    # R
+        eye + 0.1 * torch.randn(R, R, generator=g, dtype=DTYPE),    # Q
+        0.2 * torch.randn(R, R, R, generator=g, dtype=DTYPE),       # S
+        0.3 * torch.randn(R, generator=g, dtype=DTYPE),             # Bhat
+        0.3 * torch.randn(R, generator=g, dtype=DTYPE),             # m
+        0.3 * torch.randn(R, M, generator=g, dtype=DTYPE),          # B
+    ]
+    model = AtrPolynomialModel(
+        R, [1, 2], dtype=DTYPE, atr_params=atr_params,
+        forcing_config={"forcing_exists": True, "m": M},
+    )
+    module = _module(model, adjoint_method=adjoint_method)
+    assert_grad_close(
+        module.gradient(), finite_diff_grad(module), rtol=1e-4, atol=1e-6
     )
 
 

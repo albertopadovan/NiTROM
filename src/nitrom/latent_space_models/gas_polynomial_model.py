@@ -56,15 +56,9 @@ class GasPolynomialModel(Model):
         gas_params: list | None = None,
         forcing_config: dict | None = None,
     ):
-        # Determine GAS parameter names and shapes
-        param_names: list[str] = []
-        gas_shapes: list[tuple[int, ...]] = []
-        if 1 in poly_comp:
-            param_names.extend(["K", "R", "Q"])
-            gas_shapes.extend([(r, r), (r, r), (r, r)])
-        if 2 in poly_comp:
-            param_names.extend(["S"])
-            gas_shapes.extend([(r, r, r)])
+        # Determine GAS parameter names, shapes, and initializations
+        specs = self._gas_param_specs(r, poly_comp)
+        param_names: list[str] = [name for name, _, _ in specs]
 
         # Track forcing.  An optional fixed input operator may be supplied via
         # ``forcing_config["B"]``; B stays a parameter but is flagged
@@ -78,7 +72,7 @@ class GasPolynomialModel(Model):
 
         super().__init__(r, param_names, device, dtype)
         bkend = self.backend
-        self.poly_comp = poly_comp
+        self.poly_comp = self._inner_poly_comp(poly_comp)
         self.forcing_exists = forcing_exists
 
         # Set GAS parameters as attributes
@@ -89,12 +83,12 @@ class GasPolynomialModel(Model):
                     bkend.asarray(tensor, dtype=self.dtype, device=self.device),
                 )
         else:
-            # Initialize the GAS parameters randomly (K, R, Q, S; B handled below)
-            gas_param_names = [name for name in param_names if name != "B"]
-            for name, shape in zip(gas_param_names, gas_shapes, strict=True):
+            # Initialize the GAS parameters (K, R, Q, S, ...; B handled below)
+            for name, shape, init in specs:
+                alloc = bkend.zeros if init == "zeros" else bkend.randn
                 setattr(
                     self, name,
-                    bkend.randn(shape, dtype=self.dtype, device=self.device),
+                    alloc(shape, dtype=self.dtype, device=self.device),
                 )
             # Initialize B (fixed value if supplied, else zeros)
             if forcing_exists:
@@ -116,13 +110,48 @@ class GasPolynomialModel(Model):
         tensors = self.assemble_gas_tensors()
         self.model = PolynomialModel(
             r,
-            poly_comp,
+            self.poly_comp,
             device=device,
             dtype=self.dtype,
             instability_threshold=instability_threshold,
             tensors=tensors,
             forcing_config=forcing_config,
         )
+
+    @staticmethod
+    def _gas_param_specs(
+        r: int, poly_comp: list[int]
+    ) -> list[tuple[str, tuple[int, ...], str]]:
+        r"""
+        Specification of the free GAS parameters (everything except ``B``).
+
+        Each entry is ``(name, shape, init)`` where ``init`` is ``"randn"`` or
+        ``"zeros"``, used when no initial parameters are supplied.  Subclasses
+        override this to extend the parameter set (see
+        :class:`~nitrom.latent_space_models.atr_polynomial_model.AtrPolynomialModel`).
+
+        :param r: reduced state dimension
+        :param poly_comp: polynomial degrees requested by the caller
+        :rtype: list[tuple[str, tuple[int, ...], str]]
+        """
+        specs: list[tuple[str, tuple[int, ...], str]] = []
+        if 1 in poly_comp:
+            specs.extend(
+                [("K", (r, r), "randn"), ("R", (r, r), "randn"), ("Q", (r, r), "randn")]
+            )
+        if 2 in poly_comp:
+            specs.append(("S", (r, r, r), "randn"))
+        return specs
+
+    @staticmethod
+    def _inner_poly_comp(poly_comp: list[int]) -> list[int]:
+        """
+        Polynomial degrees carried by the inner :class:`PolynomialModel`.
+
+        Identity for GAS; subclasses override it when the assembled dynamics
+        need extra degrees (e.g. the ATR model, which adds a constant term).
+        """
+        return list(poly_comp)
 
     def _precompute_inverses(self) -> None:
         """Precompute and cache inverses and products for Q and R."""

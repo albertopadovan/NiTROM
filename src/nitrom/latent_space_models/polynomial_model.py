@@ -100,7 +100,11 @@ class PolynomialModel(Model):
     def _generate_einsum_subscripts(self) -> None:
         """
         Generates the indices for the einsum evaluation of the
-        right-hand side and the adjoint
+        right-hand side and the adjoint.
+
+        The equations depend only on :attr:`poly_comp`, so they are built once
+        here rather than re-derived (with ``combinations`` and string joins) on
+        every one of the thousands of evaluations a single adjoint sweep makes.
         """
         ss = []
         for k in self.poly_comp:
@@ -108,6 +112,56 @@ class PolynomialModel(Model):
             ssk = [ssk] + [s for s in ssk[1:]]
             ss.append(ssk)
         self.einsum_ss = tuple(ss)
+
+        # RHS:  A_k (z, ..., z)
+        self._rhs_eq = tuple(
+            ",".join(parts) for parts in self.einsum_ss
+        )
+        self._rhs_eq_batched = tuple(
+            ",".join([parts[0]] + [f"...{p}" for p in parts[1:]])
+            for parts in self.einsum_ss
+        )
+
+        # Adjoint:  J(Z)^T w, contracted directly rather than by assembling J.
+        # For degree k, leaving one latent slot free and filling the other
+        # k - 1 with Z gives one term of the Jacobian; contracting the ambient
+        # index against the seed at the same time yields the free slot of the
+        # result.
+        adj, adj_b = [], []
+        for i, k in enumerate(self.poly_comp):
+            terms, terms_b = [], []
+            if k > 0:
+                ss0 = self.einsum_ss[i][0]
+                out_char, input_chars = ss0[0], ss0[1:]
+                for comb in combinations(input_chars, k - 1):
+                    free = next(c for c in input_chars if c not in comb)
+                    terms.append(
+                        ",".join([ss0, out_char, *comb]) + "->" + free
+                    )
+                    terms_b.append(
+                        ",".join(
+                            [ss0, f"...{out_char}", *(f"...{c}" for c in comb)]
+                        )
+                        + f"->...{free}"
+                    )
+            adj.append(tuple(terms))
+            adj_b.append(tuple(terms_b))
+        self._adjoint_eq = tuple(adj)
+        self._adjoint_eq_batched = tuple(adj_b)
+
+        # Parameter VJP:  dJ/dA_k = v (x) z (x) ... (x) z
+        vjp, vjp_b = [], []
+        for parts in self.einsum_ss:
+            out_subscript = parts[0]
+            vjp.append(",".join(out_subscript) + "->" + out_subscript)
+            # Explicit summed batch index (numpy einsum rejects a broadcast
+            # ellipsis dropped from an explicit output).
+            batch = ascii_lowercase[len(out_subscript)]
+            vjp_b.append(
+                ",".join(batch + s for s in out_subscript) + "->" + out_subscript
+            )
+        self._vjp_eq = tuple(vjp)
+        self._vjp_eq_batched = tuple(vjp_b)
 
     def update_params(self, tensors: list) -> None:
         r"""
@@ -150,9 +204,8 @@ class PolynomialModel(Model):
             # Compute the dynamics
             dzdt = bkend.zeros_like(z)
             for i, k in enumerate(self.poly_comp):
-                equation = ",".join(self.einsum_ss[i])
                 operands = [tensors[i]] + [z for _ in range(k)]
-                dzdt += bkend.einsum(equation, *operands)
+                dzdt += bkend.einsum(self._rhs_eq[i], *operands)
 
             # Add the forcing
             if f_fun_lst is not None:
@@ -162,27 +215,36 @@ class PolynomialModel(Model):
         # z is a tensor (we use batching to evaluate all vectors at once)
         else:
             # Guard against blow-up. If all entries > thresh, then return zeros,
-            # otherwise compute the rhs of the vectors that are < thresh
+            # otherwise compute the rhs of the vectors that are < thresh.
+            # Nothing having blown up is the overwhelmingly common case, and
+            # there the boolean gather/scatter around the contraction is pure
+            # overhead, so contract ``z`` whole when the mask is all-true.
             norms = bkend.vector_norm(z, axis=-1)
             mask = norms < self.thresh
-            if not mask.any():
+            all_below = bool(mask.all())
+            if not all_below and not mask.any():
                 return bkend.zeros_like(z)
 
             # Compute the dynamics
+            zk = z if all_below else z[mask]
             dzdt = bkend.zeros_like(z)
             for i, k in enumerate(self.poly_comp):
-                parts = self.einsum_ss[i]
-                eq_parts = [parts[0]] + [f"...{p}" for p in parts[1:]]
-                equation = ",".join(eq_parts)
-                operands = [tensors[i]] + [z[mask] for _ in range(k)]
-                dzdt[mask] += bkend.einsum(equation, *operands)
+                operands = [tensors[i]] + [zk for _ in range(k)]
+                term = bkend.einsum(self._rhs_eq_batched[i], *operands)
+                if all_below:
+                    dzdt += term
+                else:
+                    dzdt[mask] += term
 
             # Add the external forcing
             if f_fun_lst is not None:
                 for i in range(len(f_fun_lst)):
-                    if mask[i] and f_fun_lst[i] is not None:
-                        f = bkend.atleast_1d(f_fun_lst[i](t))
-                        dzdt[i] += self.B @ f if self.forcing_exists else f
+                    if f_fun_lst[i] is None:
+                        continue
+                    if not all_below and not mask[i]:
+                        continue
+                    f = bkend.atleast_1d(f_fun_lst[i](t))
+                    dzdt[i] += self.B @ f if self.forcing_exists else f
 
         return dzdt
 
@@ -203,7 +265,6 @@ class PolynomialModel(Model):
         :param Z: base flow at which to evaluate the Jacobian, same shape as ``z``
         :rtype: backend array
         """
-        n = z.shape[-1]
         tensors = self.get_params()
         bkend = self.backend
 
@@ -213,41 +274,35 @@ class PolynomialModel(Model):
             if bkend.vector_norm(z) >= self.thresh:
                 return bkend.zeros_like(z)
 
-            # Compute the Jacobian and adjoint dynamics
-            J = bkend.zeros((n, n), dtype=self.dtype, device=self.device)
+            # Contract J(Z)^T z directly: assembling J only to apply it once
+            # costs an extra (n, n) intermediate per term.
+            dzdt = bkend.zeros_like(z)
             for i, k in enumerate(self.poly_comp):
-                if k == 0:
-                    continue
-                combs = list(combinations(self.einsum_ss[i][1:], r=k - 1))
-                operands = [tensors[i]] + [Z for _ in range(k - 1)]
-                for comb in combs:
-                    equation = ",".join([self.einsum_ss[i][0], *comb])
-                    J += bkend.einsum(equation, *operands)
-            dzdt = J.T @ z
+                operands = [tensors[i], z] + [Z for _ in range(k - 1)]
+                for equation in self._adjoint_eq[i]:
+                    dzdt += bkend.einsum(equation, *operands)
 
         # z is a tensor (we use batching to evaluate all vectors at once)
         else:
-            # Guard against blow-up
+            # Guard against blow-up (see :meth:`evaluate_rhs` for the fast path)
             norms = bkend.vector_norm(z, axis=-1)
             mask = norms < self.thresh
-            if not mask.any():
+            all_below = bool(mask.all())
+            if not all_below and not mask.any():
                 return bkend.zeros_like(z)
 
-            # Compute the Jacobian and adjoint dynamics
+            # Contract J(Z)^T z directly, skipping the batched (B, n, n)
+            # Jacobian the result is immediately contracted against.
+            zk, Zk = (z, Z) if all_below else (z[mask], Z[mask])
             dzdt = bkend.zeros_like(z)
-            Jb = bkend.zeros(
-                (int(mask.sum()), n, n), dtype=self.dtype, device=self.device
-            )
             for i, k in enumerate(self.poly_comp):
-                if k == 0:
-                    continue
-                combs = list(combinations(self.einsum_ss[i][1:], r=k - 1))
-                for comb in combs:
-                    eq_parts = [self.einsum_ss[i][0]] + [f"...{p}" for p in comb]
-                    equation = ",".join(eq_parts)
-                    operands = [tensors[i]] + [Z[mask] for _ in range(k - 1)]
-                    Jb += bkend.einsum(equation, *operands)
-            dzdt[mask] = bkend.einsum("bnm,bn->bm", Jb, z[mask])
+                operands = [tensors[i], zk] + [Zk for _ in range(k - 1)]
+                for equation in self._adjoint_eq_batched[i]:
+                    term = bkend.einsum(equation, *operands)
+                    if all_below:
+                        dzdt += term
+                    else:
+                        dzdt[mask] += term
 
         return dzdt
 
@@ -289,12 +344,8 @@ class PolynomialModel(Model):
 
         if z.ndim == 1:
             for i, k in enumerate(self.poly_comp):
-                ss = self.einsum_ss[i]
-                out_subscript = ss[0]
-                in_subscripts = [ss[0][0], *ss[0][1:]]
-                equation = ",".join(in_subscripts) + "->" + out_subscript
                 operands = [v] + [z for _ in range(k)]
-                grads.append(bkend.einsum(equation, *operands))
+                grads.append(bkend.einsum(self._vjp_eq[i], *operands))
 
             # grad_B = v @ u(t)^T
             if f_fun_lst is not None:
@@ -302,17 +353,8 @@ class PolynomialModel(Model):
                 grads.append(bkend.outer(v, u))
         else:
             for i, k in enumerate(self.poly_comp):
-                ss = self.einsum_ss[i]
-                out_subscript = ss[0]
-                # Use an explicit batch index, omitted from the output so the
-                # contribution is summed over the batch.  (Avoid the
-                # "...a,...b->ab" ellipsis form: numpy einsum rejects a broadcast
-                # ellipsis that is dropped from an explicit output.)
-                batch = ascii_lowercase[len(out_subscript)]
-                in_subscripts = [batch + s for s in out_subscript]
-                equation = ",".join(in_subscripts) + "->" + out_subscript
                 operands = [v] + [z for _ in range(k)]
-                grads.append(bkend.einsum(equation, *operands))
+                grads.append(bkend.einsum(self._vjp_eq_batched[i], *operands))
 
             # grad_B = sum_j v_j @ u_j(t)^T
             if f_fun_lst is not None:

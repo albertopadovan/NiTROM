@@ -49,6 +49,9 @@ class Backend:
         self.name = name
         self.float64 = self.xp.float64
         self.float32 = self.xp.float32
+        # Cache of numpy einsum contraction paths, keyed by equation + operand
+        # shapes (see :meth:`einsum`).
+        self._einsum_paths = {}
 
     @property
     def is_torch(self) -> bool:
@@ -79,8 +82,94 @@ class Backend:
     def zeros_like(self, x):
         return self.xp.zeros_like(x)
 
+    #: Naive-contraction cost above which deriving an optimized path pays off.
+    #: Below it numpy's path machinery costs more than the contraction itself;
+    #: measured crossover for the polynomial RHS at batch 9 sits between
+    #: ``r = 12`` (cost 1.6e4, naive wins) and ``r = 16`` (cost 3.7e4,
+    #: optimized wins).
+    _EINSUM_OPTIMIZE_MIN_COST = 20_000
+
+    #: Cap on :attr:`_einsum_paths`.  Keys include operand shapes, so a caller
+    #: that varies batch sizes freely could otherwise grow the cache without
+    #: bound; the hot equations are few, so a flush is cheap and rare.
+    _EINSUM_CACHE_MAX = 512
+
+    @staticmethod
+    def _einsum_naive_cost(equation, operands):
+        """Cost of the *unoptimized* contraction.
+
+        ``numpy.einsum`` without a path runs one C loop over the product of
+        every distinct index dimension, so that product is the cost to beat.
+
+        This only steers a performance choice, so every ``zip`` here is
+        deliberately non-strict: a subscript that does not line up with its
+        operand should make the estimate wrong, never raise.
+        """
+        lhs = equation.split("->")[0].replace(" ", "")
+        dims = {}
+        broadcast = 1
+        for subscript, op in zip(lhs.split(","), operands, strict=False):
+            shape = getattr(op, "shape", ())
+            if "..." in subscript:
+                head, tail = subscript.split("...")
+                n_ell = len(shape) - len(head) - len(tail)
+                size = 1
+                for s in shape[len(head): len(head) + n_ell]:
+                    size *= s
+                broadcast = max(broadcast, size)
+                labelled = [
+                    *zip(head, shape, strict=False),
+                    *zip(tail, shape[len(head) + n_ell:], strict=False),
+                ]
+            else:
+                labelled = zip(subscript, shape, strict=False)
+            for c, s in labelled:
+                dims[c] = s
+        cost = broadcast
+        for s in dims.values():
+            cost *= s
+        return cost
+
     def einsum(self, equation, *operands):
-        return self.xp.einsum(equation, *operands)
+        """Contract ``operands`` according to ``equation``.
+
+        ``numpy.einsum`` defaults to ``optimize=False``, which evaluates a
+        multi-operand contraction with a single naive C loop rather than
+        decomposing it into BLAS calls.  NiTROM's hot kernels are exactly that
+        shape -- ``'abc,db,dc->da'`` for the polynomial RHS, ``'da,db,dc->abc'``
+        for its parameter VJP -- and at ``r = 50`` the naive loop costs an order
+        of magnitude more (measured 970 us vs 74 us).
+
+        Optimizing is not free, though: deriving and parsing a path costs tens
+        of microseconds, which *exceeds* the whole contraction at small ``r``.
+        So the choice is made per contraction from its naive cost and cached
+        per ``(equation, operand shapes)``, leaving low-dimensional ROMs on the
+        path they were already taking.
+
+        ``torch.einsum`` already chooses its own contraction order, so the
+        torch backend forwards unchanged.
+        """
+        if self.is_torch:
+            return self.xp.einsum(equation, *operands)
+
+        try:
+            # A list comprehension, not a generator: this key is built on every
+            # contraction and at small r it is a visible fraction of one.
+            key = (equation, *[op.shape for op in operands])
+            path = self._einsum_paths[key]
+        except AttributeError:  # an operand without .shape -- not worth caching
+            return self.xp.einsum(equation, *operands)
+        except KeyError:
+            cost = self._einsum_naive_cost(equation, operands)
+            path = (
+                self.xp.einsum_path(equation, *operands, optimize="optimal")[0]
+                if cost >= self._EINSUM_OPTIMIZE_MIN_COST
+                else False
+            )
+            if len(self._einsum_paths) >= self._EINSUM_CACHE_MAX:
+                self._einsum_paths.clear()
+            self._einsum_paths[key] = path
+        return self.xp.einsum(equation, *operands, optimize=path)
 
     def atleast_1d(self, x):
         return self.xp.atleast_1d(x)

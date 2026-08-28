@@ -64,9 +64,11 @@ class OpInfModule(InferenceModule):
         self.ntraj = ntraj
         self.nt = nt
 
-        # Weight matrix
-        W = bkend.repeat_interleave(1 / training_data.weights.reshape(-1), nt)
-        self.W = bkend.diag(W)
+        # Per-snapshot weights.  Held as the (ntraj * nt,) diagonal rather than
+        # the dense matrix: every use is a row scale of the residual, so
+        # materializing the (ntraj*nt)^2 matrix costs O(n_s) times the memory
+        # and turns an elementwise multiply into a GEMM against a diagonal.
+        self.w = bkend.repeat_interleave(1 / training_data.weights.reshape(-1), nt)
 
         # Store forcing callables and time grid
         self.forcing_fns = getattr(training_data, "forcing_fns", None)
@@ -141,7 +143,7 @@ class OpInfModule(InferenceModule):
 
         R = self.dZ - fZ
         R_flat = bkend.permute(R, (1, 0, 2)).reshape(self.rom.state_dimension, -1)
-        cost = ((R_flat @ self.W) * R_flat).sum()
+        cost = ((R_flat * self.w[None, :]) * R_flat).sum()
 
         # Regularization on the quadratic tensor H
         _, world_size = distributed_rank_size()
@@ -174,7 +176,7 @@ class OpInfModule(InferenceModule):
         R = self.dZ - fZ
         R_flat = bkend.permute(R, (1, 0, 2)).reshape(r, -1)
         RW = bkend.permute(
-            (R_flat @ self.W).reshape(r, self.ntraj, self.nt), (1, 0, 2)
+            (R_flat * self.w[None, :]).reshape(r, self.ntraj, self.nt), (1, 0, 2)
         )
 
         # VJP: adjoint seed v = -2 * R * W

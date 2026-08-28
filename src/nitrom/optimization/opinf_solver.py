@@ -96,7 +96,7 @@ def solve_opinf(module: OpInfModule) -> OpInfModule:
     # 5. Formulate and solve the least-squares problem: S A = B_sys
     # A = Q_w @ Q.T + reg * I, where Q_w = Q @ W
     # B_sys = tilde_dZ @ Q_w.T
-    w = bkend.diag(module.W)  # shape (N_s,)
+    w = module.w  # shape (N_s,)
     Q_w = Q * w[None, :]
     Q_w_Q_T = Q_w @ Q.T
     B_sys = tilde_dZ @ Q_w.T

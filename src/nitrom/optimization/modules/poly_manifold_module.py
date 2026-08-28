@@ -79,9 +79,9 @@ class PolyManifoldInfModule(InferenceModule):
         self.ntraj = ntraj
         self.nt = nt
 
-        # Weight matrix
-        W = bkend.repeat_interleave(1.0 / training_data.weights.reshape(-1), nt)
-        self.W = bkend.diag(W)
+        # Per-snapshot weights, held as the (ntraj * nt,) diagonal rather than
+        # the dense matrix (see :class:`OpInfModule`).
+        self.w = bkend.repeat_interleave(1.0 / training_data.weights.reshape(-1), nt)
 
         # Precompute encoded data: Z of shape (ntraj, r, nt)
         self.Z = bkend.einsum("ij,kil->kjl", Psi, self.X)
@@ -149,7 +149,7 @@ class PolyManifoldInfModule(InferenceModule):
         R = X_flat - X_hat  # (ntraj*nt, N)
         # Reshape to (N, ntraj*nt) for the weighted norm
         R_flat = R.T
-        cost = ((R_flat @ self.W) * R_flat).sum()
+        cost = ((R_flat * self.w[None, :]) * R_flat).sum()
 
         # Regularization on A_k
         _, world_size = distributed_rank_size()
@@ -179,7 +179,7 @@ class PolyManifoldInfModule(InferenceModule):
 
         R = X_flat - X_hat
         R_flat = R.T  # (N, ntraj*nt)
-        RW = (R_flat @ self.W).T  # (ntraj*nt, N)
+        RW = (R_flat * self.w[None, :]).T  # (ntraj*nt, N)
 
         # Adjoint seed: v = -2 * R * W
         v = -2.0 * RW

@@ -28,7 +28,10 @@ class NitromModule(InferenceModule):
     :param registry: registry of the ROM parameters spanning the
         latent-space model and the projection
     :type registry: ParamRegistry
-    :param fom: optional full-order model, e.g. for output evaluation
+    :param fom: optional full-order model, e.g. for output evaluation.  Must
+        provide ``compute_output(q)`` and ``compute_output_derivative(q)``; it
+        may additionally provide ``apply_output_adjoint(e, q)`` to apply the
+        output Jacobian-transpose without forming the ``(no, N)`` matrix.
     :param reg: Tikhonov regularization weight
     :type reg: float
     """
@@ -120,6 +123,35 @@ class NitromModule(InferenceModule):
         except AttributeError:
             return False
 
+    def _data_output(self) -> Any:
+        """``fom.compute_output`` of the training data, cached.
+
+        The training trajectories are fixed for the whole optimization, so the
+        output map is applied to them once instead of on every cost and
+        gradient evaluation.  Keyed on the array's identity so that swapping
+        the training data out invalidates the cache.
+        """
+        X = self.training_data.X
+        cached = getattr(self, "_data_output_cache", None)
+        if cached is None or cached[0] is not X:
+            self._data_output_cache = (X, self.fom.compute_output(X))
+        return self._data_output_cache[1]
+
+    def _output_vjp(self, e: Any, Xhat: Any) -> Any:
+        r"""Apply the transpose of the output Jacobian to ``e``.
+
+        Maps ``(ntraj, no, nt) -> (ntraj, N, nt)``.  A FOM may supply
+        ``apply_output_adjoint(e, q)`` to do this without ever forming the
+        ``(no, N)`` matrix; that matters once the ambient dimension is large,
+        and is free for the common case of an identity output map.  Without it
+        we fall back to building the matrix and contracting.
+        """
+        apply_adjoint = getattr(self.fom, "apply_output_adjoint", None)
+        if apply_adjoint is not None:
+            return apply_adjoint(e, Xhat)
+        C = self.fom.compute_output_derivative(Xhat)  # (no, N), constant
+        return self.backend.einsum("on,bot->bnt", C, e)
+
     def _decode_trajectories(self, Z: Any) -> Any:
         r"""
         Decode a batch of latent trajectories to the ambient space.
@@ -170,7 +202,7 @@ class NitromModule(InferenceModule):
         )  # (ntraj, r, nt)
 
         # Weighted sum-of-squares output mismatch.
-        e = self.fom.compute_output(self.training_data.X) - self.fom.compute_output(
+        e = self._data_output() - self.fom.compute_output(
             self._decode_trajectories(Z)
         )
         per_traj = bkend.sum(e * e, axis=(1, 2)) / self.weights.reshape(-1)
@@ -229,10 +261,9 @@ class NitromModule(InferenceModule):
 
             # --- output residual and adjoint sources at each snapshot ------
             Xhat = self._decode_trajectories(Z)  # (ntraj, N, nt)
-            e = self.fom.compute_output(X) - self.fom.compute_output(Xhat)
-            C = self.fom.compute_output_derivative(Xhat)  # (no, N), constant
+            e = self._data_output() - self.fom.compute_output(Xhat)
             # Weighted full-space output seed v_i = -2 alpha_j^{-1} C^T e_i.
-            cw = -2.0 * w * bkend.einsum("on,bot->bnt", C, e)  # (ntraj, N, nt)
+            cw = -2.0 * w * self._output_vjp(e, Xhat)  # (ntraj, N, nt)
             N = cw.shape[1]
 
             # Flatten the (trajectory, snapshot) axes into a single batch.

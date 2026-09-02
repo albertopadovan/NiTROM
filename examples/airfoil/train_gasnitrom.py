@@ -19,7 +19,7 @@ rank, world_size = mpi_rank_size()
 
 traj_path = "./trajectories/"
 models_dir = "./models/"
-r = 75  # reduced dimension
+r = 50  # reduced dimension
 poly_comp = [1, 2]
 
 # Initialization model for GAS-NiTROM: "gas_opinf" or "nitrom".
@@ -148,7 +148,7 @@ pool = TrainingPool(
 )
 
 # Alternating optimization parameters
-n_outer_iterations = 14
+n_outer_iterations = 20
 epochs_bases = 25
 epochs_operators = 25
 

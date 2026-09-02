@@ -5,9 +5,101 @@ import numpy as np
 from nitrom.roms.param_registry import ParamRegistry
 from nitrom.training_data import TrainingData
 
-from ...time_steppers.time_stepper import solve_ivp, solve_adjoint_ivp_discrete
+from ...time_steppers.time_stepper import (
+    solve_adjoint_ivp_discrete,
+    solve_ivp,
+    solve_ivp_dense,
+)
 from ...utils import interp_quadratic
 from .base import InferenceModule
+
+
+class _ParamVJPCollector:
+    """Buffers the discrete adjoint's parameter-VJP records and reduces in bulk.
+
+    The backward sweep produces one ``(state, seed)`` record per Runge-Kutta stage
+    per sub-step.  Evaluating and accumulating the VJP per record means hundreds of
+    rank-1 updates of an ``(r, r, r)`` tensor, which is memory-bound and dominates
+    the sweep.  Because the VJP is multilinear in ``(state, seed)``, the sum over
+    records equals a single contraction over the stacked records -- one GEMM per
+    degree instead of one outer product per record.
+
+    Records are flushed every ``max_records`` so the intermediate stays bounded
+    regardless of trajectory count or horizon length.
+    """
+
+    def __init__(self, module: "NitromModule", max_records: int = 512):
+        self.backend = module.backend
+        self.model = module.model
+        self.max_records = max_records
+        self.grads = [
+            self.backend.zeros_like(p) for p in self.model.inner_params()
+        ]
+
+        forcing_fns = module.forcing_fns or None
+        self.forcing_fns = (
+            forcing_fns
+            if getattr(self.model, "forcing_exists", False) and forcing_fns
+            else None
+        )
+        self._m = (
+            self.model.inner_params()[-1].shape[1]
+            if self.forcing_fns is not None
+            else 0
+        )
+        self._z: list = []
+        self._w: list = []
+        self._t: list = []
+
+    def add(self, z: Any, w: Any, t: float) -> None:
+        """Record one stage contribution; ``z``/``w`` are ``(ntraj, r)``."""
+        self._z.append(z)
+        self._w.append(w)
+        self._t.append(t)
+        if len(self._z) >= self.max_records:
+            self.flush()
+
+    def _forcing_block(self, ntraj: int) -> Any:
+        """Stacked ``u_j(t_a)`` rows, flattened to match the record ordering."""
+        bkend = self.backend
+        rows = []
+        for t in self._t:
+            for j in range(ntraj):
+                fn = self.forcing_fns[j] if j < len(self.forcing_fns) else None
+                rows.append(
+                    bkend.zeros(
+                        (self._m,), dtype=self.grads[-1].dtype,
+                        device=bkend.device_of(self.grads[-1]),
+                    )
+                    if fn is None
+                    else bkend.atleast_1d(fn(t))
+                )
+        return bkend.stack(rows, axis=0)  # (nrec * ntraj, m)
+
+    def flush(self) -> None:
+        """Reduce the buffered records into the running gradient accumulators."""
+        if not self._z:
+            return
+        bkend = self.backend
+        Z = bkend.stack(self._z, axis=0)  # (nrec, ntraj, r)
+        W = bkend.stack(self._w, axis=0)
+        nrec, ntraj, r = Z.shape
+
+        # Flatten to (nrec * ntraj, r); record d then has trajectory index
+        # d % ntraj, which is the indexing the forcing block above assumes.
+        U = self._forcing_block(ntraj) if self.forcing_fns else None
+        self.grads = self.model.inner_batched_vjp_evaluate_rhs(
+            Z.reshape(nrec * ntraj, r), W.reshape(nrec * ntraj, r),
+            U=U, out=self.grads,
+        )
+        self._z.clear()
+        self._w.clear()
+        self._t.clear()
+
+    def result(self) -> list:
+        """Flush any buffered records and return the accumulated gradients."""
+        self.flush()
+        return self.grads
 
 
 class NitromModule(InferenceModule):
@@ -208,16 +300,67 @@ class NitromModule(InferenceModule):
         per_traj = bkend.sum(e * e, axis=(1, 2)) / self.weights.reshape(-1)
         cost = per_traj.sum()
 
-        # Regularization on the quadratic tensor H
-        from nitrom.backend import distributed_rank_size
-        _, world_size = distributed_rank_size()
-        reg = self.reg / world_size
-        if reg > 0.0 and hasattr(self.model, "poly_comp") and 2 in self.model.poly_comp:
+        # Regularization on the quadratic tensor H.  It is a global term added
+        # redundantly on every rank, so pre-dividing by the world size makes the
+        # SUM all-reduce in the training loop recover it exactly once.
+        if self.reg > 0.0 and hasattr(self.model, "poly_comp") and 2 in self.model.poly_comp:
+            reg = self.reg / self.world_size
             h_idx = self.model.poly_comp.index(2)
             H = self.model.inner_params()[h_idx]
             cost = cost + reg * bkend.vector_norm(H) ** 2
 
         return cost
+
+    #: Cap on the retained dense forward trajectory (and stages).  Above this,
+    #: ``gradient`` falls back to re-integrating each measurement interval.
+    max_dense_bytes: int = 512 * 1024**2
+
+    def _dense_grid(self) -> float | None:
+        """Uniform sub-step size, if the snapshot grid lands exactly on sub-steps.
+
+        The per-interval path integrates each ``[t_{k-1}, t_k]`` with its own
+        ``h = (t_k - t_{k-1}) / n_substeps``.  A single global solve uses one
+        uniform ``dt``, which is a *different discretization* unless the snapshot
+        grid is uniform -- so this returns ``None`` on a non-uniform grid rather
+        than silently changing the answer.  ``rk45`` has no fixed sub-step grid
+        at all.
+
+        :returns: the sub-step size, or ``None`` if the dense path does not apply
+        """
+        if self.time_stepper == "rk45":
+            return None
+
+        time = self.time
+        nt = len(time)
+        if nt < 2:
+            return None
+
+        t0, tf = float(time[0]), float(time[-1])
+        span = tf - t0
+        if span <= 0.0:
+            return None
+
+        # Reproduce solve_ivp_dense's own grid arithmetic exactly.
+        nt_sim = int(round(span / ((float(time[1]) - t0) / self.n_substeps)))
+        if nt_sim != (nt - 1) * self.n_substeps:
+            return None
+        dt = span / nt_sim
+
+        tol = 1e-9 * span
+        for k in range(nt):
+            if abs(float(time[k]) - (t0 + k * self.n_substeps * dt)) > tol:
+                return None
+
+        # Memory guard: (ntraj, r, nt_sim + 1) plus the stage cache.
+        ntraj = self.training_data.X.shape[0]
+        r = self.model.state_dimension
+        itemsize = getattr(self.training_data.X.dtype, "itemsize", 8)
+        n_stages = 4  # upper bound over the fixed-step tableaus
+        nbytes = ntraj * r * itemsize * ((nt_sim + 1) + nt_sim * n_stages)
+        if nbytes > self.max_dense_bytes:
+            return None
+
+        return dt
 
     def _vjp_rhs(self, z: Any, lam: Any, t: float) -> list:
         """VJP of the latent RHS w.r.t. the inner model parameters (forwards forcing)."""
@@ -253,11 +396,26 @@ class NitromModule(InferenceModule):
             # --- forward solve at the measurement times --------------------
             z0 = self.projection.encode(X[:, :, 0])  # (ntraj, r)
             dt = (time[1] - time[0]) / self.n_substeps
-            Z = solve_ivp(
-                self.model.evaluate_rhs, z0, time[0], time[-1], dt, time,
-                self.time_stepper, atol=self.atol, rtol=self.rtol,
-                external_forcing=ef,
-            )  # (ntraj, r, nt)
+
+            # When the snapshot grid lands on sub-steps, one dense solve serves
+            # both the measurement values and every interval of the backward
+            # sweep, which otherwise re-integrates each interval from scratch.
+            dense_dt = self._dense_grid()
+            want_stages = dense_dt is not None and self.adjoint_method == "discrete"
+            if dense_dt is not None:
+                dense = solve_ivp_dense(
+                    self.model.evaluate_rhs, z0, float(time[0]), float(time[-1]),
+                    dense_dt, self.time_stepper, save_every=1,
+                    with_stages=want_stages, external_forcing=ef,
+                )
+                Z = dense.X[:, :, :: self.n_substeps]  # (ntraj, r, nt)
+            else:
+                dense = None
+                Z = solve_ivp(
+                    self.model.evaluate_rhs, z0, time[0], time[-1], dt, time,
+                    self.time_stepper, atol=self.atol, rtol=self.rtol,
+                    external_forcing=ef,
+                )  # (ntraj, r, nt)
 
             # --- output residual and adjoint sources at each snapshot ------
             Xhat = self._decode_trajectories(Z)  # (ntraj, N, nt)
@@ -287,24 +445,39 @@ class NitromModule(InferenceModule):
             lam = bkend.zeros((ntraj, r), device=dev, dtype=dtype)
 
             if self.adjoint_method == "discrete":
+                # The parameter VJP is multilinear in (state, seed), so the
+                # per-stage contributions can be buffered and reduced in bulk.
+                collector = _ParamVJPCollector(self)
                 for k in range(nt - 1, 0, -1):
                     # Inject the measurement source at snapshot k.
                     lam = lam + src[:, :, k]
 
-                    # Re-integrate the base flow over [t_{k-1}, t_k].
+                    # Base flow over [t_{k-1}, t_k]: slice the dense solve when
+                    # we have one, else re-integrate the interval.
                     t0i, tfi = float(time[k - 1]), float(time[k])
                     delta = tfi - t0i
                     h = delta / self.n_substeps
-                    sub_t = bkend.linspace(
-                        t0i, tfi, self.n_substeps + 1, device=dev, dtype=dtype
-                    )
-                    Zint = solve_ivp(
-                        self.model.evaluate_rhs, Z[:, :, k - 1], t0i, tfi,
-                        h, sub_t, self.time_stepper,
-                        atol=self.atol, rtol=self.rtol,
-                        external_forcing=ef,
-                    )  # (ntraj, r, n_substeps + 1)
-                    
+                    if dense is not None:
+                        j0 = (k - 1) * self.n_substeps
+                        j1 = j0 + self.n_substeps
+                        sub_t = dense.t[j0 : j1 + 1]
+                        Zint = dense.X[:, :, j0 : j1 + 1]
+                        stages_G = (
+                            None if dense.stages is None
+                            else dense.stages[:, :, j0:j1, :]
+                        )
+                    else:
+                        sub_t = bkend.linspace(
+                            t0i, tfi, self.n_substeps + 1, device=dev, dtype=dtype
+                        )
+                        Zint = solve_ivp(
+                            self.model.evaluate_rhs, Z[:, :, k - 1], t0i, tfi,
+                            h, sub_t, self.time_stepper,
+                            atol=self.atol, rtol=self.rtol,
+                            external_forcing=ef,
+                        )  # (ntraj, r, n_substeps + 1)
+                        stages_G = None
+
                     # Propagate adjoint and accumulate model grads
                     lam, step_grads = solve_adjoint_ivp_discrete(
                         self.model.evaluate_rhs,
@@ -312,12 +485,18 @@ class NitromModule(InferenceModule):
                         self._vjp_rhs,
                         Zint, sub_t, h, lam,
                         method=self.time_stepper,
+                        collector=collector,
+                        stages_G=stages_G,
                         external_forcing=ef,
                     )
-                    
+
                     if step_grads is not None:
                         for idx, g in enumerate(step_grads):
                             model_grads[idx] = model_grads[idx] + g
+
+                # One contraction over every buffered stage record.
+                for idx, g in enumerate(collector.result()):
+                    model_grads[idx] = model_grads[idx] + g
 
             else:  # continuous adjoint
                 xi, wq = self._gl_nodes, self._gl_weights
@@ -330,15 +509,20 @@ class NitromModule(InferenceModule):
                     t0i, tfi = float(time[k - 1]), float(time[k])
                     delta = tfi - t0i
                     a = 0.5 * delta
-                    sub_t = bkend.linspace(
-                        t0i, tfi, self.n_substeps + 1, device=dev, dtype=dtype
-                    )
-                    Zint = solve_ivp(
-                        self.model.evaluate_rhs, Z[:, :, k - 1], t0i, tfi,
-                        delta / self.n_substeps, sub_t, self.time_stepper,
-                        atol=self.atol, rtol=self.rtol,
-                        external_forcing=ef,
-                    )  # (ntraj, r, n_substeps + 1)
+                    if dense is not None:
+                        j0 = (k - 1) * self.n_substeps
+                        sub_t = dense.t[j0 : j0 + self.n_substeps + 1]
+                        Zint = dense.X[:, :, j0 : j0 + self.n_substeps + 1]
+                    else:
+                        sub_t = bkend.linspace(
+                            t0i, tfi, self.n_substeps + 1, device=dev, dtype=dtype
+                        )
+                        Zint = solve_ivp(
+                            self.model.evaluate_rhs, Z[:, :, k - 1], t0i, tfi,
+                            delta / self.n_substeps, sub_t, self.time_stepper,
+                            atol=self.atol, rtol=self.rtol,
+                            external_forcing=ef,
+                        )  # (ntraj, r, n_substeps + 1)
 
                     # Adjoint in reversed time tau in [0, delta] (physical time
                     # t = tfi - tau): d(lam)/d(tau) = J_f(Z(t))^T lam.
@@ -396,11 +580,9 @@ class NitromModule(InferenceModule):
             for k, g in enumerate(self.projection.vjp_encode(X[:, :, 0], lam)):
                 proj_grads[k] = proj_grads[k] + g
 
-            # Add regularization gradient on H if reg > 0.0
-            from nitrom.backend import distributed_rank_size
-            _, world_size = distributed_rank_size()
-            reg = self.reg / world_size
-            if reg > 0.0 and hasattr(self.model, "poly_comp") and 2 in self.model.poly_comp:
+            # Add regularization gradient on H if reg > 0.0 (see forward()).
+            if self.reg > 0.0 and hasattr(self.model, "poly_comp") and 2 in self.model.poly_comp:
+                reg = self.reg / self.world_size
                 h_idx = self.model.poly_comp.index(2)
                 H = self.model.inner_params()[h_idx]
                 model_grads[h_idx] = model_grads[h_idx] + 2.0 * reg * H

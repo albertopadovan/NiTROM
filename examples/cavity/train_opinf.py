@@ -1,15 +1,15 @@
 import os
 import pickle
 import time
-import numpy as np
 
 import classes_cavity
+import numpy as np
+
 from nitrom.backend import mpi_allreduce_scalar, mpi_rank_size, set_backend
 from nitrom.latent_space_models.gas_polynomial_model import GasPolynomialModel
 from nitrom.latent_space_models.polynomial_model import PolynomialModel
 from nitrom.optimization import OpInfModule, solve_opinf, train
 from nitrom.projections.linear_projection import LinearProjection
-from nitrom.roms.param_registry import ParamRegistry
 from nitrom.training_data import TrainingData, TrainingPool
 from nitrom.utils import compute_POD
 
@@ -34,12 +34,12 @@ Lx = 1
 Ly = 1
 Nx = 100
 Ny = 100
-dx = Lx/Nx
-dy = Ly/Ny
+dx = Lx / Nx
+dy = Ly / Ny
 Re = 8300
 
 n = 400
-dt = 1.0/n
+dt = 1.0 / n
 
 # Setup the flow & FOM
 flow = classes_cavity.flow_class(Lx, Ly, Nx, Ny, Re)
@@ -103,7 +103,9 @@ training_data = TrainingData(
 # Galerkin projection (Psi = Phi): (A_r, H_r)
 phi_tot = phi_pre @ Phi
 psi_tot = phi_pre @ Phi
-(A2r, A3r), _ = fom.assemble_petrov_galerkin_tensors(phi_tot, psi_tot, B, [0,0,1,0,0,0,0,0])
+(A2r, A3r), _ = fom.assemble_petrov_galerkin_tensors(
+    phi_tot, psi_tot, B, [0, 0, 1, 0, 0, 0, 0, 0]
+)
 
 # %% 1) Solve standard OpInf analytically
 printr("\n=== OpInf ===")
@@ -116,7 +118,7 @@ if rank == 0:
     save_checkpoint(
         [np.copy(np.asarray(t)) for t in opinf_model.get_params()],
         "opinf",
-        os.path.join(models_dir, "opinf_model.pkl")
+        os.path.join(models_dir, "opinf_model.pkl"),
     )
 
 # %% 2) Train GAS-constrained OpInf, initialized from Galerkin
@@ -126,7 +128,10 @@ seed.retract_general_tensors_to_gas_tensors([A2r, A3r], use_P_I=True)
 gas_init = [*seed.get_params()]
 
 gas_model = GasPolynomialModel(
-    r, poly_comp, dtype=dtype, gas_params=gas_init,
+    r,
+    poly_comp,
+    dtype=dtype,
+    gas_params=gas_init,
 )
 gas = OpInfModule(training_data, gas_model, projection, reg=5.428675e-05)
 
@@ -137,7 +142,9 @@ printr(f"training time: {gas_opinf_time:.4f} s")
 
 if rank == 0:
     gas_params = [np.copy(np.asarray(t)) for t in gas_model.get_params()]
-    best_gas_physical_tensors = [np.copy(np.asarray(t)) for t in gas_model.model.get_params()]
+    best_gas_physical_tensors = [
+        np.copy(np.asarray(t)) for t in gas_model.model.get_params()
+    ]
     save_checkpoint(
         best_gas_physical_tensors,
         "gas",
@@ -149,7 +156,7 @@ if rank == 0:
         "iters": np.arange(len(gas.loss_history)),
         "loss": gas.loss_history,
         "gradnorm": gas.gradnorm_history,
-        "time": gas_opinf_time
+        "time": gas_opinf_time,
     }
     with open(os.path.join(models_dir, "gas_opinf_history.pkl"), "wb") as f:
         pickle.dump(gas_opinf_dict, f)

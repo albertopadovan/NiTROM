@@ -4,7 +4,6 @@ from nitrom.latent_space_models.gas_polynomial_model import GasPolynomialModel
 from nitrom.latent_space_models.polynomial_model import PolynomialModel
 from nitrom.projections.projection import Projection
 from nitrom.training_data import TrainingData
-from nitrom.backend import distributed_rank_size
 
 
 from .base import InferenceModule
@@ -146,7 +145,7 @@ class OpInfModule(InferenceModule):
         cost = ((R_flat * self.w[None, :]) * R_flat).sum()
 
         # Regularization on the quadratic tensor H
-        _, world_size = distributed_rank_size()
+        world_size = self.world_size  # communicator the pool was sharded on
         reg = self.reg / world_size
         if hasattr(self.rom, "poly_comp") and 2 in self.rom.poly_comp:
             if hasattr(self.rom, "model"):
@@ -183,15 +182,13 @@ class OpInfModule(InferenceModule):
         if self.forcing_fns is None or len(self.forcing_fns) == 0:
             Z_flat = bkend.permute(self.Z, (0, 2, 1)).reshape(-1, r)
             v = -2.0 * bkend.permute(RW, (0, 2, 1)).reshape(-1, r)
-            from nitrom.backend import distributed_rank_size
-            _, world_size = distributed_rank_size()
+            world_size = self.world_size  # communicator the pool was sharded on
             reg = self.reg / world_size
             grads = self.rom.inner_vjp_evaluate_rhs(Z_flat, v, reg=reg)
         else:
             # Accumulate VJP over time snapshots
             grads = None
-            from nitrom.backend import distributed_rank_size
-            _, world_size = distributed_rank_size()
+            world_size = self.world_size  # communicator the pool was sharded on
             reg_val = self.reg / world_size
             for j in range(self.nt):
                 t_j = self.time[j]

@@ -1,6 +1,6 @@
 from typing import Any
 
-from nitrom.backend import get_backend, distributed_rank_size
+from nitrom.backend import get_backend
 from nitrom.projections.polynomial_projection import PolynomialProjection
 from nitrom.training_data import TrainingData
 
@@ -152,7 +152,7 @@ class PolyManifoldInfModule(InferenceModule):
         cost = ((R_flat * self.w[None, :]) * R_flat).sum()
 
         # Regularization on A_k
-        _, world_size = distributed_rank_size()
+        world_size = self.world_size  # communicator the pool was sharded on
         reg = self.reg / world_size
         for name in self._trainable_names:
             cost = cost + reg * bkend.vector_norm(getattr(self.proj, name)) ** 2
@@ -191,8 +191,7 @@ class PolyManifoldInfModule(InferenceModule):
         grads = list(all_grads[2:])
 
         # Add regularization
-        from nitrom.backend import distributed_rank_size
-        _, world_size = distributed_rank_size()
+        world_size = self.world_size  # communicator the pool was sharded on
         reg = self.reg / world_size
         for i, name in enumerate(self._trainable_names):
             grads[i] = grads[i] + 2.0 * reg * getattr(self.proj, name)

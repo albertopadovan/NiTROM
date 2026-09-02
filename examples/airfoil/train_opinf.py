@@ -37,7 +37,7 @@ traj_path = "./trajectories/"
 parameters = np.load(traj_path + "parameters.npy")
 n_traj = len(parameters)
 
-r = 75  # reduced dimension
+r = 50  # reduced dimension
 poly_comp = [1, 2]
 
 # Load the trajectories into a TrainingPool
@@ -84,7 +84,7 @@ training_data = TrainingData(
 # 1) Solve standard OpInf analytically
 printr("\n=== OpInf ===")
 opinf_model = PolynomialModel(r, poly_comp, dtype=dtype)
-opinf = OpInfModule(training_data, opinf_model, projection, reg=1e-2)
+opinf = OpInfModule(training_data, opinf_model, projection, reg=1e-3)
 solve_opinf(opinf)
 
 if rank == 0:
@@ -108,7 +108,7 @@ gas_model = GasPolynomialModel(
     dtype=dtype,
     gas_params=gas_init,
 )
-gas = OpInfModule(training_data, gas_model, projection, reg=2.223e-5)
+gas = OpInfModule(training_data, gas_model, projection, reg=1.6681e-5)
 
 t0 = time.perf_counter()
 train(gas, n_epochs=10000, lr=1.0, optimizer_type="lbfgs", print_every=259, tol=1e-14)

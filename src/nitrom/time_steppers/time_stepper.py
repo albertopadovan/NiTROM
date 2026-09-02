@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 from nitrom.backend import get_backend
 from nitrom.utils import interp_quadratic
@@ -70,6 +70,19 @@ def _jacobian_f(f, t_eval, y, args, kwargs, bkend):
             return jacrev(single_f)(y_detached).detach()
 
         B_size = y.shape[0]
+
+        # Each output row depends only on its own input row, so the batched
+        # Jacobian is block diagonal.  One jacrev over the whole batch and then
+        # taking the diagonal blocks costs a single RHS trace; differentiating
+        # row by row instead re-evaluates the *full* batched RHS once per row,
+        # i.e. O(B^2) work for the same numbers.  The full Jacobian is
+        # (B, n, B, n), so fall back to the per-row loop when that would be
+        # large.
+        if B_size * B_size * n * n <= 1 << 20:
+            J_full = jacrev(single_f)(y_detached).detach()  # (B, n, B, n)
+            idx = torch.arange(B_size, device=J_full.device)
+            return J_full[idx, :, idx, :]
+
         J = bkend.zeros((B_size, n, n), dtype=y.dtype, device=dev)
         for b in range(B_size):
             def single_f_batched(u, b=b):
@@ -156,6 +169,60 @@ def _newton_solve(
     return y
 
 
+def _rk_step(
+    f: Callable[..., Any],
+    t: float,
+    x: Any,
+    dt: float,
+    tableau: dict,
+    newton_tol: float,
+    newton_max_iter: int,
+    args: tuple,
+    kwargs: dict,
+) -> tuple[Any, list, list]:
+    """One Runge-Kutta step.
+
+    Returns ``(x_next, stages_g, stages_k)`` -- the stage *states* and stage
+    *derivatives* alongside the updated state.  :func:`evolve` discards the
+    stages; :func:`solve_ivp_dense` can retain ``stages_g`` so the discrete
+    adjoint does not have to rebuild them.
+    """
+    c, b, A = tableau["c"], tableau["b"], tableau["A"]
+    s = len(c)
+
+    stages_g, stages_k = [], []
+    for i in range(s):
+        val = None
+        for j in range(i):
+            if A[i][j] != 0.0:
+                term = A[i][j] * stages_k[j]
+                val = term if val is None else val + term
+        const_i = x if val is None else x + dt * val
+
+        if A[i][i] != 0.0:  # Implicit stage
+            f_guess = f(t, x, *args, **kwargs)
+            y0 = const_i + dt * A[i][i] * f_guess
+            g_i = _newton_solve(
+                f, t + c[i] * dt, y0, const_i, dt, A[i][i],
+                newton_tol, newton_max_iter, *args, **kwargs,
+            )
+            k_i = f(t + c[i] * dt, g_i, *args, **kwargs)
+        else:  # Explicit stage
+            g_i = const_i
+            k_i = f(t + c[i] * dt, g_i, *args, **kwargs)
+        stages_g.append(g_i)
+        stages_k.append(k_i)
+
+    val_next = None
+    for i in range(s):
+        if b[i] != 0.0:
+            term = b[i] * stages_k[i]
+            val_next = term if val_next is None else val_next + term
+    x_next = x if val_next is None else x + dt * val_next
+
+    return x_next, stages_g, stages_k
+
+
 def evolve(
     f: Callable[..., Any],
     t: float,
@@ -185,39 +252,10 @@ def evolve(
     """
     if method in _BUTCHER_TABLEAUS:
         tableau = _BUTCHER_TABLEAUS[method]
-        c = tableau["c"]
-        b = tableau["b"]
-        A = tableau["A"]
-        s = len(c)
-
-        stages_k = []
-        for i in range(s):
-            val = None
-            for j in range(i):
-                if A[i][j] != 0.0:
-                    term = A[i][j] * stages_k[j]
-                    val = term if val is None else val + term
-            const_i = x if val is None else x + dt * val
-
-            if A[i][i] != 0.0:  # Implicit stage
-                f_guess = f(t, x, *args, **kwargs)
-                y0 = const_i + dt * A[i][i] * f_guess
-                g_i = _newton_solve(
-                    f, t + c[i] * dt, y0, const_i, dt, A[i][i],
-                    newton_tol, newton_max_iter, *args, **kwargs,
-                )
-                k_i = f(t + c[i] * dt, g_i, *args, **kwargs)
-            else:  # Explicit stage
-                g_i = const_i
-                k_i = f(t + c[i] * dt, g_i, *args, **kwargs)
-            stages_k.append(k_i)
-
-        val_next = None
-        for i in range(s):
-            if b[i] != 0.0:
-                term = b[i] * stages_k[i]
-                val_next = term if val_next is None else val_next + term
-        x_next = x if val_next is None else x + dt * val_next
+        s = len(tableau["c"])
+        x_next, _stages_g, stages_k = _rk_step(
+            f, t, x, dt, tableau, newton_tol, newton_max_iter, args, kwargs,
+        )
 
         if return_error:
             if "b_err" not in tableau:
@@ -349,40 +387,126 @@ def solve_ivp(
         X = bkend.stack(xsave_list, axis=-1)
         return interp_quadratic(t_eval, tsave, X)
 
-    # Time points for the simulation.
+    # Fixed-step: integrate on a uniform grid, sub-sample, then interpolate.
+    nt_sim = int(round((tf - t0) / dt))
+    dt_grid = (tf - t0) / nt_sim
+    dteval_min = float((t_eval[1:] - t_eval[:-1]).min())
+    save_every = max(int(round(dteval_min / dt_grid)), 1)
+
+    sol = solve_ivp_dense(
+        f, x0, t0, tf, dt_grid, method, newton_tol, newton_max_iter,
+        save_every=save_every, *args, **kwargs,
+    )
+    return interp_quadratic(t_eval, sol.t, sol.X)
+
+
+class DenseSolution(NamedTuple):
+    """Fixed-step solution retained on the integration grid.
+
+    :param t: grid times, shape ``(n_save,)``
+    :param X: states, shape ``(B, n, n_save)`` or ``(n, n_save)``
+    :param stages: per-step Runge-Kutta stage states, shape
+        ``(B, n, n_step, s)`` or ``(n, n_step, s)``; ``None`` unless requested
+    """
+
+    t: Any
+    X: Any
+    stages: Any = None
+
+
+def solve_ivp_dense(
+    f: Callable[..., Any],
+    x0: Any,
+    t0: float,
+    tf: float,
+    dt: float,
+    method: Literal["rk4", "rk2", "backward_euler"] = "rk4",
+    newton_tol: float = 1e-8,
+    newton_max_iter: int = 20,
+    save_every: int = 1,
+    with_stages: bool = False,
+    *args,
+    **kwargs,
+) -> DenseSolution:
+    r"""
+    Integrate on a fixed grid and return the solution *on that grid*.
+
+    :func:`solve_ivp` interpolates onto caller-supplied times and discards the
+    integration grid.  The adjoint sweep needs the grid itself -- otherwise each
+    measurement interval has to be re-integrated from an interpolated restart --
+    so this variant hands it back.  ``with_stages`` additionally retains the
+    Runge-Kutta stage states, which lets the discrete adjoint skip rebuilding
+    them.
+
+    Only fixed-step methods are supported; ``"rk45"`` chooses its own steps and
+    has no such grid.
+
+    :param save_every: keep every ``save_every``-th step (stages, when
+        requested, are always kept for every step)
+    :param with_stages: also return the per-step stage states
+    :returns: :class:`DenseSolution`
+    """
+    if method == "rk45":
+        raise ValueError(
+            "solve_ivp_dense requires a fixed-step method; rk45 chooses its "
+            "own steps. Use solve_ivp instead."
+        )
+    if method not in _BUTCHER_TABLEAUS:
+        raise ValueError(f"Unknown integration method: {method}")
+
+    bkend = get_backend()
+    dev = bkend.device_of(x0)
+    dtype = x0.dtype
+    batched = x0.ndim == 2
+    t0, tf, dt = float(t0), float(tf), float(dt)
+
     nt_sim = int(round((tf - t0) / dt))
     dt = (tf - t0) / nt_sim
     tsim = dt * bkend.arange(nt_sim + 1, dtype=dtype, device=dev) + t0
-    assert abs(float(tf) - float(tsim[-1])) < 1e-10
 
-    # Time points for saving: store at a uniform sub-sample, then interpolate.
-    dteval_min = float((t_eval[1:] - t_eval[:-1]).min())
-    save_every = max(int(round(dteval_min / dt)), 1)
-    tsave = tsim[::save_every]
-    n_save = len(tsave)
+    tableau = _BUTCHER_TABLEAUS[method]
+    s_stages = len(tableau["c"])
+
+    x = bkend.copy(x0)
+    n_save = len(tsim[::save_every])
 
     if batched:
         B, n = x0.shape
         X = bkend.zeros((B, n, n_save), dtype=dtype, device=dev)
         X[:, :, 0] = x
+        G = (
+            bkend.zeros((B, n, nt_sim, s_stages), dtype=dtype, device=dev)
+            if with_stages
+            else None
+        )
     else:
         n = x0.shape[0]
         X = bkend.zeros((n, n_save), dtype=dtype, device=dev)
         X[:, 0] = x
-
-    for i in range(1, len(tsim)):
-        t = tsim[i - 1]
-        x = evolve(
-            f, t, x, dt, method, newton_tol, newton_max_iter,
-            *args, **kwargs,
+        G = (
+            bkend.zeros((n, nt_sim, s_stages), dtype=dtype, device=dev)
+            if with_stages
+            else None
         )
+
+    for i in range(1, nt_sim + 1):
+        t = float(tsim[i - 1])
+        x, stages_g, _stages_k = _rk_step(
+            f, t, x, dt, tableau, newton_tol, newton_max_iter, args, kwargs,
+        )
+        if G is not None:
+            stacked = bkend.stack(stages_g, axis=-1)
+            if batched:
+                G[:, :, i - 1, :] = stacked
+            else:
+                G[:, i - 1, :] = stacked
         if i % save_every == 0:
             if batched:
                 X[:, :, i // save_every] = x
             else:
                 X[:, i // save_every] = x
 
-    return interp_quadratic(t_eval, tsave, X)
+    return DenseSolution(t=tsim[::save_every], X=X, stages=G)
 
 
 def solve_adjoint_ivp_discrete(
@@ -397,8 +521,10 @@ def solve_adjoint_ivp_discrete(
     newton_tol: float = 1e-8,
     newton_max_iter: int = 20,
     *args,
+    collector: Any = None,
+    stages_G: Any = None,
     **kwargs,
-) -> tuple[Any, list[Any]]:
+) -> tuple[Any, list[Any] | None]:
     r"""
     Propagate the adjoint state backward in time through the discrete RK solver
     stages and accumulate the parameter VJPs.
@@ -411,7 +537,16 @@ def solve_adjoint_ivp_discrete(
     :param h: step size (ignored if non-uniform, computed from sub_t instead)
     :param lam_init: initial adjoint seed state: ``(B, n)``
     :param method: ``"rk4"``, ``"rk2"``, ``"backward_euler"``, or ``"rk45"``
-    :returns: tuple containing the final adjoint state and the accumulated parameter gradients list
+    :param stages_G: forward Runge-Kutta stage states from
+        :func:`solve_ivp_dense`, shape ``(B, n, n_substeps, s)``.  When given,
+        the stages are read from here instead of being recomputed, which for
+        implicit methods also skips a full Newton solve per stage.
+    :param collector: optional sink with an ``add(z, w, t)`` method.  When given,
+        stage contributions are buffered there for a single bulk contraction
+        instead of being reduced per stage, and the returned gradient list is
+        ``None`` -- the caller reads the totals off the collector.
+    :returns: tuple of the final adjoint state and the accumulated parameter
+        gradients, or ``None`` for the gradients when *collector* is used
     """
     bkend = get_backend()
     lam = bkend.copy(lam_init) if hasattr(lam_init, "copy") else lam_init * 1.0
@@ -441,30 +576,35 @@ def solve_adjoint_ivp_discrete(
         t_n = float(sub_t[j])
         h_j = float(sub_t[j+1] - sub_t[j])
         
-        # 1. Reconstruct forward stages locally
-        stages_g = []
-        stages_k = []
-        for i in range(s):
-            val = None
-            for idx_j in range(i):
-                if A[i][idx_j] != 0.0:
-                    term = A[i][idx_j] * stages_k[idx_j]
-                    val = term if val is None else val + term
-            const_i = z_n if val is None else z_n + h_j * val
-            
-            if A[i][i] != 0.0:  # Implicit stage
-                f_guess = f(t_n, z_n, *args, **kwargs)
-                y0 = const_i + h_j * A[i][i] * f_guess
-                g_i = _newton_solve(
-                    f, t_n + c[i] * h_j, y0, const_i, h_j, A[i][i],
-                    newton_tol, newton_max_iter, *args, **kwargs,
-                )
-                k_i = f(t_n + c[i] * h_j, g_i, *args, **kwargs)
-            else:  # Explicit stage
-                g_i = const_i
-                k_i = f(t_n + c[i] * h_j, g_i, *args, **kwargs)
-            stages_g.append(g_i)
-            stages_k.append(k_i)
+        # 1. Forward stages: reuse the cached ones, or rebuild them locally.
+        if stages_G is not None:
+            stages_g = [
+                stages_G[..., j, i] for i in range(s)
+            ]
+        else:
+            stages_g = []
+            stages_k = []
+            for i in range(s):
+                val = None
+                for idx_j in range(i):
+                    if A[i][idx_j] != 0.0:
+                        term = A[i][idx_j] * stages_k[idx_j]
+                        val = term if val is None else val + term
+                const_i = z_n if val is None else z_n + h_j * val
+
+                if A[i][i] != 0.0:  # Implicit stage
+                    f_guess = f(t_n, z_n, *args, **kwargs)
+                    y0 = const_i + h_j * A[i][i] * f_guess
+                    g_i = _newton_solve(
+                        f, t_n + c[i] * h_j, y0, const_i, h_j, A[i][i],
+                        newton_tol, newton_max_iter, *args, **kwargs,
+                    )
+                    k_i = f(t_n + c[i] * h_j, g_i, *args, **kwargs)
+                else:  # Explicit stage
+                    g_i = const_i
+                    k_i = f(t_n + c[i] * h_j, g_i, *args, **kwargs)
+                stages_g.append(g_i)
+                stages_k.append(k_i)
             
         # 2. Initialize adjoint variables for the step
         bar_k = [lam * (h_j * b[i]) for i in range(s)]
@@ -490,11 +630,14 @@ def solve_adjoint_ivp_discrete(
                 bar_g[i] = dz_i
                 
                 # Compute parameter VJP
-                dtheta_i = vjp_theta(stages_g[i], w_i, t_n + c[i] * h_j)
-                if param_grads is None:
-                    param_grads = [bkend.zeros_like(p) for p in dtheta_i]
-                for idx, g_param in enumerate(dtheta_i):
-                    param_grads[idx] = param_grads[idx] + g_param
+                if collector is not None:
+                    collector.add(stages_g[i], w_i, t_n + c[i] * h_j)
+                else:
+                    dtheta_i = vjp_theta(stages_g[i], w_i, t_n + c[i] * h_j)
+                    if param_grads is None:
+                        param_grads = [bkend.zeros_like(p) for p in dtheta_i]
+                    for idx, g_param in enumerate(dtheta_i):
+                        param_grads[idx] = param_grads[idx] + g_param
                     
             if bar_g[i] is not None:
                 lam_x = lam_x + bar_g[i]

@@ -87,6 +87,29 @@ class InferenceModule(BackendModule, abc.ABC):
     """
 
     @property
+    def comm(self):
+        """MPI communicator this module's data is sharded over, or ``None``.
+
+        :class:`~nitrom.training_data.TrainingPool` may be sharded over a
+        sub-communicator rather than ``COMM_WORLD``.  The training loop reduces
+        over *this* communicator so a pool built on a split communicator is
+        reduced consistently with how it was sharded; ``None`` means "use the
+        default", which resolves to ``COMM_WORLD``.
+        """
+        pool = getattr(getattr(self, "training_data", None), "pool", None)
+        return getattr(pool, "comm", None)
+
+    @property
+    def world_size(self) -> int:
+        """Number of ranks this module's data is sharded over."""
+        from nitrom.backend import comm_rank_size, distributed_rank_size
+
+        comm = self.comm
+        if comm is None:
+            return distributed_rank_size()[1]
+        return comm_rank_size(comm)[1]
+
+    @property
     def is_learnable(self) -> dict[str, bool]:
         """
         Per-parameter learnability flags, keyed by parameter name in

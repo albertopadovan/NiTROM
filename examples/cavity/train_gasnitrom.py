@@ -2,16 +2,15 @@ import os
 import pickle
 import time
 
-import fom_class
+import classes_cavity
 import numpy as np
 
 from nitrom.backend import mpi_allreduce_scalar, mpi_rank_size, set_backend
-from nitrom.latent_space_models.polynomial_model import PolynomialModel
+from nitrom.latent_space_models.gas_polynomial_model import GasPolynomialModel
 from nitrom.optimization import NitromModule, train
 from nitrom.projections.linear_projection import LinearProjection
 from nitrom.roms.param_registry import ParamRegistry
 from nitrom.training_data import TrainingData, TrainingPool
-from nitrom.utils import compute_POD
 
 # Pure-numpy CPU run (lightweight; no torch). Trajectory-parallel with MPI:
 set_backend("numpy")
@@ -22,6 +21,10 @@ traj_path = "./trajectories/"
 models_dir = "./models/"
 r = 50  # reduced dimension
 poly_comp = [1, 2]
+shift_start_times = [0.0]  # custom start times for each shift window
+
+# Initialization model for GAS-NiTROM: "galerkin", "gas_opinf", or "nitrom".
+init_model = "gas_opinf"
 
 if rank == 0:
     os.makedirs(models_dir, exist_ok=True)
@@ -129,12 +132,30 @@ def update_module_training_data(module, td):
     module.weights = td.weights
 
 
+# Cavity physical dimensions/parameters
+Lx = 1
+Ly = 1
+Nx = 100
+Ny = 100
+dx = Lx / Nx
+dy = Ly / Ny
+Re = 8300
+
+n = 400
+dt = 1.0 / n
+
 # Setup the flow & FOM
-fom = fom_class.fom_class()
+flow = classes_cavity.flow_class(Lx, Ly, Nx, Ny, Re)
+lops = classes_cavity.linear_operators_2D(flow, dt)
+flow.q_sbf = np.load("bflow_Re%d_Nx%d_Ny%d.npy" % (Re, Nx, Ny))
+fom = classes_cavity.fom_class(flow, lops)
+fom.assemble_forcing_profile(0.95, 0.05)
+B = fom.f.copy()  # shape (19700,)
 
 # Trajectory details
-parameters = np.load(traj_path + "parameters.npy")
-n_traj = len(parameters)
+amps = np.load(traj_path + "amps.npy")
+n_traj = len(amps)
+printr(n_traj)
 
 # Load the trajectories into a TrainingPool
 pool = TrainingPool(
@@ -143,28 +164,28 @@ pool = TrainingPool(
     fname_time=traj_path + "time.npy",
     dtype=dtype,
     fname_weights=traj_path + "weight_%03d.npy",
+    fname_derivs=traj_path + "deriv_%03d.npy",
+    shift_start_times=shift_start_times,
 )
 
-# Compute POD basis (rank r) of the pre-projected snapshots (dimension 300)
-U, _, _ = compute_POD(pool, normalize=True)
-Phi = U[
-    :, :r
-]  # (300, r), used as the trial/test basis init (Psi = Phi) unless resuming
+# Train GAS-NiTROM
+printr(f"\n=== GAS-NiTROM (initialized from {init_model}) ===")
 
-# Train standard NiTROM
-
-printr("\n=== NiTROM (initialized from OpInf) ===")
-ckpt_name = "opinf_model.pkl"
+ckpt_name = {
+    "galerkin": "galerkin_model.pkl",
+    "gas_opinf": "gas_opinf_model.pkl",
+    "nitrom": "nitrom_model.pkl",
+}[init_model]
 ckpt_path = os.path.join(models_dir, ckpt_name)
-checkpoint_path = os.path.join(models_dir, "nitrom_checkpoint.pkl")
+checkpoint_path = os.path.join(models_dir, "gas_nitrom_checkpoint.pkl")
 
 # Alternating optimization parameters
 n_outer_iterations = 20
 epochs_bases = 25
 epochs_operators = 25
 
-# Loop percent_time_length from 5% to 100% in steps of 5%
-percents = np.arange(0.05, 1.01, 0.05)
+# Loop percent_time_length from 5% to 50% in steps of 5%
+percents = np.arange(0.05, 0.51, 0.05)
 
 resume_state = load_training_checkpoint(checkpoint_path)
 if resume_state is not None:
@@ -180,69 +201,79 @@ if resume_state is not None:
         f"(stage {start_p_idx + 1}/{len(percents)}, "
         f"outer iter {start_outer_iter + 1}/{n_outer_iterations})"
     )
-    tensors = [np.asarray(t, dtype=dtype) for t in resume_state["tensors"]]
+    gas_init = [np.asarray(t, dtype=dtype) for t in resume_state["gas_params"]]
     init_Phi = np.asarray(resume_state["Phi"], dtype=dtype)
     init_Psi = np.asarray(resume_state["Psi"], dtype=dtype)
-    all_nitrom_loss = list(resume_state["loss_history"])
-    all_nitrom_gradnorm = list(resume_state["gradnorm_history"])
+    all_gas_nitrom_loss = list(resume_state["loss_history"])
+    all_gas_nitrom_gradnorm = list(resume_state["gradnorm_history"])
     prior_elapsed = resume_state["elapsed_time"]
 else:
     printr(f"Loading initialization from {ckpt_path}...")
     with open(ckpt_path, "rb") as f:
         ckpt = pickle.load(f)
-    tensors = [np.asarray(t, dtype=dtype) for t in ckpt["tensors"]]
-    init_Phi = Phi  # POD basis computed above
-    init_Psi = Phi
-    all_nitrom_loss = []
-    all_nitrom_gradnorm = []
+
+    init_Phi = np.asarray(ckpt["Phi"], dtype=dtype)
+    init_Psi = np.asarray(ckpt.get("Psi", ckpt["Phi"]), dtype=dtype)
+
+    if init_model == "gas_opinf":
+        gas_init = [np.asarray(t, dtype=dtype) for t in ckpt["gas_params"]]
+    else:
+        tensors = [np.asarray(t, dtype=dtype) for t in ckpt["tensors"]]
+        seed = GasPolynomialModel(r, poly_comp, dtype=dtype)
+        seed.retract_general_tensors_to_gas_tensors(tensors[:2], use_P_I=True)
+        gas_init = [*seed.get_params()]
+
+    all_gas_nitrom_loss = []
+    all_gas_nitrom_gradnorm = []
     prior_elapsed = 0.0
     start_p_idx = 0
     start_outer_iter = 0
     start_phase = None
 
-nitrom_model = PolynomialModel(
+gas_nitrom_model = GasPolynomialModel(
     r,
     poly_comp,
     dtype=dtype,
-    tensors=tensors,
+    gas_params=gas_init,
 )
-projection = LinearProjection([init_Phi, init_Psi])
-registry = ParamRegistry(nitrom_model, projection)
 
-td_init = TrainingData(
+projection_gas = LinearProjection([init_Phi, init_Psi])
+registry_gas = ParamRegistry(gas_nitrom_model, projection_gas)
+td_gas_init = TrainingData(
     pool,
     which_trajs=list(range(n_traj)),
     percent_time_length=percents[start_p_idx],
     leggauss_deg=5,
     nsave_rom=15,
+    shift_start_times=shift_start_times,
 )
-nitrom = NitromModule(
-    td_init, registry, fom=fom, n_substeps=15, adjoint_method="discrete"
+gas_nitrom = NitromModule(
+    td_gas_init, registry_gas, fom=fom, n_substeps=15, adjoint_method="discrete"
 )
-nitrom.set_manifold_types(["Phi", "Psi"], ["grassmann", "stiefel"])
+gas_nitrom.set_manifold_types(["Phi", "Psi"], ["grassmann", "stiefel"])
 
-printr(f"initial cost: {gcost(nitrom):.6e}")
+printr(f"initial cost: {gcost(gas_nitrom):.6e}")
 
-t0 = time.perf_counter()
+t0_gas = time.perf_counter()
 
 
 def elapsed_time() -> float:
-    return prior_elapsed + (time.perf_counter() - t0)
+    return prior_elapsed + (time.perf_counter() - t0_gas)
 
 
 def checkpoint(p_idx, outer_iter, phase) -> None:
     if rank == 0:
-        nitrom._sync_to_registry()
+        gas_nitrom._sync_to_registry()
         save_training_checkpoint(
             checkpoint_path,
             p_idx=p_idx,
             outer_iter=outer_iter,
             phase=phase,
-            tensors=nitrom_model.get_params(),
-            Phi=nitrom.projection.Phi,
-            Psi=nitrom.projection.Psi,
-            loss_history=all_nitrom_loss,
-            gradnorm_history=all_nitrom_gradnorm,
+            gas_params=gas_nitrom_model.get_params(),
+            Phi=gas_nitrom.projection.Phi,
+            Psi=gas_nitrom.projection.Psi,
+            loss_history=all_gas_nitrom_loss,
+            gradnorm_history=all_gas_nitrom_gradnorm,
             elapsed_time=elapsed_time(),
         )
 
@@ -251,7 +282,7 @@ for p_idx, percent in enumerate(percents):
     if p_idx < start_p_idx:
         continue
     printr(
-        f"\n--- NiTROM Stage {p_idx + 1}/{len(percents)} (Time length: {percent * 100:.1f}%) ---"
+        f"\n--- GAS-NiTROM Stage {p_idx + 1}/{len(percents)} (Time length: {percent * 100:.1f}%) ---"
     )
     td_slice = TrainingData(
         pool,
@@ -259,8 +290,9 @@ for p_idx, percent in enumerate(percents):
         percent_time_length=percent,
         leggauss_deg=5,
         nsave_rom=15,
+        shift_start_times=shift_start_times,
     )
-    update_module_training_data(nitrom, td_slice)
+    update_module_training_data(gas_nitrom, td_slice)
 
     # Alternating optimization
     outer_start = start_outer_iter if p_idx == start_p_idx else 0
@@ -275,60 +307,62 @@ for p_idx, percent in enumerate(percents):
         if not skip_bases:
             # Optimize bases (Phi, Psi) only
             printr("    Optimizing bases (Phi, Psi)...")
-            set_optimize_bases(nitrom)
+            set_optimize_bases(gas_nitrom)
             train(
-                nitrom,
+                gas_nitrom,
                 n_epochs=epochs_bases,
                 lr=1.0,
                 optimizer_type="lbfgs",
                 print_every=1,
                 tol=1e-14,
             )
-            all_nitrom_loss.extend(nitrom.loss_history)
-            all_nitrom_gradnorm.extend(nitrom.gradnorm_history)
+            all_gas_nitrom_loss.extend(gas_nitrom.loss_history)
+            all_gas_nitrom_gradnorm.extend(gas_nitrom.gradnorm_history)
             checkpoint(p_idx, outer_iter, "bases_done")
 
         # Optimize operators only
         printr("    Optimizing operators...")
-        set_optimize_operators(nitrom)
+        set_optimize_operators(gas_nitrom)
         train(
-            nitrom,
+            gas_nitrom,
             n_epochs=epochs_operators,
             lr=1.0,
             optimizer_type="lbfgs",
             print_every=1,
             tol=1e-14,
         )
-        all_nitrom_loss.extend(nitrom.loss_history)
-        all_nitrom_gradnorm.extend(nitrom.gradnorm_history)
+        all_gas_nitrom_loss.extend(gas_nitrom.loss_history)
+        all_gas_nitrom_gradnorm.extend(gas_nitrom.gradnorm_history)
         checkpoint(p_idx, outer_iter, "operators_done")
 
-nitrom_time = elapsed_time()
-printr(f"training time: {nitrom_time:.4f} s")
-printr(f"final cost:   {gcost(nitrom):.6e}")
+gas_nitrom_time = elapsed_time()
+printr(f"training time: {gas_nitrom_time:.4f} s")
+printr(f"final cost:   {gcost(gas_nitrom):.6e}")
 
-nitrom._sync_to_registry()
+gas_nitrom._sync_to_registry()
 if rank == 0:
+    gas_params = [np.asarray(t) for t in gas_nitrom_model.get_params()]
     save_checkpoint(
-        nitrom_model.get_params(),
-        "nitrom",
-        os.path.join(models_dir, "nitrom_model.pkl"),
-        nitrom.projection.Phi,
-        nitrom.projection.Psi,
+        gas_nitrom_model.model.get_params(),
+        "gas_nitrom",
+        os.path.join(models_dir, "gas_nitrom_model.pkl"),
+        gas_nitrom.projection.Phi,
+        gas_nitrom.projection.Psi,
+        gas_params=gas_params,
     )
     # Training finished; the resume checkpoint is no longer needed.
     if os.path.exists(checkpoint_path):
         os.remove(checkpoint_path)
 
-nitrom_loss = np.array(all_nitrom_loss)
-nitrom_gradnorm = np.array(all_nitrom_gradnorm)
-nitrom_iters = np.arange(len(nitrom_loss))
-nitrom_dict = {
-    "iters": nitrom_iters,
-    "loss": nitrom_loss,
-    "gradnorm": nitrom_gradnorm,
-    "time": nitrom_time,
+gas_nitrom_loss = np.array(all_gas_nitrom_loss)
+gas_nitrom_gradnorm = np.array(all_gas_nitrom_gradnorm)
+gas_nitrom_iters = np.arange(len(gas_nitrom_loss))
+gas_nitrom_dict = {
+    "iters": gas_nitrom_iters,
+    "loss": gas_nitrom_loss,
+    "gradnorm": gas_nitrom_gradnorm,
+    "time": gas_nitrom_time,
 }
 if rank == 0:
-    with open(os.path.join(models_dir, "nitrom_history.pkl"), "wb") as f:
-        pickle.dump(nitrom_dict, f)
+    with open(os.path.join(models_dir, "gas_nitrom_history.pkl"), "wb") as f:
+        pickle.dump(gas_nitrom_dict, f)

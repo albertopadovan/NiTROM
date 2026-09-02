@@ -104,10 +104,12 @@ def solve_opinf(module: OpInfModule) -> OpInfModule:
     # Allreduce local contributions to get the global matrices in parallel runs
     if bkend.is_numpy:
         from nitrom.backend import mpi_allreduce_sum, mpi_rank_size
-        _, size = mpi_rank_size()
+        # Reduce over the communicator the pool was sharded on (see train.py).
+        comm = getattr(module, "comm", None)
+        _, size = mpi_rank_size(comm)
         if size > 1:
-            Q_w_Q_T = mpi_allreduce_sum(Q_w_Q_T)
-            B_sys = mpi_allreduce_sum(B_sys)
+            Q_w_Q_T = mpi_allreduce_sum(Q_w_Q_T, comm=comm)
+            B_sys = mpi_allreduce_sum(B_sys, comm=comm)
     else:
         try:
             import torch.distributed as dist

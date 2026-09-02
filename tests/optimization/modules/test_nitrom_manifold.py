@@ -55,7 +55,10 @@ def _module(model) -> NitromModule:
         registry,
         fom=_fom(),
         reg=0.01,
-        n_substeps=100,
+        # Discrete adjoint (the default) is exact for the discretized cost at any
+        # resolution, so a coarse sub-step grid checks the same thing far faster.
+        # See the _N_SUBSTEPS note in test_nitrom.py.
+        n_substeps=10,
         time_stepper="rk4",
         n_leggauss=5,
     )

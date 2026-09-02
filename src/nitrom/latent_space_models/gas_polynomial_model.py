@@ -522,6 +522,20 @@ class GasPolynomialModel(Model):
         """
         return self.model.vjp_evaluate_rhs(z, v, reg=reg, **kwargs)
 
+    def inner_batched_vjp_evaluate_rhs(
+        self, Z: Any, V: Any, U: Any = None, out: list | None = None,
+        max_bytes: int = 64 << 20,
+    ) -> list[Any]:
+        """Batched VJP w.r.t. the inner ``(A, H, [B])`` tensors.
+
+        The GAS parameters are recovered from these by
+        :meth:`project_inner_gradients`, which the caller applies once at the end
+        of the sweep.
+        """
+        return self.model.batched_vjp_evaluate_rhs(
+            Z, V, U=U, out=out, max_bytes=max_bytes
+        )
+
     def vjp_evaluate_rhs(self, z: Any, v: Any, reg: float = 0.0, **kwargs) -> list[Any]:
         r"""
         VJP of the RHS with respect to the GAS parameters.

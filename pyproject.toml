@@ -25,6 +25,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest",
+    "pytest-xdist",
     "ruff",
 ]
 
@@ -33,6 +34,12 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The finite-difference gradient checks are independent and CPU-bound, so the
+# suite parallelizes almost perfectly.  "-n logical" uses every available core
+# (SLURM/cgroup limits are respected); "-p no:cacheprovider" keeps concurrent
+# workers from racing on .pytest_cache.  Override with "-n 0" to run serially,
+# e.g. when using a debugger.
+addopts = "-n logical -p no:cacheprovider"
 
 [tool.ruff]
 target-version = "py310"

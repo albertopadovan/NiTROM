@@ -421,3 +421,103 @@ def test_train_numpy_opinf_decreases(optimizer_type):
     lr = {"adam": 0.05, "sgd": 1e-3, "lbfgs": 1.0}[optimizer_type]
     train(m, n_epochs=60, lr=lr, optimizer_type=optimizer_type, print_every=0, tol=1e-14)
     assert float(m()) < l0
+
+
+# ---------------------------------------------------------------------------
+# Backend.einsum contraction plans
+# ---------------------------------------------------------------------------
+#
+# The numpy backend compiles each contraction into a transpose/reshape/dot plan
+# and replays it, rather than re-entering ``numpy.einsum`` per call.  These pin
+# the plan to numpy's own result: any subscript the shape algebra gets wrong
+# would otherwise surface as a silently wrong gradient.
+
+# Big enough to clear Backend._EINSUM_OPTIMIZE_MIN_COST (so a plan is built)
+# and small enough to stay cheap; the pairs below are the shapes NiTROM's
+# polynomial RHS and its parameter VJP actually contract at.
+_EINSUM_CASES = [
+    ("abc,db,dc->da", [(20, 20, 20), (7, 20), (7, 20)]),  # ROM rhs, batched
+    ("abc,db,dc->da", [(20, 20, 20), (1, 20), (1, 20)]),  # ROM rhs, one traj
+    ("da,db,dc->abc", [(7, 20), (7, 20), (7, 20)]),  # parameter VJP
+    ("da,db,dc->abc", [(1, 20), (1, 20), (1, 20)]),
+    ("abc,b,c->a", [(20, 20, 20), (20,), (20,)]),  # unbatched rhs
+    ("ab,db->da", [(40, 40), (30, 40)]),  # linear term
+    ("ijk,jl->ilk", [(20, 20, 20), (20, 20)]),  # transposed output
+    ("abcd,dc->ab", [(12, 12, 12, 12), (12, 12)]),  # multi-axis contraction
+    ("abc,abc->", [(20, 20, 20), (20, 20, 20)]),  # full reduction to a scalar
+    ("ab,cd->abcd", [(12, 12), (12, 12)]),  # outer product, nothing summed
+    ("ij,jk,kl->il", [(30, 30), (30, 30), (30, 30)]),  # chain, three operands
+    ("ab,bc->ac", [(2, 2), (2, 2)]),  # below threshold: naive fallback
+]
+
+
+@pytest.mark.parametrize("equation,shapes", _EINSUM_CASES)
+def test_numpy_einsum_matches_numpy(equation, shapes):
+    set_backend("numpy")
+    rng = np.random.default_rng(0)
+    operands = [rng.standard_normal(s) for s in shapes]
+
+    expected = np.einsum(equation, *operands, optimize=False)
+    got = get_backend().einsum(equation, *operands)
+
+    assert np.shape(got) == np.shape(expected)
+    assert np.allclose(got, expected, rtol=0, atol=1e-12)
+
+
+def test_numpy_einsum_plan_is_reused_across_calls():
+    """A repeated contraction must be planned once, then replayed."""
+    set_backend("numpy")
+    backend = get_backend()
+    backend._einsum_paths.clear()
+
+    rng = np.random.default_rng(1)
+    H = rng.standard_normal((20, 20, 20))
+    z = rng.standard_normal((7, 20))
+
+    first = backend.einsum("abc,db,dc->da", H, z, z)
+    assert len(backend._einsum_paths) == 1
+    for _ in range(3):
+        assert np.array_equal(backend.einsum("abc,db,dc->da", H, z, z), first)
+    assert len(backend._einsum_paths) == 1
+
+    # A different batch size is a different plan, not a cache hit.
+    backend.einsum("abc,db,dc->da", H, z[:1], z[:1])
+    assert len(backend._einsum_paths) == 2
+
+
+@pytest.mark.parametrize("backend_name", ["numpy", "torch"])
+def test_solve_batched_vector_rhs(backend_name):
+    """``solve((B, n, n), (B, n))`` must mean a batch of vector solves.
+
+    NumPy 2.0 dropped this form of ``linalg.solve`` -- a 2-D ``b`` is now read as
+    a single matrix -- while torch still accepts it.  The batched Newton solve
+    (``_newton_solve``) and the implicit-stage adjoint
+    (``solve_adjoint_ivp_discrete``) both rely on it, so the backend normalizes
+    the two.  Without this, ``backward_euler`` raises on numpy and passes on torch.
+    """
+    set_backend(backend_name)
+    backend = get_backend()
+
+    rng = np.random.default_rng(0)
+    B, n = 3, 5
+    a_np = rng.standard_normal((B, n, n)) + n * np.eye(n)  # diagonally dominant
+    b_np = rng.standard_normal((B, n))
+
+    a = backend.asarray(a_np)
+    b = backend.asarray(b_np)
+
+    x = backend.solve(a, b)
+    assert tuple(x.shape) == (B, n)
+
+    expected = np.stack([np.linalg.solve(a_np[i], b_np[i]) for i in range(B)])
+    np.testing.assert_allclose(backend.to_numpy(x), expected, rtol=1e-10, atol=1e-12)
+
+    # The matrix right-hand side must keep working untouched.
+    rhs_np = rng.standard_normal((B, n, 2))
+    xm = backend.solve(a, backend.asarray(rhs_np))
+    assert tuple(xm.shape) == (B, n, 2)
+    np.testing.assert_allclose(
+        backend.to_numpy(xm),
+        np.stack([np.linalg.solve(a_np[i], rhs_np[i]) for i in range(B)]),
+        rtol=1e-10, atol=1e-12,
+    )

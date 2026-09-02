@@ -61,6 +61,10 @@ class PolynomialModel(Model):
 
         self.poly_comp = poly_comp
         self.thresh = instability_threshold
+        # Compared against squared norms: sqrt() per RHS call is pure overhead on
+        # a divergence guard, and np.linalg.norm carries __array_function__
+        # dispatch that shows up in profiles of the adjoint sweep.
+        self._thresh_sq = instability_threshold * instability_threshold
         self.forcing_exists = forcing_exists
 
         # Initialize tensors (zero, or the fixed B) if not provided
@@ -167,12 +171,19 @@ class PolynomialModel(Model):
         r"""
         Update the operator tensors of the polynomial model.
 
+        The tensors are stored C-contiguous.  A caller that assembles them from
+        contractions -- :class:`~nitrom.latent_space_models.gas_polynomial_model.GasPolynomialModel`
+        and its subclasses do, once per optimizer step -- can otherwise hand over
+        a permuted-stride view, which every RHS and adjoint evaluation until the
+        next update then has to copy on reshape (see
+        :meth:`~nitrom.backend.Backend.ascontiguous`).
+
         :param tensors: new list of operator tensors :math:`[A_1, A_2, \ldots]`,
             in the same order as :attr:`param_names`
         :type tensors: list
         """
         for name, tensor in zip(self.param_names, tensors, strict=True):
-            setattr(self, name, tensor)
+            setattr(self, name, self.backend.ascontiguous(tensor))
 
     def evaluate_rhs(self, t: float, z: Any, **kwargs) -> Any:
         r"""
@@ -198,7 +209,7 @@ class PolynomialModel(Model):
         # z is a vector
         if z.ndim == 1:
             # Guard against blow-up
-            if bkend.vector_norm(z) >= self.thresh:
+            if (z * z).sum() >= self._thresh_sq:
                 return bkend.zeros_like(z)
 
             # Compute the dynamics
@@ -219,8 +230,7 @@ class PolynomialModel(Model):
             # Nothing having blown up is the overwhelmingly common case, and
             # there the boolean gather/scatter around the contraction is pure
             # overhead, so contract ``z`` whole when the mask is all-true.
-            norms = bkend.vector_norm(z, axis=-1)
-            mask = norms < self.thresh
+            mask = (z * z).sum(axis=-1) < self._thresh_sq
             all_below = bool(mask.all())
             if not all_below and not mask.any():
                 return bkend.zeros_like(z)
@@ -248,6 +258,93 @@ class PolynomialModel(Model):
 
         return dzdt
 
+    def batched_vjp_evaluate_rhs(
+        self,
+        Z: Any,
+        V: Any,
+        U: Any = None,
+        out: list | None = None,
+        max_bytes: int = 64 << 20,
+    ) -> list[Any]:
+        r"""
+        Parameter VJP summed over a stack of ``(state, seed)`` records.
+
+        Equivalent to summing :meth:`vjp_evaluate_rhs` over the records, i.e. for
+        each degree :math:`k`
+
+        .. math::
+
+            \sum_d v_d \otimes \underbrace{z_d \otimes \cdots \otimes z_d}_{k},
+
+        but evaluated as a single matrix product per degree instead of one
+        outer-product-and-accumulate per record.  The adjoint sweep produces one
+        record per Runge-Kutta stage per sub-step, so at ``r = 50`` this replaces
+        several hundred rank-1 updates of an ``(r, r, r)`` accumulator -- which are
+        memory-bound and dominate the sweep -- with one GEMM.
+
+        This is the multilinear part only: unlike :meth:`vjp_evaluate_rhs` it takes
+        no ``reg``, because a regularization term must be added once, not once per
+        record.
+
+        :param Z: stacked states, shape ``(D, r)``
+        :param V: stacked upstream adjoint seeds, shape ``(D, r)``
+        :param U: stacked forcing rows ``u(t_d)``, shape ``(D, m)``; required iff
+            :attr:`forcing_exists`
+        :param out: accumulators to add into, in :meth:`get_params` order; a new
+            list is allocated when omitted
+        :param max_bytes: soft cap on the ``(chunk, r**k)`` intermediate, which
+            bounds memory independently of ``D``
+        :returns: list of gradients ``[grad_A_0, ..., grad_A_K, grad_B]``
+        :rtype: list
+        """
+        bkend = self.backend
+        D, r = Z.shape
+
+        if self.forcing_exists and U is None:
+            raise ValueError(
+                "batched_vjp_evaluate_rhs needs the stacked forcing U when "
+                "forcing_exists is True"
+            )
+
+        # Bound the largest intermediate, (chunk, r**k_max), not the whole stack.
+        k_max = max(self.poly_comp) if self.poly_comp else 1
+        itemsize = getattr(Z.dtype, "itemsize", 8)
+        per_record = max(1, itemsize * r ** max(k_max, 1))
+        chunk = max(1, min(D, max_bytes // per_record))
+
+        grads: list[Any] = [None] * len(self.poly_comp)
+        grad_B = None
+
+        for start in range(0, D, chunk):
+            Zc = Z[start : start + chunk]
+            Vc = V[start : start + chunk]
+            Vt = bkend.permute(Vc, (1, 0))  # (r, C)
+
+            for i, k in enumerate(self.poly_comp):
+                if k == 0:
+                    g = Vc.sum(axis=0)
+                elif k == 1:
+                    g = Vt @ Zc
+                else:
+                    # P[d, b*r + c + ...] = Z[d, b] * Z[d, c] * ...  so that
+                    # (V^T @ P) reshaped is  sum_d V[d, a] Z[d, b] Z[d, c] ...
+                    P = Zc
+                    for _ in range(k - 1):
+                        P = (P[:, :, None] * Zc[:, None, :]).reshape(Zc.shape[0], -1)
+                    g = (Vt @ P).reshape((r,) * (k + 1))
+                grads[i] = g if grads[i] is None else grads[i] + g
+
+            if self.forcing_exists:
+                gB = Vt @ U[start : start + chunk]
+                grad_B = gB if grad_B is None else grad_B + gB
+
+        if self.forcing_exists:
+            grads.append(grad_B)
+
+        if out is None:
+            return grads
+        return [o + g for o, g in zip(out, grads, strict=True)]
+
     def evaluate_adjoint_rhs(self, t: float, z: Any, Z: Any, **kwargs) -> Any:
         r"""
         Evaluate the adjoint right-hand side:
@@ -271,7 +368,7 @@ class PolynomialModel(Model):
         # z is a vector
         if z.ndim == 1:
             # Guard against blow-up
-            if bkend.vector_norm(z) >= self.thresh:
+            if (z * z).sum() >= self._thresh_sq:
                 return bkend.zeros_like(z)
 
             # Contract J(Z)^T z directly: assembling J only to apply it once
@@ -285,8 +382,7 @@ class PolynomialModel(Model):
         # z is a tensor (we use batching to evaluate all vectors at once)
         else:
             # Guard against blow-up (see :meth:`evaluate_rhs` for the fast path)
-            norms = bkend.vector_norm(z, axis=-1)
-            mask = norms < self.thresh
+            mask = (z * z).sum(axis=-1) < self._thresh_sq
             all_below = bool(mask.all())
             if not all_below and not mask.any():
                 return bkend.zeros_like(z)

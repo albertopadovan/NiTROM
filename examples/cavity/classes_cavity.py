@@ -117,8 +117,13 @@ class fom_class:
             return torch.eye(q.shape[1], device=q.device, dtype=q.dtype)
         else:
             return np.eye(q.shape[1], dtype=q.dtype)
-    
-    def assemble_forcing_profile(self,xc,yc): 
+
+    def apply_output_adjoint(self,e,q):
+        # compute_output is the identity, so its adjoint is the identity too;
+        # this skips ever forming the dense (N, N) output-derivative matrix.
+        return e
+
+    def assemble_forcing_profile(self,xc,yc):
         
         dx = self.flow_params.x[1] - self.flow_params.x[0] 
         f = np.zeros(self.flow_params.szu + self.flow_params.szv)

@@ -190,9 +190,7 @@ class GasPolynomialModel(Model):
 
         if 2 in self.poly_comp:
             idx = self.poly_comp.index(2)
-            tensors[idx] = bkend.einsum(
-                "ilk,lj->ijk", self.S, Qtil
-            ) - bkend.einsum("lik,lj->ijk", self.S, Qtil)
+            tensors[idx] = bkend.einsum("ilk,lj->ijk", self._S_diff, Qtil)
 
         if self.forcing_exists:
             tensors.append(self.B)
@@ -498,9 +496,8 @@ class GasPolynomialModel(Model):
             grad_Q = -(self._Qinv.T @ (grad_Qtil @ Qtil) + self._Qinv.T @ (grad_Qtil.T @ Qtil))
 
             # grad_S_{abc} = Σ_j grad_H_{ajc} Qtil_{bj} - Σ_j grad_H_{bjc} Qtil_{aj}
-            grad_S = bkend.einsum("ijk,jl->ilk", grad_H, Qtil) - bkend.einsum(
-                "ljk,ij->ilk", grad_H, Qtil
-            )
+            grad_S_pre = bkend.einsum("ijk,jl->ilk", grad_H, Qtil)
+            grad_S = grad_S_pre - bkend.permute(grad_S_pre, (1, 0, 2))
             grads.extend([grad_Q, grad_S])
 
         if self.forcing_exists:

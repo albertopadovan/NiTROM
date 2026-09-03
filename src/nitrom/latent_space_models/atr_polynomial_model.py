@@ -145,9 +145,7 @@ class AtrPolynomialModel(GasPolynomialModel):
 
         # Shifted-frame operators (identical to the GAS parameterization).
         Ahat = ((self.K - self.K.T) - self._Rtil) @ Qtil
-        H = bkend.einsum("ilk,lj->ijk", self.S, Qtil) - bkend.einsum(
-            "lik,lj->ijk", self.S, Qtil
-        )
+        H = bkend.einsum("ilk,lj->ijk", self._S_diff, Qtil)
 
         # Undo the shift: A = Ahat - H:(I x m) - H:(m x I).
         A = (

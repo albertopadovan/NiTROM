@@ -5,7 +5,6 @@ from nitrom.latent_space_models.polynomial_model import PolynomialModel
 from nitrom.projections.projection import Projection
 from nitrom.training_data import TrainingData
 
-
 from .base import InferenceModule
 
 
@@ -63,15 +62,49 @@ class OpInfModule(InferenceModule):
         self.ntraj = ntraj
         self.nt = nt
 
+        # Keep the snapshot axis leading in the hot cost/gradient path.  These
+        # arrays do not depend on the ROM parameters, so repeatedly permuting
+        # the trajectory representation in every objective evaluation is
+        # unnecessary.
+        r = self.rom.state_dimension
+        self.Z_flat = bkend.permute(self.Z, (0, 2, 1)).reshape(-1, r)
+        self.dZ_flat = bkend.permute(self.dZ, (0, 2, 1)).reshape(-1, r)
+
+        # Store forcing callables and time grid.
+        self.forcing_fns = getattr(training_data, "forcing_fns", None)
+        self.time = getattr(training_data, "time", None)
+
+        # For an unforced quadratic ROM, z \otimes z is also fixed throughout
+        # OpInf.  It is built lazily on the first objective evaluation: a
+        # closed-form-only OpInf solve does not need it, whereas GAS-OpInf then
+        # reuses it for every RHS evaluation.  The threshold check preserves
+        # PolynomialModel's blow-up-guard behaviour for unusual input data.
+        poly_comp = getattr(self.rom, "poly_comp", ())
+        self.Z_2_flat = None
+        inner_model = getattr(self.rom, "model", self.rom)
+        threshold_sq = getattr(inner_model, "_thresh_sq", None)
+        self._quadratic_fastpath = (
+            (self.forcing_fns is None or len(self.forcing_fns) == 0)
+            and len(poly_comp) == 2
+            and set(poly_comp) == {1, 2}
+            and (
+                threshold_sq is None
+                or bool(((self.Z_flat * self.Z_flat).sum(axis=-1) < threshold_sq).all())
+            )
+        )
+
         # Per-snapshot weights.  Held as the (ntraj * nt,) diagonal rather than
         # the dense matrix: every use is a row scale of the residual, so
         # materializing the (ntraj*nt)^2 matrix costs O(n_s) times the memory
         # and turns an elementwise multiply into a GEMM against a diagonal.
         self.w = bkend.repeat_interleave(1 / training_data.weights.reshape(-1), nt)
 
-        # Store forcing callables and time grid
-        self.forcing_fns = getattr(training_data, "forcing_fns", None)
-        self.time = getattr(training_data, "time", None)
+        # The optimizer evaluates the cost and gradient at the same candidate
+        # parameters.  Cache the assembly and residual for that candidate so
+        # the gradient does not repeat the full batched RHS evaluation.
+        self._synced_signature = None
+        self._cached_signature = None
+        self._cached_residual_flat = None
 
         # Register the model's parameters (wrapped per backend by the container)
         for name in self.rom.param_names:
@@ -96,9 +129,74 @@ class OpInfModule(InferenceModule):
         return bkend.permute(Z_flat.reshape(ntraj, nt, r), (0, 2, 1))
 
     def _sync_to_rom(self) -> None:
-        """Push current parameters into the underlying ROM."""
+        """Push current parameters into the underlying ROM when they changed."""
         tensors = [getattr(self, name) for name in self.rom.param_names]
+        signature = self._parameter_signature(tensors)
+        if signature == self._synced_signature:
+            return
         self.rom.update_params(tensors)
+        self._synced_signature = signature
+        self._cached_signature = None
+        self._cached_residual_flat = None
+
+    def _parameter_signature(self, tensors: list[Any]) -> tuple:
+        """Return a cheap per-iterate identity/version signature.
+
+        NumPy's optimizer replaces parameter arrays for every trial point;
+        PyTorch increments a tensor's internal version counter for in-place
+        optimizer updates.  Together these identify the normal training path
+        without hashing the O(r^3) GAS tensors on every call.
+        """
+        if self.backend.is_torch:
+            return tuple((id(t), t._version) for t in tensors)
+        return tuple(id(t) for t in tensors)
+
+    def _evaluate_rhs_flat(self) -> Any:
+        """Evaluate all RHS values in ``(ntraj * nt, r)`` layout."""
+        bkend = self.backend
+
+        if self.forcing_fns is None or len(self.forcing_fns) == 0:
+            # The common GAS-OpInf model has exactly linear and quadratic
+            # physical operators.  Its already assembled tensors are exposed
+            # through inner_params(), including for GasPolynomialModel.
+            if self._quadratic_fastpath:
+                if self.Z_2_flat is None:
+                    self.Z_2_flat = (
+                        self.Z_flat[:, :, None] * self.Z_flat[:, None, :]
+                    ).reshape(self.Z_flat.shape[0], -1)
+                tensors = self.rom.inner_params()
+                i_A = self.rom.poly_comp.index(1)
+                i_H = self.rom.poly_comp.index(2)
+                A, H = tensors[i_A], tensors[i_H]
+                return self.Z_flat @ A.T + self.Z_2_flat @ H.reshape(
+                    self.rom.state_dimension, -1
+                ).T
+            return self.rom.evaluate_rhs(0.0, self.Z_flat)
+
+        fZ = self._evaluate_rhs_all()
+        return bkend.permute(fZ, (0, 2, 1)).reshape(-1, self.rom.state_dimension)
+
+    def _residual_flat(self) -> Any:
+        """Return the cached residual rows for the current parameter iterate."""
+        if self._cached_signature == self._synced_signature:
+            return self._cached_residual_flat
+        residual = self.dZ_flat - self._evaluate_rhs_flat()
+        self._cached_signature = self._synced_signature
+        self._cached_residual_flat = residual
+        return residual
+
+    def _quadratic_inner_vjp(self, v: Any, reg: float) -> list[Any]:
+        """VJP of an unforced linear--quadratic ROM using cached features."""
+        r = self.rom.state_dimension
+        tensors = self.rom.inner_params()
+        i_A = self.rom.poly_comp.index(1)
+        i_H = self.rom.poly_comp.index(2)
+        grads = [None] * len(tensors)
+        grads[i_A] = v.T @ self.Z_flat
+        grads[i_H] = (v.T @ self.Z_2_flat).reshape(r, r, r)
+        if reg > 0.0:
+            grads[i_H] = grads[i_H] + 2.0 * reg * tensors[i_H]
+        return grads
 
     def _evaluate_rhs_all(self) -> Any:
         r"""
@@ -115,8 +213,7 @@ class OpInfModule(InferenceModule):
         r = self.rom.state_dimension
 
         if self.forcing_fns is None or len(self.forcing_fns) == 0:
-            Z_flat = bkend.permute(self.Z, (0, 2, 1)).reshape(-1, r)
-            fZ = self.rom.evaluate_rhs(0.0, Z_flat)
+            fZ = self.rom.evaluate_rhs(0.0, self.Z_flat)
             return bkend.permute(fZ.reshape(self.ntraj, self.nt, r), (0, 2, 1))
 
         # Loop over time snapshots to pass per-trajectory forcing
@@ -137,12 +234,8 @@ class OpInfModule(InferenceModule):
         """
         bkend = self.backend
         self._sync_to_rom()
-
-        fZ = self._evaluate_rhs_all()
-
-        R = self.dZ - fZ
-        R_flat = bkend.permute(R, (1, 0, 2)).reshape(self.rom.state_dimension, -1)
-        cost = ((R_flat * self.w[None, :]) * R_flat).sum()
+        R_flat = self._residual_flat()
+        cost = ((R_flat * self.w[:, None]) * R_flat).sum()
 
         # Regularization on the quadratic tensor H
         world_size = self.world_size  # communicator the pool was sharded on
@@ -165,35 +258,30 @@ class OpInfModule(InferenceModule):
 
         :returns: list of gradient tensors, one per parameter
         """
-        bkend = self.backend
         self._sync_to_rom()
         r = self.rom.state_dimension
 
-        # Compute residual
-        fZ = self._evaluate_rhs_all()
-
-        R = self.dZ - fZ
-        R_flat = bkend.permute(R, (1, 0, 2)).reshape(r, -1)
-        RW = bkend.permute(
-            (R_flat * self.w[None, :]).reshape(r, self.ntraj, self.nt), (1, 0, 2)
-        )
+        R_flat = self._residual_flat()
 
         # VJP: adjoint seed v = -2 * R * W
         if self.forcing_fns is None or len(self.forcing_fns) == 0:
-            Z_flat = bkend.permute(self.Z, (0, 2, 1)).reshape(-1, r)
-            v = -2.0 * bkend.permute(RW, (0, 2, 1)).reshape(-1, r)
+            v = -2.0 * R_flat * self.w[:, None]
             world_size = self.world_size  # communicator the pool was sharded on
             reg = self.reg / world_size
-            grads = self.rom.inner_vjp_evaluate_rhs(Z_flat, v, reg=reg)
+            if self._quadratic_fastpath:
+                grads = self._quadratic_inner_vjp(v, reg)
+            else:
+                grads = self.rom.inner_vjp_evaluate_rhs(self.Z_flat, v, reg=reg)
         else:
             # Accumulate VJP over time snapshots
             grads = None
             world_size = self.world_size  # communicator the pool was sharded on
             reg_val = self.reg / world_size
+            V = (-2.0 * R_flat * self.w[:, None]).reshape(self.ntraj, self.nt, r)
             for j in range(self.nt):
                 t_j = self.time[j]
                 z_j = self.Z[:, :, j]           # (ntraj, r)
-                v_j = -2.0 * RW[:, :, j]        # (ntraj, r)
+                v_j = V[:, j, :]                 # (ntraj, r)
                 reg_j = reg_val if j == 0 else 0.0
                 grads_j = self.rom.inner_vjp_evaluate_rhs(
                     z_j, v_j,

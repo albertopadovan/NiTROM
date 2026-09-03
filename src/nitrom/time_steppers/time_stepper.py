@@ -406,7 +406,11 @@ class DenseSolution(NamedTuple):
     :param t: grid times, shape ``(n_save,)``
     :param X: states, shape ``(B, n, n_save)`` or ``(n, n_save)``
     :param stages: per-step Runge-Kutta stage states, shape
-        ``(B, n, n_step, s)`` or ``(n, n_step, s)``; ``None`` unless requested
+        ``(n_step, s, B, n)`` or ``(n_step, s, n)``; ``None`` unless requested.
+        Step and stage lead so that a single stage is a contiguous block: the
+        backward sweep reads one per adjoint evaluation, and with the state
+        axes trailing instead the read is a gather with a stride of the whole
+        trajectory.
     """
 
     t: Any
@@ -475,7 +479,7 @@ def solve_ivp_dense(
         X = bkend.zeros((B, n, n_save), dtype=dtype, device=dev)
         X[:, :, 0] = x
         G = (
-            bkend.zeros((B, n, nt_sim, s_stages), dtype=dtype, device=dev)
+            bkend.zeros((nt_sim, s_stages, B, n), dtype=dtype, device=dev)
             if with_stages
             else None
         )
@@ -484,7 +488,7 @@ def solve_ivp_dense(
         X = bkend.zeros((n, n_save), dtype=dtype, device=dev)
         X[:, 0] = x
         G = (
-            bkend.zeros((n, nt_sim, s_stages), dtype=dtype, device=dev)
+            bkend.zeros((nt_sim, s_stages, n), dtype=dtype, device=dev)
             if with_stages
             else None
         )
@@ -495,11 +499,7 @@ def solve_ivp_dense(
             f, t, x, dt, tableau, newton_tol, newton_max_iter, args, kwargs,
         )
         if G is not None:
-            stacked = bkend.stack(stages_g, axis=-1)
-            if batched:
-                G[:, :, i - 1, :] = stacked
-            else:
-                G[:, i - 1, :] = stacked
+            G[i - 1] = bkend.stack(stages_g, axis=0)
         if i % save_every == 0:
             if batched:
                 X[:, :, i // save_every] = x
@@ -578,9 +578,7 @@ def solve_adjoint_ivp_discrete(
         
         # 1. Forward stages: reuse the cached ones, or rebuild them locally.
         if stages_G is not None:
-            stages_g = [
-                stages_G[..., j, i] for i in range(s)
-            ]
+            stages_g = [stages_G[j, i] for i in range(s)]
         else:
             stages_g = []
             stages_k = []

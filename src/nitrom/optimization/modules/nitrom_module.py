@@ -464,7 +464,7 @@ class NitromModule(InferenceModule):
                         Zint = dense.X[:, :, j0 : j1 + 1]
                         stages_G = (
                             None if dense.stages is None
-                            else dense.stages[:, :, j0:j1, :]
+                            else dense.stages[j0:j1]
                         )
                     else:
                         sub_t = bkend.linspace(

@@ -131,25 +131,43 @@ class PolynomialModel(Model):
         # k - 1 with Z gives one term of the Jacobian; contracting the ambient
         # index against the seed at the same time yields the free slot of the
         # result.
+        #
+        # All k of those terms open by contracting A_k's ambient index against
+        # the same seed, and that is the expensive part -- O(r^(k+1)) against
+        # O(r^k) for filling the remaining slots with Z.  So it is hoisted into
+        # G and done once, and each term then only contracts G with Z.  At
+        # r = 50 the quadratic adjoint goes from two r^3 contractions to one
+        # (measured 228 us -> 90 us), and it is the single hottest kernel in a
+        # NiTROM gradient.
+        adj_pre, adj_pre_b = [], []
         adj, adj_b = [], []
         for i, k in enumerate(self.poly_comp):
             terms, terms_b = [], []
-            if k > 0:
-                ss0 = self.einsum_ss[i][0]
-                out_char, input_chars = ss0[0], ss0[1:]
+            ss0 = self.einsum_ss[i][0]
+            out_char, input_chars = ss0[0], ss0[1:]
+            # k == 0 is a constant term, which drops out of the Jacobian, so
+            # there is nothing to pre-contract.  k == 1 needs G itself and no
+            # further contraction, so its term list stays empty too.
+            adj_pre.append(f"{ss0},{out_char}->{input_chars}" if k > 0 else None)
+            adj_pre_b.append(
+                f"{ss0},...{out_char}->...{input_chars}" if k > 0 else None
+            )
+            if k > 1:
                 for comb in combinations(input_chars, k - 1):
                     free = next(c for c in input_chars if c not in comb)
                     terms.append(
-                        ",".join([ss0, out_char, *comb]) + "->" + free
+                        ",".join([input_chars, *comb]) + "->" + free
                     )
                     terms_b.append(
                         ",".join(
-                            [ss0, f"...{out_char}", *(f"...{c}" for c in comb)]
+                            [f"...{input_chars}", *(f"...{c}" for c in comb)]
                         )
                         + f"->...{free}"
                     )
             adj.append(tuple(terms))
             adj_b.append(tuple(terms_b))
+        self._adjoint_pre_eq = tuple(adj_pre)
+        self._adjoint_pre_eq_batched = tuple(adj_pre_b)
         self._adjoint_eq = tuple(adj)
         self._adjoint_eq_batched = tuple(adj_b)
 
@@ -375,7 +393,13 @@ class PolynomialModel(Model):
             # costs an extra (n, n) intermediate per term.
             dzdt = bkend.zeros_like(z)
             for i, k in enumerate(self.poly_comp):
-                operands = [tensors[i], z] + [Z for _ in range(k - 1)]
+                if self._adjoint_pre_eq[i] is None:
+                    continue
+                G = bkend.einsum(self._adjoint_pre_eq[i], tensors[i], z)
+                if not self._adjoint_eq[i]:  # degree 1: G is already J^T z
+                    dzdt += G
+                    continue
+                operands = [G] + [Z for _ in range(k - 1)]
                 for equation in self._adjoint_eq[i]:
                     dzdt += bkend.einsum(equation, *operands)
 
@@ -392,7 +416,16 @@ class PolynomialModel(Model):
             zk, Zk = (z, Z) if all_below else (z[mask], Z[mask])
             dzdt = bkend.zeros_like(z)
             for i, k in enumerate(self.poly_comp):
-                operands = [tensors[i], zk] + [Zk for _ in range(k - 1)]
+                if self._adjoint_pre_eq_batched[i] is None:
+                    continue
+                G = bkend.einsum(self._adjoint_pre_eq_batched[i], tensors[i], zk)
+                if not self._adjoint_eq_batched[i]:  # degree 1: G is J^T z
+                    if all_below:
+                        dzdt += G
+                    else:
+                        dzdt[mask] += G
+                    continue
+                operands = [G] + [Zk for _ in range(k - 1)]
                 for equation in self._adjoint_eq_batched[i]:
                     term = bkend.einsum(equation, *operands)
                     if all_below:

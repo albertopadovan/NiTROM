@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import warnings
 from collections.abc import Callable
 from typing import Any
 
@@ -114,6 +115,9 @@ class TrainingPool:
         if self.my_n_traj == 0:
             raise ValueError("Every rank needs to own at least one trajectory")
 
+        if self.is_distributed and self.rank == 0:
+            self._warn_on_parallel_config(n_virtual)
+
         start_idx = self.rank * (n_virtual // self.world_size) + min(
             self.rank, n_virtual % self.world_size
         )
@@ -127,6 +131,57 @@ class TrainingPool:
             np.load(fname_time), dtype=self.dtype, device=self.device
         )
         self.load_time_derivatives(kwargs, fname_traj)
+
+    #: Environment variables any of which, set to "1", pins BLAS to one thread.
+    _THREAD_ENV_VARS = (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    )
+
+    def _warn_on_parallel_config(self, n_virtual: int) -> None:
+        """Flag the two settings that cost the most in a trajectory-parallel run.
+
+        Both are invisible until you profile, and both are fixed from the job
+        script rather than from here, so this warns rather than acting.
+
+        *Ragged split.* Ranks run the optimizer in lockstep, so every cost and
+        gradient ends at an all-reduce and the whole job advances at the pace of
+        the busiest rank.  A rank holding one extra trajectory therefore adds its
+        full cost to *every* iteration while the other ranks idle at the
+        barrier.  Rank counts that divide the trajectory count evenly are worth
+        more than the extra ranks a ragged split would add.
+
+        *BLAS oversubscription.* One trajectory per rank leaves the hot kernels
+        matrix-vector shaped, where threading the BLAS is already pure overhead;
+        with several ranks per node each spawning a full thread pool it becomes
+        oversubscription on top of that.
+        """
+        remainder = n_virtual % self.world_size
+        if remainder:
+            warnings.warn(
+                f"{n_virtual} trajectories over {self.world_size} ranks splits "
+                f"{remainder} rank(s) one trajectory heavier than the rest.  "
+                f"Ranks advance in lockstep, so every iteration runs at the "
+                f"heaviest rank's pace and the lighter ranks idle; a rank count "
+                f"that divides {n_virtual} evenly is usually faster in wall "
+                f"time even when it uses fewer cores.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+
+        if not any(os.environ.get(v) for v in self._THREAD_ENV_VARS):
+            warnings.warn(
+                "Running trajectory-parallel with no BLAS thread limit set.  "
+                "Each rank's BLAS will try to use every core, so the ranks "
+                "oversubscribe the node; set OMP_NUM_THREADS=1 and "
+                "OPENBLAS_NUM_THREADS=1 (or the equivalent for your BLAS) in "
+                "the job script.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
 
     def load_trajectories(self, fname_traj: str) -> None:
         """Load trajectory snapshots from ``.npy`` files into :attr:`X`."""

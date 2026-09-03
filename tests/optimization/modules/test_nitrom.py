@@ -222,10 +222,15 @@ def test_gradient_atr_rom(adjoint_method):
         )
 
     module = _module(make_model(), adjoint_method=adjoint_method)
+    # As in the GAS check, the diagonal entries S[i, i, k] cancel exactly in the
+    # H = S - S^T assembly, so their true gradient is 0 and the analytic adjoint
+    # returns exactly 0 there.  The finite-difference reference is only
+    # 0 +- ULP noise (the ATR cost is O(1e4) here, so central differencing at
+    # eps=1e-6 has an absolute noise floor of ~2e-6), which trips atol=1e-6.
     assert_grad_close(
         module.gradient(),
         _reference_grad(module, make_model, "rk4", adjoint_method),
-        rtol=1e-4, atol=1e-6,
+        rtol=1e-4, atol=5e-6,
     )
 
 

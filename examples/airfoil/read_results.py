@@ -1,15 +1,10 @@
 import os
 import pickle
 import re
-import tempfile
 
 import fom_class
-import incompreso
 import matplotlib.pyplot as plt
 import numpy as np
-import yaml
-from incompreso.backend import to_numpy
-from incompreso.utils.post_process import compute_vorticity
 from matplotlib.ticker import AutoMinorLocator, LogLocator, NullFormatter
 
 from nitrom.backend import set_backend
@@ -80,7 +75,7 @@ fom = fom_class.fom_class()
 
 # Trajectory details
 traj_path = "./trajectories/"
-which = "test"  # 'train' or 'test'
+which = "train"  # 'train' or 'test'
 
 if which == "train":
     fname_traj = traj_path + "traj_%03d.npy"
@@ -312,36 +307,100 @@ save_figure(fig, f"airfoil_error_{which}")
 
 # --- 3) Sinusoidal Forcing ---
 forcing_path = "./traj_forcing/"
+snapshot_fname = "snapshot_000074.npz"
+
+# The ROM training data was restricted to this subdomain before the POD was
+# computed, while the saved forcing cases and finite-volume weights still use
+# the original full mesh.
+X_BOUNDS = (-4.0, 13.0)
+Y_BOUNDS = (-3.0, 3.0)
 
 decoder_full = np.load(traj_path + "decoder.npz")
 q_base = decoder_full["q_base"]  # (n_fom,)
 n_u = int(decoder_full["n_u"])
 n_v = int(decoder_full["n_v"])
 
+# Recover the full staggered-grid coordinates and build the same spatial
+# restriction that was used to create decoder.npz.
+snap = np.load(snapshot_fname)
+xu_full, yu_full = snap["xu"][1:-1], snap["yu"][1:-1]
+xv_full, yv_full = snap["xv"][1:-1], snap["yv"][1:-1]
+xi, eta = snap["xi"], snap["eta"]
+
+u_x_keep = (xu_full >= X_BOUNDS[0]) & (xu_full < X_BOUNDS[1])
+u_y_keep = (yu_full > Y_BOUNDS[0]) & (yu_full < Y_BOUNDS[1])
+v_x_keep = (xv_full > X_BOUNDS[0]) & (xv_full < X_BOUNDS[1])
+v_y_keep = (yv_full > Y_BOUNDS[0]) & (yv_full < Y_BOUNDS[1])
+
+xu, yu = xu_full[u_x_keep], yu_full[u_y_keep]
+xv, yv = xv_full[v_x_keep], yv_full[v_y_keep]
+
+if len(yu) * len(xu) != n_u or len(yv) * len(xv) != n_v:
+    raise ValueError(
+        "The configured airfoil crop does not match decoder.npz: "
+        f"crop gives n_u={len(yu) * len(xu)}, n_v={len(yv) * len(xv)}; "
+        f"decoder contains n_u={n_u}, n_v={n_v}."
+    )
+
+
+def restrict_to_rom_domain(q):
+    """Restrict full-grid velocity data to the ROM's cropped domain."""
+    q = np.asarray(q)
+    if q.shape[0] == q_base.size:
+        return q
+
+    n_u_full = len(yu_full) * len(xu_full)
+    n_v_full = len(yv_full) * len(xv_full)
+    if q.shape[0] != n_u_full + n_v_full:
+        raise ValueError(
+            f"Expected {n_u_full + n_v_full} full-grid or {q_base.size} "
+            f"cropped velocity entries, got {q.shape[0]}."
+        )
+
+    trailing_shape = q.shape[1:]
+    u_full = q[:n_u_full].reshape((len(yu_full), len(xu_full)) + trailing_shape)
+    v_full = q[n_u_full:].reshape((len(yv_full), len(xv_full)) + trailing_shape)
+    u = u_full[u_y_keep][:, u_x_keep]
+    v = v_full[v_y_keep][:, v_x_keep]
+    return np.concatenate(
+        (u.reshape((n_u,) + trailing_shape), v.reshape((n_v,) + trailing_shape)),
+        axis=0,
+    )
+
+
 # Finite-volume weights the POD modes are orthonormal under, i.e.
 # Phi_project.T @ diag(fv_weights) @ Phi_project == I. Needed to encode a
 # full-order forcing vector into the 300-dim projected space (Phi_project's
 # columns are not orthonormal in the plain Euclidean inner product on this
 # non-uniform grid).
-fv_weights = np.load("weights.npy")  # (n_fom,)
+fv_weights = restrict_to_rom_domain(np.load("weights.npy"))  # (n_fom,)
 
-# forcing_profiles.npy stacks one n_fom-dim spatial forcing profile per
-# traj_forcing case file (columns line up 1:1 with the sorted file list);
-# the profile is location-only -- amplitude and frequency are applied on
-# top of it below from the case filename ("<location>_amp<amp>_k<harmonic>").
-forcing_profiles = np.load(forcing_path + "forcing_profiles.npy")  # (n_fom, n_cases)
+# forcing_profiles_projected.npy stacks the full-grid constraint-projected
+# spatial forcing profile for each traj_forcing case (columns line up 1:1
+# with the sorted file list). Project before restricting to the ROM crop so
+# the reduced forcing represents the field that survives the FOM projection.
+# The ROM evaluates each sinusoidal input analytically from its stored
+# amplitude and angular frequency.  Interpolating forcing_signal.npy would
+# alias the higher harmonics because that file is sampled only at snapshot
+# times rather than at the FOM time-step cadence.
+forcing_profiles = restrict_to_rom_domain(
+    np.load(forcing_path + "forcing_profiles_projected.npy")
+)  # (n_fom, n_cases)
+forcing_amplitudes = np.load(forcing_path + "forcing_amplitude.npy")
+forcing_omegas = np.load(forcing_path + "forcing_omega.npy")
 t_forcing = np.load(forcing_path + "time.npy")
 t0_f, tf_f = float(t_forcing[0]), float(t_forcing[-1])
 dt_f = float(t_forcing[1] - t_forcing[0])
 
 case_re = re.compile(r"^(?P<location>.+)_amp(?P<amp>[\d.]+)_k(?P<harmonic>\d+)\.npy$")
-case_files = sorted(
-    f
-    for f in os.listdir(forcing_path)
-    if f.endswith(".npy") and f not in ("time.npy", "forcing_profiles.npy")
-)
+case_files = sorted(f for f in os.listdir(forcing_path) if case_re.match(f) is not None)
 assert len(case_files) == forcing_profiles.shape[1], (
-    "forcing_profiles.npy columns must line up with the traj_forcing case files"
+    "forcing_profiles_projected.npy columns must line up with the "
+    "traj_forcing case files"
+)
+assert forcing_amplitudes.shape == forcing_omegas.shape == (len(case_files),), (
+    "forcing_amplitude.npy and forcing_omega.npy must contain one entry per "
+    "traj_forcing case"
 )
 
 case_groups = {}
@@ -360,7 +419,14 @@ for i, fname in enumerate(case_files):
         amp=amp,
         harmonic=harmonic,
         B=forcing_profiles[:, i],
+        forcing_amplitude=float(forcing_amplitudes[i]),
+        forcing_omega=float(forcing_omegas[i]),
     )
+    if not np.isclose(case["forcing_amplitude"], amp):
+        raise ValueError(
+            f"Forcing amplitude metadata for {fname} is "
+            f"{case['forcing_amplitude']:g}, but its filename specifies {amp:g}."
+        )
     case_groups.setdefault((location, amp), []).append(case)
 for group in case_groups.values():
     group.sort(key=lambda c: c["harmonic"])
@@ -372,50 +438,31 @@ roms = {
     "GasNiTROM": (rom_nit_gs, proj_nit_gs, Psi_nit_gs, COLORS["nitrom"], STYLES["gas"]),
 }
 
-# --- Mesh, BCs, and airfoil outline (rebuilt from config.yaml), used for
-# vorticity contour snapshots ---
-# config.yaml's initial_condition points at a solver restart file that
-# lives alongside the raw incompreso run (not checked into this repo);
-# postprocessing here only needs mesh/bcs/immersed_body -- the states come
-# from the ROMs -- so swap in a zero IC before building the sim objects.
-with open("config.yaml") as f:
-    _cfg_dict = yaml.safe_load(f)
-_cfg_dict["initial_condition"] = {"type": "zero"}
-with tempfile.NamedTemporaryFile(
-    mode="w", suffix=".yaml", dir=".", delete=False
-) as _tmp:
-    yaml.safe_dump(_cfg_dict, _tmp)
-    _tmp_config_path = _tmp.name
-try:
-    sim = incompreso.parse_input_file(_tmp_config_path)
-finally:
-    os.remove(_tmp_config_path)
-mesh = sim["mesh"]
-bcs = sim["bcs"]
-ib = sim["immersed_body"]
-xi, eta = to_numpy(ib.xi), to_numpy(ib.eta)
-
-n_fom_expected = mesh.u_int.size + mesh.v_int.size + mesh.w_int.size
-assert q_base.size == n_fom_expected, (
-    "decoder.npz's q_base doesn't match the mesh built from config.yaml"
-)
-
-# Vorticity is only affine (not linear) in q once boundary conditions are
-# applied, so the perturbation vorticity is the *difference* of the two
-# full-state vorticities rather than compute_vorticity(perturbation, ...)
-# directly (which would wrongly impose the full-flow BCs on a
-# perturbation field).
-omega_base, X_vort, Y_vort = compute_vorticity(0.0, q_base, mesh, bcs)
-omega_base = to_numpy(omega_base)
-X_vort, Y_vort = to_numpy(X_vort), to_numpy(Y_vort)
+# Vorticity is evaluated only where both cropped staggered fields have the
+# neighboring samples required by the finite difference. The outer u columns
+# are omitted because the corresponding v samples lie outside the ROM crop.
+X_vort, Y_vort = np.meshgrid(xu[1:-1], yv)
+dx_local = np.diff(xv)
+dy_local = np.diff(yu)
 
 
 def vorticity(q_pert):
-    omega_full, _, _ = compute_vorticity(0.0, q_base + q_pert, mesh, bcs)
-    return to_numpy(omega_full) - omega_base
+    u = q_pert[:n_u].reshape(len(yu), len(xu))
+    v = q_pert[n_u:].reshape(len(yv), len(xv))
+    dv_dx = np.diff(v, axis=1) / dx_local[None, :]
+    du_dy = np.diff(u, axis=0) / dy_local[:, None]
+    return dv_dx - du_dy[:, 1:-1]
 
 
 harmonic_contour = 2
+snapshot_time = 9.0
+snapshot_idx = np.flatnonzero(np.isclose(t_forcing, snapshot_time))
+if snapshot_idx.size != 1:
+    raise ValueError(
+        f"Expected exactly one forcing snapshot at t={snapshot_time:g}, "
+        f"found {snapshot_idx.size}."
+    )
+snapshot_idx = int(snapshot_idx[0])
 
 for (location, amp), group in sorted(case_groups.items()):
     amp_str = str(amp).replace(".", "p")
@@ -428,17 +475,18 @@ for (location, amp), group in sorted(case_groups.items()):
     contour_blowup = None  # name -> bool, for harmonic_contour
 
     for case in group:
-        # 0.8026 Hz is the base (vortex shedding) frequency the harmonics were
-        # generated at; convert to rad/s for use inside sin(f * t) below.
-        freq = 2 * np.pi * 0.8026 * float(case["harmonic"])
         B = case["B"]
-        dataf = np.load(
-            forcing_path + case["fname"]
+        forcing_amplitude = case["forcing_amplitude"]
+        forcing_omega = case["forcing_omega"]
+        dataf = restrict_to_rom_domain(
+            np.load(forcing_path + case["fname"])
         )  # (n_fom, T), full state (base + perturbation)
         # Raw full-order field -- unlike pool.X/proj.decode(...) output, this
         # isn't already in the weighted-orthonormal 300-dim space, so the
         # energy norm needs the finite-volume weights explicitly.
-        energy_true = np.sum(fv_weights[:, None] * (dataf - q_base[:, None]) ** 2, axis=0)
+        energy_true = np.sum(
+            fv_weights[:, None] * (dataf - q_base[:, None]) ** 2, axis=0
+        )
 
         z0 = np.zeros(r)
         energies_row = {"Truth": energy_true}
@@ -455,7 +503,9 @@ for (location, amp), group in sorted(case_groups.items()):
                 t_forcing,
                 "rk45",
                 external_forcing=[
-                    lambda t, Fs=F_spatial, f=freq, a=amp: Fs * a * np.sin(f * t)
+                    lambda t, Fs=F_spatial, a=forcing_amplitude, omega=forcing_omega: (
+                        Fs * a * np.sin(omega * t)
+                    )
                 ],
                 rtol=rtol,
                 atol=atol,
@@ -524,7 +574,7 @@ for (location, amp), group in sorted(case_groups.items()):
     ax[0].legend(loc="upper right", fontsize=7)
     save_figure(fig, f"airfoil_{location}_amp{amp_str}_forcing_energy")
 
-    # --- Snapshot contour plots: perturbation vorticity at the final time ---
+    # --- Snapshot contour plots: perturbation vorticity at t=9 ---
     if contour_states is not None:
         fig, axes = plt.subplots(
             3, 2, figsize=(FIG_WIDTH_WIDE, 5.0), constrained_layout=True
@@ -533,13 +583,13 @@ for (location, amp), group in sorted(case_groups.items()):
 
         vort_fields = {}
         for title, state in contour_states.items():
-            field = vorticity(state[:, -1])
+            field = vorticity(state[:, snapshot_idx])
             if contour_blowup[title]:
                 field = np.zeros_like(field)
                 title += " (blew up)"
             vort_fields[title] = field
-        vmax = max(np.max(np.abs(field)) for field in vort_fields.values())
-        vmin = -vmax
+        vmin = np.min(vort_fields["Truth"])
+        vmax = -vmin
 
         for ax_i, (title, field) in zip(axes, vort_fields.items()):
             # contourf (not pcolormesh/gouraud) so the EPS export in save_figure works --
@@ -619,7 +669,7 @@ lines = l1 + l2 + l3
 labels = [l.get_label() for l in lines]
 ax1.legend(lines, labels, loc="upper right")
 
-save_figure(fig, "cost_history_cavity")
+save_figure(fig, "cost_history_airfoil")
 
 # Gradient Norm vs Iteration Plot
 fig, ax = make_figure()
@@ -650,6 +700,6 @@ ax.semilogy(
 style_axes(ax, xlabel="Iteration", ylabel="Gradient Norm", log_y=True)
 # ax.legend(loc='upper right')
 
-save_figure(fig, "gradnorm_history_cavity")
+save_figure(fig, "gradnorm_history_airfoil")
 
 print("All figures plotted and saved successfully!")

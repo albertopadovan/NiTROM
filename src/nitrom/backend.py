@@ -195,17 +195,26 @@ class Backend:
             return self.xp.einsum(equation, *operands)
         except KeyError:
             cost = self._einsum_naive_cost(equation, operands)
-            plan = (
-                self._compile_einsum_plan(equation, operands)
-                if cost >= self._EINSUM_OPTIMIZE_MIN_COST
-                else None
-            )
+            plan = None
+            if cost >= self._EINSUM_OPTIMIZE_MIN_COST:
+                plan = self._compile_einsum_plan(equation, operands)
+                if plan is None:
+                    # Compiling can fail on a subscript the shape algebra
+                    # below does not model, or on a numpy whose einsum_path
+                    # internals have moved.  Either way the contraction is
+                    # still far too big for the naive C loop -- letting numpy
+                    # optimize it costs a per-call re-parse but stays an order
+                    # of magnitude ahead -- so degrade to that, never to no
+                    # optimization at all.
+                    plan = self._numpy_einsum_path(equation, operands)
             if len(self._einsum_paths) >= self._EINSUM_CACHE_MAX:
                 self._einsum_paths.clear()
             self._einsum_paths[key] = plan
 
         if plan is None:
             return self._c_einsum(equation, *operands)
+        if plan.__class__ is not tuple:  # a numpy path, not a compiled plan
+            return self.xp.einsum(equation, *operands, optimize=plan)
 
         ops = list(operands)
         for inds, arg, perm in plan:
@@ -258,7 +267,21 @@ class Backend:
         shapes = [tuple(op.shape) for op in operands]
         steps = []
         try:
-            for inds, idx_rm, einsum_str, _remaining, blas in contraction_list:
+            for entry in contraction_list:
+                # numpy <= 2.3 reports (inds, idx_rm, einsum_str, remaining,
+                # blas); 2.4 dropped the derived fields and reports
+                # (inds, einsum_str, remaining).  Take the two that are always
+                # there and re-derive the rest, so the plan does not silently
+                # stop compiling -- and the hot kernels do not silently drop to
+                # the naive C loop -- the next time numpy reshuffles this.
+                if len(entry) == 5:
+                    inds, idx_rm, einsum_str, _remaining, blas = entry
+                elif len(entry) == 3:
+                    inds, einsum_str, _remaining = entry
+                    idx_rm, blas = None, None
+                else:
+                    return None
+
                 if "..." in einsum_str:
                     return None  # broadcasting: leave the shape algebra to numpy
                 in_str, out_str = einsum_str.split("->")
@@ -270,6 +293,11 @@ class Backend:
                     for c, s in zip(sub, shape, strict=True):
                         dims[c] = s
                 shapes.append(tuple(dims[c] for c in out_str))
+
+                if idx_rm is None:
+                    idx_rm = set("".join(in_subs)) - set(out_str)
+                if blas is None:
+                    blas = self._can_tensordot(in_subs, out_str, idx_rm)
 
                 if not blas:
                     steps.append((tuple(inds), einsum_str, None))
@@ -300,6 +328,44 @@ class Backend:
             # hand the contraction back to numpy, never to fail the solve.
             return None
         return tuple(steps)
+
+    def _numpy_einsum_path(self, equation, operands):
+        """numpy's own contraction path for ``equation``, or ``None``."""
+        try:
+            return self.xp.einsum_path(equation, *operands, optimize="optimal")[0]
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _can_tensordot(in_subs, out_str, idx_rm):
+        """Whether a contraction step reduces to a single ``tensordot``.
+
+        Needed because numpy 2.4 no longer reports its own BLAS verdict.  The
+        conditions are the classical ones: exactly two operands, at least one
+        summed label, no label repeated inside an operand (that is a diagonal,
+        not a product), every summed label present in both operands and absent
+        from the output, and every surviving label kept.
+
+        The shared labels must be *exactly* the summed ones.  A label carried by
+        both operands and by the output is a batch index -- ``'Ibc,Ic->Ib'``,
+        which is what an ellipsis over a batched contraction expands to -- and
+        ``tensordot`` cannot express it: it would build the full outer product
+        over that axis instead of pairing it up.
+
+        Anything else is handed to the C loop, so a false negative only costs
+        speed.
+        """
+        if len(in_subs) != 2 or not idx_rm:
+            return False
+        left, right = in_subs
+        if len(set(left)) != len(left) or len(set(right)) != len(right):
+            return False
+        if set(left) & set(right) != set(idx_rm):
+            return False
+        for s in idx_rm:
+            if s in out_str:
+                return False
+        return set(left) | set(right) == set(out_str) | set(idx_rm)
 
     @staticmethod
     def _plan_tensordot(shape_a, shape_b, axes_a, axes_b):

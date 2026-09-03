@@ -3,7 +3,7 @@
 For the last trajectory in the training set, integrates each trained ROM
 (OpInf, GasOpInf, NiTROM, GasNiTROM) forward from the true initial condition
 and animates the resulting perturbation vorticity field (base flow excluded)
-over the full domain, side by side with the true (projected) trajectory.
+over the ROM's cropped domain, side by side with the true trajectory.
 """
 
 import os
@@ -16,7 +16,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from nitrom.backend import set_backend
-from nitrom.latent_space_models.gas_polynomial_model import GasPolynomialModel
 from nitrom.latent_space_models.polynomial_model import PolynomialModel
 from nitrom.plotting import set_plot_style
 from nitrom.projections.linear_projection import LinearProjection
@@ -34,6 +33,10 @@ traj_path = "./trajectories/"
 models_dir = "./models/"
 movies_dir = "./movies/"
 snapshot_fname = "snapshot_000074.npz"
+
+# Spatial restriction used before the POD and stored in decoder.npz.
+X_BOUNDS = (-4.0, 13.0)
+Y_BOUNDS = (-3.0, 3.0)
 
 # Frame stride for the movies; trim to taste.
 FRAME_STRIDE = 1
@@ -56,36 +59,6 @@ def load_rom(fname):
         dtype=dtype,
         tensors=[np.asarray(t, dtype=dtype) for t in ckpt["tensors"]],
         forcing_config=ckpt["forcing_config"],
-    )
-    Phi = np.asarray(ckpt["Phi"], dtype=dtype)
-    Psi = np.asarray(ckpt.get("Psi", ckpt["Phi"]), dtype=dtype)
-    return rom, Phi, Psi
-
-
-def load_checkpoint(fname, r, poly_comp):
-    with open(os.path.join(models_dir, fname), "rb") as f:
-        ckpt = pickle.load(f)
-    rom = PolynomialModel(
-        r,
-        poly_comp,
-        dtype=dtype,
-        tensors=[np.asarray(t, dtype=dtype) for t in ckpt["tensors"]],
-        forcing_config=None,
-    )
-    Phi = np.asarray(ckpt["Phi"], dtype=dtype)
-    Psi = np.asarray(ckpt.get("Psi", ckpt["Phi"]), dtype=dtype)
-    return rom, Phi, Psi
-
-
-def load_checkpoint_gas(fname, r, poly_comp):
-    with open(os.path.join(models_dir, fname), "rb") as f:
-        ckpt = pickle.load(f)
-    rom = GasPolynomialModel(
-        r,
-        poly_comp,
-        dtype=dtype,
-        gas_params=ckpt["gas_params"],
-        forcing_config=None,
     )
     Phi = np.asarray(ckpt["Phi"], dtype=dtype)
     Psi = np.asarray(ckpt.get("Psi", ckpt["Phi"]), dtype=dtype)
@@ -116,20 +89,31 @@ pool = TrainingPool(
 
 # --- Mesh and airfoil outline, taken from a representative flow snapshot ---
 snap = np.load(snapshot_fname)
-xu, yu = snap["xu"][1:-1], snap["yu"][1:-1]
-xv, yv = snap["xv"][1:-1], snap["yv"][1:-1]
+xu_full, yu_full = snap["xu"][1:-1], snap["yu"][1:-1]
+xv_full, yv_full = snap["xv"][1:-1], snap["yv"][1:-1]
 xi, eta = snap["xi"], snap["eta"]
+
+xu = xu_full[(xu_full >= X_BOUNDS[0]) & (xu_full < X_BOUNDS[1])]
+yu = yu_full[(yu_full > Y_BOUNDS[0]) & (yu_full < Y_BOUNDS[1])]
+xv = xv_full[(xv_full > X_BOUNDS[0]) & (xv_full < X_BOUNDS[1])]
+yv = yv_full[(yv_full > Y_BOUNDS[0]) & (yv_full < Y_BOUNDS[1])]
 
 rowsu, colsu = len(yu), len(xu)
 rowsv, colsv = len(yv), len(xv)
-assert rowsu * colsu == n_u, "u-grid does not match decoder's n_u"
-assert rowsv * colsv == n_v, "v-grid does not match decoder's n_v"
+if rowsu * colsu != n_u or rowsv * colsv != n_v:
+    raise ValueError(
+        "The configured airfoil crop does not match decoder.npz: "
+        f"crop gives n_u={rowsu * colsu}, n_v={rowsv * colsv}; "
+        f"decoder contains n_u={n_u}, n_v={n_v}."
+    )
 
-# Vorticity lives at the corners of the (u, v) staggered grid.
-X_vort, Y_vort = np.meshgrid(xu, yv)
+# Vorticity is evaluated where both cropped staggered fields have all the
+# neighboring samples required by the finite difference. The outer u columns
+# are omitted because the corresponding v samples lie outside the ROM crop.
+X_vort, Y_vort = np.meshgrid(xu[1:-1], yv)
 XLIM = (float(X_vort.min()), float(X_vort.max()))
 YLIM = (float(Y_vort.min()), float(Y_vort.max()))
-dx_local = np.diff(xv)  # (colsu,)
+dx_local = np.diff(xv)  # (colsu - 2,)
 dy_local = np.diff(yu)  # (rowsv,)
 
 
@@ -143,7 +127,7 @@ def vorticity(q):
     u, v = split_fields(q)
     dv_dx = (v[:, 1:] - v[:, :-1]) / dx_local[None, :]
     du_dy = (u[1:, :] - u[:-1, :]) / dy_local[:, None]
-    return dv_dx - du_dy
+    return dv_dx - du_dy[:, 1:-1]
 
 
 # --- Load the trained ROMs ---
@@ -153,14 +137,10 @@ proj_oi = LinearProjection([Phi_oi, Psi_oi])
 rom_oi_gs, Phi_oi_gs, Psi_oi_gs = load_rom("gas_opinf_model.pkl")
 proj_oi_gs = LinearProjection([Phi_oi_gs, Psi_oi_gs])
 
-rom_nit, Phi_nit, Psi_nit = load_checkpoint(
-    "nitrom_checkpoint.pkl", r=rom_oi._r, poly_comp=rom_oi.poly_comp
-)
+rom_nit, Phi_nit, Psi_nit = load_rom("nitrom_model.pkl")
 proj_nit = LinearProjection([Phi_nit, Psi_nit])
 
-rom_nit_gs, Phi_nit_gs, Psi_nit_gs = load_checkpoint_gas(
-    "gas_nitrom_checkpoint.pkl", r=rom_oi._r, poly_comp=rom_oi.poly_comp
-)
+rom_nit_gs, Phi_nit_gs, Psi_nit_gs = load_rom("gas_nitrom_model.pkl")
 proj_nit_gs = LinearProjection([Phi_nit_gs, Psi_nit_gs])
 
 roms = {

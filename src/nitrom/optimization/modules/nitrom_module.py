@@ -2,6 +2,7 @@ from typing import Any
 
 import numpy as np
 
+from nitrom.latent_space_models.model import regularized_tensor_index
 from nitrom.roms.param_registry import ParamRegistry
 from nitrom.training_data import TrainingData
 
@@ -180,10 +181,11 @@ class NitromModule(InferenceModule):
         from nitrom.backend import distributed_rank_size
         _, world_size = distributed_rank_size()
         reg = self.reg / world_size
-        if reg > 0.0 and hasattr(self.model, "poly_comp") and 2 in self.model.poly_comp:
-            h_idx = self.model.poly_comp.index(2)
-            H = self.model.inner_params()[h_idx]
-            cost = cost + reg * bkend.vector_norm(H) ** 2
+        if reg > 0.0 and hasattr(self.model, "poly_comp"):
+            h_idx = regularized_tensor_index(self.model.poly_comp)
+            if h_idx is not None:
+                H = self.model.inner_params()[h_idx]
+                cost = cost + reg * bkend.vector_norm(H) ** 2
 
         return cost
 
@@ -369,10 +371,11 @@ class NitromModule(InferenceModule):
             from nitrom.backend import distributed_rank_size
             _, world_size = distributed_rank_size()
             reg = self.reg / world_size
-            if reg > 0.0 and hasattr(self.model, "poly_comp") and 2 in self.model.poly_comp:
-                h_idx = self.model.poly_comp.index(2)
-                H = self.model.inner_params()[h_idx]
-                model_grads[h_idx] = model_grads[h_idx] + 2.0 * reg * H
+            if reg > 0.0 and hasattr(self.model, "poly_comp"):
+                h_idx = regularized_tensor_index(self.model.poly_comp)
+                if h_idx is not None:
+                    H = self.model.inner_params()[h_idx]
+                    model_grads[h_idx] = model_grads[h_idx] + 2.0 * reg * H
 
             # --- assemble in registry order, summing shared contributions --
             model_grads = self.model.project_inner_gradients(model_grads)

@@ -1,5 +1,6 @@
 from typing import Any
 from nitrom.optimization.modules.opinf_module import OpInfModule
+from nitrom.latent_space_models.model import regularized_tensor_index
 
 
 def _kronecker_power(bkend: Any, Z: Any, d: int) -> Any:
@@ -118,6 +119,14 @@ def solve_opinf(module: OpInfModule) -> OpInfModule:
             pass
 
     import numpy as np
+    # Tikhonov regularization acts on the highest-degree nonlinear tensor: the
+    # quadratic tensor for poly_comp = [1, 2], the cubic one for [1, 3].
+    reg_degree = None
+    if hasattr(module.rom, "poly_comp"):
+        reg_idx = regularized_tensor_index(module.rom.poly_comp)
+        if reg_idx is not None:
+            reg_degree = module.rom.poly_comp[reg_idx]
+
     reg_diag_np = np.zeros(Q_dim, dtype=float)
     offset = 0
     for name in learnable_params:
@@ -126,7 +135,7 @@ def solve_opinf(module: OpInfModule) -> OpInfModule:
         else:
             d = int(name.split("_")[1])
             num_cols = r**d
-            if d == 2:
+            if d == reg_degree:
                 reg_diag_np[offset : offset + num_cols] = module.reg
         offset += num_cols
 

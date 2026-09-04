@@ -2,7 +2,7 @@ from itertools import combinations
 from string import ascii_lowercase
 from typing import Any
 
-from .model import Model
+from .model import Model, regularized_tensor_index
 
 
 class PolynomialModel(Model):
@@ -323,8 +323,8 @@ class PolynomialModel(Model):
                 grads.append(grad_B)
 
         if reg > 0.0:
-            for i, k in enumerate(self.poly_comp):
-                if k == 2:
-                    grads[i] = grads[i] + 2.0 * reg * self.get_params()[i]
+            idx = regularized_tensor_index(self.poly_comp)
+            if idx is not None:
+                grads[idx] = grads[idx] + 2.0 * reg * self.get_params()[idx]
 
         return grads

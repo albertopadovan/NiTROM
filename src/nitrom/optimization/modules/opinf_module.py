@@ -1,6 +1,7 @@
 from typing import Any
 
 from nitrom.latent_space_models.gas_polynomial_model import GasPolynomialModel
+from nitrom.latent_space_models.model import regularized_tensor_index
 from nitrom.latent_space_models.polynomial_model import PolynomialModel
 from nitrom.projections.projection import Projection
 from nitrom.training_data import TrainingData
@@ -146,14 +147,12 @@ class OpInfModule(InferenceModule):
         # Regularization on the quadratic tensor H
         _, world_size = distributed_rank_size()
         reg = self.reg / world_size
-        if hasattr(self.rom, "poly_comp") and 2 in self.rom.poly_comp:
-            if hasattr(self.rom, "model"):
-                idx = self.rom.model.poly_comp.index(2)
-                H = self.rom.model.get_params()[idx]
-            else:
-                idx = self.rom.poly_comp.index(2)
-                H = self.rom.get_params()[idx]
-            cost = cost + reg * bkend.vector_norm(H) ** 2
+        if hasattr(self.rom, "poly_comp"):
+            rom = self.rom.model if hasattr(self.rom, "model") else self.rom
+            idx = regularized_tensor_index(rom.poly_comp)
+            if idx is not None:
+                H = rom.get_params()[idx]
+                cost = cost + reg * bkend.vector_norm(H) ** 2
 
         return cost
 

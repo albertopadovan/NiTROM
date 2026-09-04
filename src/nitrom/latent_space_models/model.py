@@ -4,6 +4,24 @@ from typing import Any
 from ..backend import get_backend
 
 
+def regularized_tensor_index(poly_comp) -> int | None:
+    """
+    Index of the tensor targeted by Tikhonov regularization.
+
+    Regularization acts on the highest-degree nonlinear tensor: the quadratic
+    tensor :math:`H` for ``poly_comp = [1, 2]``, the cubic (fourth-order)
+    tensor for ``poly_comp = [1, 3]``.  Returns ``None`` for a purely linear
+    (or constant) model, which has nothing to regularize.
+
+    :param poly_comp: polynomial degrees of the model
+    :returns: index into ``poly_comp`` (and into the tensor list), or ``None``
+    """
+    nonlinear = [k for k in poly_comp if k >= 2]
+    if not nonlinear:
+        return None
+    return list(poly_comp).index(max(nonlinear))
+
+
 class Model(metaclass=abc.ABCMeta):
     r"""Abstract base class for NiTROM latent-space dynamics models.
 

@@ -1,0 +1,10 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Generated CGL example data (recreate with: python generate_data.py)
+Examples/cgl/trajectories/
+Examples/cgl/testing/
+
+# Rasterized previews of the committed PDF figures
+Examples/cgl/figures/*.png

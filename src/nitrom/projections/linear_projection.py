@@ -125,6 +125,26 @@ class LinearProjection(Projection):
         grad_Psi = -self.Phi @ (wTPhi @ self.S)  # (N, r)
         return (grad_Phi, grad_Psi)
 
+    def vjp_bases(self, grad_Phi: Any, grad_Psi: Any) -> tuple:
+        r"""
+        Map cotangents with respect to the *bases* onto gradients with respect
+        to this projection's parameters, in :attr:`param_names` order.
+
+        A caller that differentiates a cost through :math:`\Phi` and
+        :math:`\Psi` directly (rather than through :meth:`encode` /
+        :meth:`decode`) obtains ambient ``(N, r)`` cotangents.  For a plain
+        :class:`LinearProjection` the bases *are* the parameters, so this is
+        the identity; a subclass that parameterizes them differently -- e.g.
+        :class:`ObliqueChartProjection`, where
+        :math:`\Psi = \Phi + W N` -- overrides it with the chain rule.
+
+        :param grad_Phi: :math:`\partial J / \partial \Phi`, shape ``(N, r)``
+        :param grad_Psi: :math:`\partial J / \partial \Psi`, shape ``(N, r)``
+        :returns: gradients in :attr:`param_names` order
+        :rtype: tuple
+        """
+        return (grad_Phi, grad_Psi)
+
     def vjp_decode_state(self, z: Any, v: Any) -> Any:
         r"""
         VJP of the decoder :math:`\hat{q} = \Phi\, S\, z` with respect to the

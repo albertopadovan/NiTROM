@@ -129,7 +129,7 @@ printr(f"initial cost: {gcost(oblique):.6e}")
 # on the chart coefficients.  A joint quasi-Newton descent stalls here -- the
 # two blocks are coupled through z = Psi^T q, so the latent data move whenever
 # Psi does.
-solve_oblique_opinf(oblique, n_sweeps=300, tol=1e-13, verbose=(rank == 0))
+solve_oblique_opinf(oblique, n_sweeps=30, verbose=(rank == 0))
 printr(f"final cost:   {gcost(oblique):.6e}")
 
 # %% Save

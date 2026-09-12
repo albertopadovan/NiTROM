@@ -5,6 +5,7 @@ import re
 import fom_class
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import ListedColormap
 from matplotlib.ticker import AutoMinorLocator, LogLocator, NullFormatter
 
 from nitrom.backend import set_backend
@@ -27,6 +28,11 @@ FIG_HEIGHT = 2.6
 TRAINING_SHADE = "#ececec"
 rtol = 1e-4
 atol = 1e-8
+
+# The finite-volume weights are the velocity degrees of freedom's cell
+# volumes.  Use the smallest full-mesh cell volume to put every displayed
+# perturbation energy on the same cell-volume-normalized scale.
+min_cell_volume = float(np.min(np.load("weights.npy", mmap_mode="r")))
 
 
 def make_figure(*, wide=False):
@@ -54,11 +60,30 @@ def style_axes(ax, *, xlabel="", ylabel="", xlim=None, ylim=None, log_y=False):
     ax.grid(which="minor", color="#efefef", linewidth=0.4, alpha=0.8)
 
 
-def save_figure(fig, stem):
+def save_figure(fig, stem, *, tight=False):
     os.makedirs("figures", exist_ok=True)
-    fig.savefig(f"figures/{stem}.eps", format="eps")
-    fig.savefig(f"figures/{stem}.png", format="png")
+    bbox_inches = "tight" if tight else None
+    fig.savefig(
+        f"figures/{stem}.eps", format="eps", bbox_inches=bbox_inches, pad_inches=0.02
+    )
+    fig.savefig(
+        f"figures/{stem}.png", format="png", bbox_inches=bbox_inches, pad_inches=0.02
+    )
     plt.close(fig)
+
+
+def rd_bu_white_center():
+    """Return RdBu_r with a pure-white neutral band around zero."""
+    colors = plt.get_cmap("RdBu_r", 512)(np.linspace(0.0, 1.0, 512))
+    center = len(colors) // 2
+    colors[center - 1 : center + 1] = (1.0, 1.0, 1.0, 1.0)
+    return ListedColormap(colors, name="RdBu_r_white_center")
+
+
+def zero_refined_levels(vmax, count=129):
+    """Return symmetric contour boundaries concentrated near zero."""
+    normalized = np.linspace(-1.0, 1.0, count)
+    return vmax * normalized * np.abs(normalized)
 
 
 def detect_blowup(energy, energy_true, factor=1000.0):
@@ -174,16 +199,22 @@ if which == "train":
     fig, ax = make_figure()
     for k in range(pool.my_n_traj):
         Qk = pool.X[k]
-        energy_k = np.linalg.norm(Qk, axis=0) ** 2
+        energy_k = np.linalg.norm(Qk, axis=0) ** 2 / min_cell_volume
         ax.plot(pool.time, energy_k, color="k", alpha=0.85)
     style_axes(
         ax,
         xlabel=r"Time $t$",
-        ylabel="Energy of perturbations",
+        ylabel=r"$E_{\mathrm{pert}}$",
         xlim=(0.0, pool.time[-1]),
     )
     ax.set_ylim(bottom=0)
-    save_figure(fig, "airfoil_energy_perturbations")
+    ax.xaxis.label.set_fontsize(16)
+    ax.xaxis.set_tick_params(labelsize=16)
+    ax.yaxis.label.set_fontsize(16)
+    ax.yaxis.set_tick_params(labelsize=16)
+    # Include the full-width y-axis label in the saved figure without
+    # shrinking its font.
+    save_figure(fig, "airfoil_energy_perturbations", tight=True)
 
 # --- 2) Validation Error ---
 t_eval = pool.time
@@ -291,7 +322,7 @@ ax.semilogy(
     error_zeros,
     label="Zero",
     color="k",
-    linestyle="-",
+    linestyle=":",
 )
 style_axes(
     ax,
@@ -301,9 +332,9 @@ style_axes(
     ylim=(1e-6, 1e2),
     log_y=True,
 )
-ax.legend()
+if which == "train":
+    ax.legend(fontsize=10)
 save_figure(fig, f"airfoil_error_{which}")
-
 
 # --- 3) Sinusoidal Forcing ---
 forcing_path = "./traj_forcing/"
@@ -445,6 +476,29 @@ X_vort, Y_vort = np.meshgrid(xu[1:-1], yv)
 dx_local = np.diff(xv)
 dy_local = np.diff(yu)
 
+CONTOUR_XLIM = (-1.0, 5.0)
+CONTOUR_YLIM = (-2.0, 2.0)
+CONTOUR_DOWNSAMPLE = 4
+
+
+def contour_indices(coordinates, bounds, stride=CONTOUR_DOWNSAMPLE):
+    """Select a decimated grid including one point beyond each plot edge."""
+    start = max(np.searchsorted(coordinates, bounds[0], side="right") - 1, 0)
+    stop = min(
+        np.searchsorted(coordinates, bounds[1], side="left") + 1, len(coordinates)
+    )
+    indices = np.arange(start, stop, stride)
+    if indices[-1] != stop - 1:
+        indices = np.append(indices, stop - 1)
+    return indices
+
+
+vort_row_indices = contour_indices(yv, CONTOUR_YLIM)
+vort_col_indices = contour_indices(xu[1:-1], CONTOUR_XLIM)
+vort_plot_indices = np.ix_(vort_row_indices, vort_col_indices)
+X_vort_plot = X_vort[vort_plot_indices]
+Y_vort_plot = Y_vort[vort_plot_indices]
+
 
 def vorticity(q_pert):
     u = q_pert[:n_u].reshape(len(yu), len(xu))
@@ -454,25 +508,98 @@ def vorticity(q_pert):
     return dv_dx - du_dy[:, 1:-1]
 
 
-harmonic_contour = 2
-snapshot_time = 9.0
-snapshot_idx = np.flatnonzero(np.isclose(t_forcing, snapshot_time))
-if snapshot_idx.size != 1:
-    raise ValueError(
-        f"Expected exactly one forcing snapshot at t={snapshot_time:g}, "
-        f"found {snapshot_idx.size}."
+harmonics_contour = (1, 2)
+contour_snapshot_times = {1: 30.0, 2: 7.0}
+contour_snapshot_indices = {}
+for harmonic, snapshot_time in contour_snapshot_times.items():
+    snapshot_idx = np.flatnonzero(np.isclose(t_forcing, snapshot_time))
+    if snapshot_idx.size != 1:
+        raise ValueError(
+            f"Expected exactly one forcing snapshot at t={snapshot_time:g}, "
+            f"found {snapshot_idx.size}."
+        )
+    contour_snapshot_indices[harmonic] = int(snapshot_idx[0])
+
+
+def save_snapshot_contour(
+    location, amp_str, harmonic, snapshot_idx, contour_states, contour_blowup
+):
+    """Save perturbation-vorticity contours for one forcing harmonic."""
+    fig = plt.figure(figsize=(FIG_WIDTH_WIDE, 5.0), constrained_layout=True)
+    grid = fig.add_gridspec(3, 2, wspace=0.02)
+    axes = [
+        fig.add_subplot(grid[0, :]),
+        fig.add_subplot(grid[1, 0]),
+        fig.add_subplot(grid[1, 1]),
+        fig.add_subplot(grid[2, 0]),
+        fig.add_subplot(grid[2, 1]),
+    ]
+    fig.set_constrained_layout_pads(w_pad=0.0, wspace=0.02)
+    panel_order = ["Truth", "OpInf", "GasOpInf", "NiTROM", "GasNiTROM"]
+
+    vort_fields = {}
+    panel_titles = {}
+    for name, state in contour_states.items():
+        field = vorticity(state[:, snapshot_idx])
+        if contour_blowup[name]:
+            field = np.zeros_like(field)
+            panel_titles[name] = f"{name} (blew up)"
+        else:
+            panel_titles[name] = name
+        vort_fields[name] = field
+    # Use one symmetric, robust scale for every panel.  Scaling from only
+    # the truth field clips ROM predictions with larger (but finite)
+    # vorticity, while a raw global maximum is overly sensitive to a few
+    # pointwise spikes.
+    vmax = np.percentile(
+        np.abs(np.concatenate([field.ravel() for field in vort_fields.values()])),
+        99.5,
     )
-snapshot_idx = int(snapshot_idx[0])
+    vmin = -vmax
+    print("Contour:", (location, harmonic), amp_str, "vorticity range:", vmin, vmax)
+    levels = zero_refined_levels(vmax)
+    contour_cmap = rd_bu_white_center()
+
+    for idx, (ax_i, name) in enumerate(zip(axes, panel_order, strict=True)):
+        field = vort_fields[name]
+        # contourf (not pcolormesh/gouraud) so the EPS export in save_figure works --
+        # Ghostscript's PS/EPS distiller can't handle gouraud-shaded meshes.
+        ax_i.contourf(
+            X_vort_plot,
+            Y_vort_plot,
+            field[vort_plot_indices],
+            levels=levels,
+            cmap=contour_cmap,
+            extend="both",
+        )
+        ax_i.fill(xi, eta, color="0.2", zorder=5)
+        ax_i.set_aspect("equal", adjustable="box")
+        ax_i.set_xlim(*CONTOUR_XLIM)
+        ax_i.set_ylim(*CONTOUR_YLIM)
+        ax_i.set_title(panel_titles[name], fontsize=10)
+        ax_i.tick_params(direction="out", top=False, right=False)
+        if idx == 0:
+            ax_i.set_anchor("C")
+        elif idx % 2 == 1:
+            ax_i.set_anchor("E")
+        else:
+            ax_i.set_anchor("W")
+            ax_i.tick_params(left=False, labelleft=False)
+
+    save_figure(
+        fig,
+        f"airfoil_{location}_amp{amp_str}_k{harmonic}_snapshot_all",
+        tight=True,
+    )
+
 
 for (location, amp), group in sorted(case_groups.items()):
     amp_str = str(amp).replace(".", "p")
 
     energies_by_row = []  # one dict (name -> energy(t)) per harmonic, in group order
     blowup_by_row = []  # one dict (name -> bool) per harmonic, in group order
-    contour_states = (
-        None  # name -> full-order perturbation snapshot, for harmonic_contour
-    )
-    contour_blowup = None  # name -> bool, for harmonic_contour
+    contour_states_by_harmonic = {}
+    contour_blowup_by_harmonic = {}
 
     for case in group:
         B = case["B"]
@@ -484,8 +611,9 @@ for (location, amp), group in sorted(case_groups.items()):
         # Raw full-order field -- unlike pool.X/proj.decode(...) output, this
         # isn't already in the weighted-orthonormal 300-dim space, so the
         # energy norm needs the finite-volume weights explicitly.
-        energy_true = np.sum(
-            fv_weights[:, None] * (dataf - q_base[:, None]) ** 2, axis=0
+        energy_true = (
+            np.sum(fv_weights[:, None] * (dataf - q_base[:, None]) ** 2, axis=0)
+            / min_cell_volume
         )
 
         z0 = np.zeros(r)
@@ -515,7 +643,7 @@ for (location, amp), group in sorted(case_groups.items()):
             # sol_300 is already isometric to the full-order weighted norm
             # (Phi_project.T @ diag(fv_weights) @ Phi_project == I), so no
             # explicit weighting is needed here, unlike energy_true above.
-            energy = np.linalg.norm(sol_300, axis=0) ** 2
+            energy = np.linalg.norm(sol_300, axis=0) ** 2 / min_cell_volume
             energies_row[name] = energy
             blowup_row[name] = detect_blowup(energy, energy_true)
             preds_full[name] = sol_full
@@ -528,9 +656,13 @@ for (location, amp), group in sorted(case_groups.items()):
                 f"{[name for name, blew_up in blowup_row.items() if blew_up]}"
             )
 
-        if case["harmonic"] == harmonic_contour:
-            contour_states = {"Truth": dataf - q_base[:, None], **preds_full}
-            contour_blowup = {"Truth": False, **blowup_row}
+        if case["harmonic"] in harmonics_contour:
+            harmonic = case["harmonic"]
+            contour_states_by_harmonic[harmonic] = {
+                "Truth": dataf - q_base[:, None],
+                **preds_full,
+            }
+            contour_blowup_by_harmonic[harmonic] = {"Truth": False, **blowup_row}
 
     # --- Energy figure: one row per harmonic ---
     fig, ax = plt.subplots(
@@ -551,67 +683,61 @@ for (location, amp), group in sorted(case_groups.items()):
             )
         ax[row_idx].text(
             0.03,
-            0.65,
+            0.97,
             rf"$k = {case['harmonic']}$",
             transform=ax[row_idx].transAxes,
             ha="left",
-            va="bottom",
-            fontsize=14,
+            va="top",
+            fontsize=22,
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.9},
+            zorder=10,
         )
         style_axes(
             ax[row_idx],
             xlabel="" if row_idx < len(group) - 1 else r"Time $t$",
-            ylabel="Energy" if row_idx == len(group) // 2 else "",
+            ylabel=r"$E_{\mathrm{pert}}$"
+            if row_idx == len(group) // 2
+            else "",
             xlim=(0.0, float(t_forcing[-1])),
         )
-        # Limit the plot height to the highest stable (non-blown-up) model
-        # so a diverging ROM doesn't squash the rest of the curves.
-        stable_names = ["Truth"] + [name for name in roms if not blowup_row[name]]
+        # NiTROM grows without crossing detect_blowup's threshold for the
+        # trailing-edge, a=0.3, k=1 case. Clip only that curve there; every
+        # other panel retains the usual blowup-based vertical limit.
+        exclude_nitrom = (
+            location == "trailing_edge"
+            and np.isclose(amp, 0.3)
+            and case["harmonic"] == 1
+        )
+        stable_names = [
+            "Truth",
+            *[
+                name
+                for name in roms
+                if not blowup_row[name] and (not exclude_nitrom or name != "NiTROM")
+            ],
+        ]
         row_max = max(np.max(energies_row[name]) for name in stable_names)
         # Extra headroom on the top row so the legend doesn't overlap the curves.
         headroom = 1.35 if row_idx == 0 else 1.1
         ax[row_idx].set_ylim(bottom=0, top=row_max * headroom)
-    ax[0].legend(loc="upper right", fontsize=7)
+        ax[row_idx].xaxis.label.set_fontsize(16)
+        ax[row_idx].xaxis.set_tick_params(labelsize=16)
+        ax[row_idx].yaxis.label.set_fontsize(16)
+        ax[row_idx].yaxis.set_tick_params(labelsize=16)
+    # ax[0].legend(loc="upper right", fontsize=7)
     save_figure(fig, f"airfoil_{location}_amp{amp_str}_forcing_energy")
 
-    # --- Snapshot contour plots: perturbation vorticity at t=9 ---
-    if contour_states is not None:
-        fig, axes = plt.subplots(
-            3, 2, figsize=(FIG_WIDTH_WIDE, 5.0), constrained_layout=True
-        )
-        axes = axes.ravel()
-
-        vort_fields = {}
-        for title, state in contour_states.items():
-            field = vorticity(state[:, snapshot_idx])
-            if contour_blowup[title]:
-                field = np.zeros_like(field)
-                title += " (blew up)"
-            vort_fields[title] = field
-        vmin = np.min(vort_fields["Truth"])
-        vmax = -vmin
-
-        for ax_i, (title, field) in zip(axes, vort_fields.items()):
-            # contourf (not pcolormesh/gouraud) so the EPS export in save_figure works --
-            # Ghostscript's PS/EPS distiller can't handle gouraud-shaded meshes.
-            cf = ax_i.contourf(
-                X_vort, Y_vort, field, levels=100, cmap="RdBu_r", vmin=vmin, vmax=vmax
+    # --- Snapshot contour plots: t=30 for k=1, t=7 for k=2 ---
+    for harmonic in harmonics_contour:
+        if harmonic in contour_states_by_harmonic:
+            save_snapshot_contour(
+                location,
+                amp_str,
+                harmonic,
+                contour_snapshot_indices[harmonic],
+                contour_states_by_harmonic[harmonic],
+                contour_blowup_by_harmonic[harmonic],
             )
-            ax_i.fill(xi, eta, color="0.2", zorder=5)
-            ax_i.set_aspect("equal", adjustable="box")
-            ax_i.set_xlim(-1, 5)
-            ax_i.set_ylim(-2, 2)
-            ax_i.set_title(title, fontsize=10)
-            ax_i.tick_params(direction="out", top=False, right=False)
-        for ax_i in axes[len(vort_fields) :]:
-            ax_i.axis("off")
-
-        fig.colorbar(
-            cf, ax=axes[: len(vort_fields)], shrink=0.85, label="Perturbation vorticity"
-        )
-        save_figure(
-            fig, f"airfoil_{location}_amp{amp_str}_k{harmonic_contour}_snapshot_all"
-        )
 
 # --- 5) Training History Plots ---
 with open(os.path.join(models_dir, "gas_opinf_history.pkl"), "rb") as f:
@@ -667,7 +793,7 @@ ax2.yaxis.set_minor_formatter(NullFormatter())
 
 lines = l1 + l2 + l3
 labels = [l.get_label() for l in lines]
-ax1.legend(lines, labels, loc="upper right")
+ax1.legend(lines, labels, loc="upper right", fontsize=8.5)
 
 save_figure(fig, "cost_history_airfoil")
 

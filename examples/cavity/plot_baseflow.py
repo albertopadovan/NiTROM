@@ -1,5 +1,6 @@
 import matplotlib.pyplot as plt
 import numpy as np 
+from matplotlib.colors import ListedColormap
 import time_steppers as tstep
 import post_process as pp
 import classes_cavity as classes
@@ -50,6 +51,20 @@ def make_figure(*, wide=False, nrows=1, ncols=1, height=None):
     return plt.subplots(nrows=nrows, ncols=ncols, figsize=(width, fig_height), constrained_layout=True)
 
 
+def rd_bu_white_center():
+    """Return RdBu_r with a pure-white neutral band around zero."""
+    colors = plt.get_cmap("RdBu_r", 512)(np.linspace(0.0, 1.0, 512))
+    center = len(colors) // 2
+    colors[center - 1 : center + 1] = (1.0, 1.0, 1.0, 1.0)
+    return ListedColormap(colors, name="RdBu_r_white_center")
+
+
+def zero_refined_levels(vmax, count=129):
+    """Return symmetric contour boundaries concentrated near zero."""
+    normalized = np.linspace(-1.0, 1.0, count)
+    return vmax * normalized * np.abs(normalized)
+
+
 Lx = 1
 Ly = 1
 Nx = 100
@@ -76,7 +91,16 @@ vmin = np.min(fields[idx])
 vmax = -vmin
 
 fig, ax = make_figure()
-plt.contourf(X[idx],Y[idx],np.flipud(fields[idx]),levels=100,cmap='RdBu_r',vmin=vmin,vmax=vmax)
+plt.contourf(
+    X[idx],
+    Y[idx],
+    np.flipud(fields[idx]),
+    levels=zero_refined_levels(vmax),
+    cmap=rd_bu_white_center(),
+    vmin=vmin,
+    vmax=vmax,
+    extend="both",
+)
 ax = plt.gca()
 ax.set_aspect('equal')
 plt.colorbar()

@@ -194,14 +194,22 @@ for name in roms:
 
     fig, axes = plt.subplots(1, 2, figsize=(11.0, 3.2), constrained_layout=True)
     meshes = []
-    for ax, title, field0 in zip(axes, ["Truth", ROM_LABELS[name]], [vort_truth[0], vort_pred[0]]):
+    for ax, title, field0 in zip(
+        axes, ["Truth", ROM_LABELS[name]], [vort_truth[0], vort_pred[0]]
+    ):
         ax.set_aspect("equal")
         ax.set_xlim(XLIM)
         ax.set_ylim(YLIM)
         ax.set_title(title)
         ax.set_xlabel(r"$x$")
         mesh = ax.pcolormesh(
-            X_vort, Y_vort, field0, cmap="RdBu_r", vmin=vmin, vmax=vmax, shading="gouraud"
+            X_vort,
+            Y_vort,
+            field0,
+            cmap="RdBu_r",
+            vmin=vmin,
+            vmax=vmax,
+            shading="gouraud",
         )
         ax.fill(xi, eta, color="0.2", zorder=5)
         meshes.append(mesh)

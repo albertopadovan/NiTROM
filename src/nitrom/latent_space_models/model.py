@@ -126,6 +126,39 @@ class Model(metaclass=abc.ABCMeta):
         """
         ...
 
+    def evaluate_jacobian(self, t: float, Z: Any) -> Any:
+        r"""
+        Jacobian of the right-hand side, :math:`J_{ac} = \partial f_a/\partial z_c`,
+        at each state in ``Z``.
+
+        The default implementation recovers it column by column from
+        :meth:`evaluate_adjoint_rhs`, which applies :math:`J^\top`: seeding with
+        the basis vector :math:`e_a` returns row :math:`a`.  That costs ``r``
+        calls, so a subclass that can assemble the Jacobian directly should
+        override this -- :meth:`evaluate_adjoint_rhs` itself typically builds
+        the whole Jacobian internally and then throws it away.
+
+        :param t: time instance
+        :param Z: state of shape ``(n,)`` or ``(m, n)``
+        :returns: ``(n, n)`` or ``(m, n, n)``
+        """
+        bkend = self.backend
+        n = Z.shape[-1]
+        dev, dtype = bkend.device_of(Z), Z.dtype
+        if Z.ndim == 1:
+            J = bkend.zeros((n, n), device=dev, dtype=dtype)
+            for a in range(n):
+                seed = bkend.zeros((n,), device=dev, dtype=dtype)
+                seed[a] = 1.0
+                J[a, :] = self.evaluate_adjoint_rhs(t, seed, Z)
+            return J
+        J = bkend.zeros((Z.shape[0], n, n), device=dev, dtype=dtype)
+        for a in range(n):
+            seed = bkend.zeros(Z.shape, device=dev, dtype=dtype)
+            seed[:, a] = 1.0
+            J[:, a, :] = self.evaluate_adjoint_rhs(t, seed, Z)
+        return J
+
     def inner_params(self) -> list[Any]:
         """
         Return the inner parameter tensors for which `vjp_evaluate_rhs` 

@@ -421,6 +421,10 @@ class GasPolynomialModel(Model):
         """Delegate to the inner :class:`PolynomialModel`."""
         return self.model.evaluate_rhs(t, z, **kwargs)
 
+    def evaluate_jacobian(self, t: float, Z: Any, **kwargs) -> Any:
+        """Jacobian of the assembled polynomial model.  See :class:`PolynomialModel`."""
+        return self.model.evaluate_jacobian(t, Z, **kwargs)
+
     def evaluate_adjoint_rhs(self, t: float, z: Any, Z: Any, **kwargs) -> Any:
         """Delegate to the inner :class:`PolynomialModel`."""
         return self.model.evaluate_adjoint_rhs(t, z, Z, **kwargs)

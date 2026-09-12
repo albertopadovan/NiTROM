@@ -55,7 +55,6 @@ x, dx, A, B_fom, C = fom_class.build_operators(L=30.0, n=301, dtype=dtype)
 AVAILABLE = [
     ("POD-Galerkin", "galerkin_model.pkl", "tab:red", "solid"),
     ("OpInf", "opinf_model.pkl", "tab:blue", "dotted"),
-    ("Oblique OpInf", "oblique_opinf_model.pkl", "tab:green", "dashed"),
 ]
 
 

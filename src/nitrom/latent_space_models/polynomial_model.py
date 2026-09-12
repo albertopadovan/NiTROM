@@ -186,6 +186,40 @@ class PolynomialModel(Model):
 
         return dzdt
 
+    def evaluate_jacobian(self, t: float, Z: Any, **kwargs) -> Any:
+        r"""
+        Assemble the Jacobian :math:`J_{ac} = \partial f_a/\partial z_c` of the
+        polynomial right-hand side at ``Z``.
+
+        For a degree-:math:`k` term, differentiating
+        :math:`A_k(z, \ldots, z)` puts :math:`z` in :math:`k - 1` of the slots
+        and leaves one free, so the Jacobian sums the :math:`k` ways of
+        choosing which slot stays open.  Any additive forcing drops out.
+
+        :param t: time instance (unused; the forcing is additive)
+        :param Z: state of shape ``(n,)`` or ``(m, n)``
+        :returns: ``(n, n)`` or ``(m, n, n)``
+        """
+        n = Z.shape[-1]
+        tensors = self.get_params()
+        bkend = self.backend
+        batched = Z.ndim > 1
+
+        shape = (Z.shape[0], n, n) if batched else (n, n)
+        J = bkend.zeros(shape, dtype=self.dtype, device=self.device)
+        for i, k in enumerate(self.poly_comp):
+            if k == 0:
+                continue
+            combs = list(combinations(self.einsum_ss[i][1:], r=k - 1))
+            for comb in combs:
+                if batched:
+                    parts = [self.einsum_ss[i][0]] + [f"...{p}" for p in comb]
+                else:
+                    parts = [self.einsum_ss[i][0], *comb]
+                operands = [tensors[i]] + [Z for _ in range(k - 1)]
+                J += bkend.einsum(",".join(parts), *operands)
+        return J
+
     def evaluate_adjoint_rhs(self, t: float, z: Any, Z: Any, **kwargs) -> Any:
         r"""
         Evaluate the adjoint right-hand side:
@@ -203,52 +237,22 @@ class PolynomialModel(Model):
         :param Z: base flow at which to evaluate the Jacobian, same shape as ``z``
         :rtype: backend array
         """
-        n = z.shape[-1]
-        tensors = self.get_params()
         bkend = self.backend
 
-        # z is a vector
         if z.ndim == 1:
-            # Guard against blow-up
             if bkend.vector_norm(z) >= self.thresh:
                 return bkend.zeros_like(z)
+            return self.evaluate_jacobian(t, Z).T @ z
 
-            # Compute the Jacobian and adjoint dynamics
-            J = bkend.zeros((n, n), dtype=self.dtype, device=self.device)
-            for i, k in enumerate(self.poly_comp):
-                if k == 0:
-                    continue
-                combs = list(combinations(self.einsum_ss[i][1:], r=k - 1))
-                operands = [tensors[i]] + [Z for _ in range(k - 1)]
-                for comb in combs:
-                    equation = ",".join([self.einsum_ss[i][0], *comb])
-                    J += bkend.einsum(equation, *operands)
-            dzdt = J.T @ z
+        # Guard against blow-up
+        norms = bkend.vector_norm(z, axis=-1)
+        mask = norms < self.thresh
+        if not mask.any():
+            return bkend.zeros_like(z)
 
-        # z is a tensor (we use batching to evaluate all vectors at once)
-        else:
-            # Guard against blow-up
-            norms = bkend.vector_norm(z, axis=-1)
-            mask = norms < self.thresh
-            if not mask.any():
-                return bkend.zeros_like(z)
-
-            # Compute the Jacobian and adjoint dynamics
-            dzdt = bkend.zeros_like(z)
-            Jb = bkend.zeros(
-                (int(mask.sum()), n, n), dtype=self.dtype, device=self.device
-            )
-            for i, k in enumerate(self.poly_comp):
-                if k == 0:
-                    continue
-                combs = list(combinations(self.einsum_ss[i][1:], r=k - 1))
-                for comb in combs:
-                    eq_parts = [self.einsum_ss[i][0]] + [f"...{p}" for p in comb]
-                    equation = ",".join(eq_parts)
-                    operands = [tensors[i]] + [Z[mask] for _ in range(k - 1)]
-                    Jb += bkend.einsum(equation, *operands)
-            dzdt[mask] = bkend.einsum("bnm,bn->bm", Jb, z[mask])
-
+        dzdt = bkend.zeros_like(z)
+        Jb = self.evaluate_jacobian(t, Z[mask])
+        dzdt[mask] = bkend.einsum("bnm,bn->bm", Jb, z[mask])
         return dzdt
 
     def vjp_evaluate_rhs(self, z: Any, v: Any, reg: float = 0.0, **kwargs) -> list[Any]:

@@ -6,7 +6,6 @@ from .utils import *
 from .optimization import (
     InferenceModule,
     NitromModule,
-    ObliqueOpInfModule,
     OpInfModule,
     PolyManifoldInfModule,
     perform_POD,

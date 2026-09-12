@@ -1,4 +1,3 @@
 from .projection import Projection
 from .linear_projection import LinearProjection
-from .oblique_chart_projection import ObliqueChartProjection
 from .polynomial_projection import PolynomialProjection

@@ -1,10 +1,11 @@
-"""Finite-difference gradient checks for OpInfModule (polynomial and GAS ROMs).
+"""Finite-difference gradient checks for OpInfModule (polynomial, GAS, ATR ROMs).
 
 Ambient dimension N = 5, latent dimension r = 2.
 """
 
 import torch
 
+from nitrom.latent_space_models.atr_polynomial_model import AtrPolynomialModel
 from nitrom.latent_space_models.gas_polynomial_model import GasPolynomialModel
 from nitrom.latent_space_models.polynomial_model import PolynomialModel
 from nitrom.optimization import OpInfModule
@@ -68,4 +69,41 @@ def test_gradient_gas_rom():
         forcing_config={"forcing_exists": True, "m": M},
     )
     module = OpInfModule(_data(), rom, _projection(), reg=0.01)
+    assert_grad_close(module.gradient(), finite_diff_grad(module))
+
+
+def test_gradient_atr_rom():
+    g = torch.Generator().manual_seed(4)
+    eye = torch.eye(R, dtype=DTYPE)
+    atr_params = [
+        torch.randn(R, R, generator=g, dtype=DTYPE),                # K
+        eye + 0.1 * torch.randn(R, R, generator=g, dtype=DTYPE),    # R (invertible)
+        eye + 0.1 * torch.randn(R, R, generator=g, dtype=DTYPE),    # Q (invertible)
+        0.3 * torch.randn(R, R, R, generator=g, dtype=DTYPE),       # S
+        torch.randn(R, generator=g, dtype=DTYPE),                   # Bhat
+        torch.randn(R, generator=g, dtype=DTYPE),                   # m
+        torch.randn(R, M, generator=g, dtype=DTYPE),                # B
+    ]
+    rom = AtrPolynomialModel(
+        R, [1, 2], dtype=DTYPE, atr_params=atr_params,
+        forcing_config={"forcing_exists": True, "m": M},
+    )
+    module = OpInfModule(_data(), rom, _projection(), reg=0.01)
+    assert_grad_close(module.gradient(), finite_diff_grad(module))
+
+
+def test_gradient_atr_rom_no_forcing():
+    g = torch.Generator().manual_seed(5)
+    eye = torch.eye(R, dtype=DTYPE)
+    atr_params = [
+        torch.randn(R, R, generator=g, dtype=DTYPE),
+        eye + 0.1 * torch.randn(R, R, generator=g, dtype=DTYPE),
+        eye + 0.1 * torch.randn(R, R, generator=g, dtype=DTYPE),
+        0.3 * torch.randn(R, R, R, generator=g, dtype=DTYPE),
+        torch.randn(R, generator=g, dtype=DTYPE),
+        torch.randn(R, generator=g, dtype=DTYPE),
+    ]
+    rom = AtrPolynomialModel(R, [1, 2], dtype=DTYPE, atr_params=atr_params)
+    data = Data(_data().X, dX=_data().dX, forcing_fns=[])
+    module = OpInfModule(data, rom, _projection(), reg=0.01)
     assert_grad_close(module.gradient(), finite_diff_grad(module))

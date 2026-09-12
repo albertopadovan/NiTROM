@@ -84,7 +84,13 @@ def _train_numpy(
     # model()/model.gradient() are partial sums; Allreduce(SUM) reconstructs the
     # global cost/gradient (the weights already carry the global normalization).
     # Every rank runs the identical optimizer on the reduced values, in lockstep.
-    rank, size = mpi_rank_size()
+    #
+    # Reduce over the communicator the training pool was *sharded* on, not
+    # COMM_WORLD: a pool built on a split communicator must be reduced over that
+    # same communicator or the sum spans the wrong set of ranks.  ``None``
+    # resolves to COMM_WORLD, so the common case is unchanged.
+    comm = getattr(model, "comm", None)
+    rank, size = mpi_rank_size(comm)
     distributed = size > 1
     printable = bool(print_every) and rank == 0
     names = [n for n, _ in model.named_parameters()]
@@ -95,12 +101,12 @@ def _train_numpy(
 
     def cost():
         c = float(model())
-        return mpi_allreduce_scalar(c) if distributed else c
+        return mpi_allreduce_scalar(c, comm=comm) if distributed else c
 
     def grads_projected():
         g = model.gradient()
         if distributed:
-            g = [mpi_allreduce_sum(np.asarray(gi)) for gi in g]
+            g = [mpi_allreduce_sum(np.asarray(gi), comm=comm) for gi in g]
         for i, name in enumerate(names):
             if manifolds.get(name):
                 g[i] = project(model._params[name], g[i], manifolds[name])

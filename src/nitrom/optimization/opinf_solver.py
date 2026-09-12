@@ -96,7 +96,7 @@ def solve_opinf(module: OpInfModule) -> OpInfModule:
     # 5. Formulate and solve the least-squares problem: S A = B_sys
     # A = Q_w @ Q.T + reg * I, where Q_w = Q @ W
     # B_sys = tilde_dZ @ Q_w.T
-    w = bkend.diag(module.W)  # shape (N_s,)
+    w = module.w  # shape (N_s,)
     Q_w = Q * w[None, :]
     Q_w_Q_T = Q_w @ Q.T
     B_sys = tilde_dZ @ Q_w.T
@@ -104,10 +104,12 @@ def solve_opinf(module: OpInfModule) -> OpInfModule:
     # Allreduce local contributions to get the global matrices in parallel runs
     if bkend.is_numpy:
         from nitrom.backend import mpi_allreduce_sum, mpi_rank_size
-        _, size = mpi_rank_size()
+        # Reduce over the communicator the pool was sharded on (see train.py).
+        comm = getattr(module, "comm", None)
+        _, size = mpi_rank_size(comm)
         if size > 1:
-            Q_w_Q_T = mpi_allreduce_sum(Q_w_Q_T)
-            B_sys = mpi_allreduce_sum(B_sys)
+            Q_w_Q_T = mpi_allreduce_sum(Q_w_Q_T, comm=comm)
+            B_sys = mpi_allreduce_sum(B_sys, comm=comm)
     else:
         try:
             import torch.distributed as dist

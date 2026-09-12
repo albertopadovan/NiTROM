@@ -1,5 +1,10 @@
 from .backend import cleanup_distributed, setup_distributed
-from .latent_space_models import Model, PolynomialModel
+from .latent_space_models import (
+    AtrPolynomialModel,
+    GasPolynomialModel,
+    Model,
+    PolynomialModel,
+)
 from .time_steppers import *
 from .training_data import *
 from .utils import *

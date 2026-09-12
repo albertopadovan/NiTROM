@@ -127,6 +127,49 @@ class Model(metaclass=abc.ABCMeta):
         """
         return inner_grads
 
+    def batched_vjp_evaluate_rhs(
+        self, Z: Any, V: Any, U: Any = None, out: list | None = None,
+        max_bytes: int = 64 << 20,
+    ) -> list:
+        """
+        Parameter VJP summed over a stack of ``(state, seed)`` records.
+
+        Concrete by design so existing subclasses keep working: the default just
+        defers to :meth:`vjp_evaluate_rhs`, whose batched form already sums over
+        its leading axis.  Subclasses override it when a fused contraction beats
+        the per-record path (see
+        :meth:`~nitrom.latent_space_models.polynomial_model.PolynomialModel.batched_vjp_evaluate_rhs`).
+
+        :param Z: stacked states, shape ``(D, n)``
+        :param V: stacked upstream adjoint seeds, shape ``(D, n)``
+        :param U: stacked forcing rows; only meaningful for models with forcing
+        :param out: accumulators to add into, in :meth:`inner_params` order
+        :rtype: list
+        """
+        if U is not None:
+            raise NotImplementedError(
+                f"{type(self).__name__} has no batched forcing VJP; override "
+                "batched_vjp_evaluate_rhs to support it"
+            )
+        grads = self.vjp_evaluate_rhs(Z, V)
+        if out is None:
+            return grads
+        return [o + g for o, g in zip(out, grads, strict=True)]
+
+    def inner_batched_vjp_evaluate_rhs(
+        self, Z: Any, V: Any, U: Any = None, out: list | None = None,
+        max_bytes: int = 64 << 20,
+    ) -> list:
+        """Batched parameter VJP w.r.t. :meth:`inner_params`.
+
+        Mirrors :meth:`inner_vjp_evaluate_rhs`: identical to
+        :meth:`batched_vjp_evaluate_rhs` unless the model has a two-level
+        parameterization.
+        """
+        return self.batched_vjp_evaluate_rhs(
+            Z, V, U=U, out=out, max_bytes=max_bytes
+        )
+
     def inner_vjp_evaluate_rhs(self, z: Any, v: Any, *args, **kwargs) -> list:
         """
         VJP of the RHS with respect to the inner parameter tensors.

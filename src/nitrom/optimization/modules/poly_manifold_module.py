@@ -1,6 +1,6 @@
 from typing import Any
 
-from nitrom.backend import get_backend, distributed_rank_size
+from nitrom.backend import get_backend
 from nitrom.projections.polynomial_projection import PolynomialProjection
 from nitrom.training_data import TrainingData
 
@@ -79,9 +79,9 @@ class PolyManifoldInfModule(InferenceModule):
         self.ntraj = ntraj
         self.nt = nt
 
-        # Weight matrix
-        W = bkend.repeat_interleave(1.0 / training_data.weights.reshape(-1), nt)
-        self.W = bkend.diag(W)
+        # Per-snapshot weights, held as the (ntraj * nt,) diagonal rather than
+        # the dense matrix (see :class:`OpInfModule`).
+        self.w = bkend.repeat_interleave(1.0 / training_data.weights.reshape(-1), nt)
 
         # Precompute encoded data: Z of shape (ntraj, r, nt)
         self.Z = bkend.einsum("ij,kil->kjl", Psi, self.X)
@@ -149,10 +149,10 @@ class PolyManifoldInfModule(InferenceModule):
         R = X_flat - X_hat  # (ntraj*nt, N)
         # Reshape to (N, ntraj*nt) for the weighted norm
         R_flat = R.T
-        cost = ((R_flat @ self.W) * R_flat).sum()
+        cost = ((R_flat * self.w[None, :]) * R_flat).sum()
 
         # Regularization on A_k
-        _, world_size = distributed_rank_size()
+        world_size = self.world_size  # communicator the pool was sharded on
         reg = self.reg / world_size
         for name in self._trainable_names:
             cost = cost + reg * bkend.vector_norm(getattr(self.proj, name)) ** 2
@@ -179,7 +179,7 @@ class PolyManifoldInfModule(InferenceModule):
 
         R = X_flat - X_hat
         R_flat = R.T  # (N, ntraj*nt)
-        RW = (R_flat @ self.W).T  # (ntraj*nt, N)
+        RW = (R_flat * self.w[None, :]).T  # (ntraj*nt, N)
 
         # Adjoint seed: v = -2 * R * W
         v = -2.0 * RW
@@ -191,8 +191,7 @@ class PolyManifoldInfModule(InferenceModule):
         grads = list(all_grads[2:])
 
         # Add regularization
-        from nitrom.backend import distributed_rank_size
-        _, world_size = distributed_rank_size()
+        world_size = self.world_size  # communicator the pool was sharded on
         reg = self.reg / world_size
         for i, name in enumerate(self._trainable_names):
             grads[i] = grads[i] + 2.0 * reg * getattr(self.proj, name)

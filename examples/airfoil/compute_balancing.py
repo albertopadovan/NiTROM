@@ -41,6 +41,15 @@ and ||q~_j(t)||^2 (the last three give exact full-state reconstruction errors).
 Memory: the data (~8.7 GB) plus one family's staged windows (75 windows of
 104 snapshots, ~38 GB).
 
+Non-uniformly sampled data (fom_data_merged: 0.02 up to t = 4, then 0.2):
+the fine early samples serve to enrich X_0 -- 20 checkpoints in [0, 2) from
+the fast early dynamics plus 20 spread over [0.2, 20] -- while every window
+uses the same uniform reference grid tau = 0, 0.2, ..., T_w (rectangle rule),
+T_w = t_end - t_c,max.  Window samples t_c + tau that are not stored (only
+after t = 4, for checkpoints off the 0.2 grid) are Lagrange-interpolated from
+the 0.2 data, in the wake phase where that is accurate to < 1%.  The reduced
+quantities saved for the fits stay on the uniform 0.2 grid.
+
 Usage: python compute_balancing.py [--domain rom|full] [--r-save 100]
                                    [--m-ckpt 25] [--q-ckpt 4]
 Writes <out>/balancing.npz and <out>/reduced_r<r_save>.npz, with <out> =
@@ -75,6 +84,53 @@ def n_v_full_of(snap):
     return (len(snap["xv"]) - 2)*(len(snap["yv"]) - 2)
 
 
+def preproject(X, use_gpu=True, n_check=40, seed=0):
+    r"""Exact reduction of the snapshot data for the balancing.
+
+    Every quantity of the balancing -- windows (interpolated ones included),
+    checkpoint states X_0, Q, H, Phi, Psi -- is a linear combination of the
+    snapshots, and only their Euclidean inner products enter.  With the
+    stacked snapshots Y = U C (U orthonormal columns, NO truncation),
+    x_i^T x_j = c_i^T c_j, so balancing the coefficient trajectories and
+    lifting Phi = U Phi_c, Psi = U Psi_c is the full-size balancing exactly.
+    U comes from a Householder QR of Y rather than POD by the method of
+    snapshots: QR is exact to machine precision, while the snapshot Gram
+    matrix squares the conditioning.  (POD modes would only rotate U, to which
+    the balancing is invariant.)
+
+    :param X: (n_traj, N, n_t) weighted snapshots
+    :returns: (C, lift, err): coefficient trajectories (n_traj, m, n_t) with
+        m = n_traj*n_t, a function A -> U A (host arrays), and the relative
+        reconstruction error of n_check random snapshots
+    """
+    n_traj, N, n_t = X.shape
+    m = n_traj*n_t
+    cols = np.random.default_rng(seed).choice(m, size=min(n_check, m),
+                                              replace=False)
+    if use_gpu:
+        import cupy as cp
+        Y = cp.empty((N, m))
+        for k in range(n_traj):
+            Y[:, k*n_t:(k + 1)*n_t] = cp.asarray(X[k])
+        U, Rm = cp.linalg.qr(Y, mode="reduced")
+        Yc = Y[:, cols]
+        err = float(cp.linalg.norm(U @ Rm[:, cols] - Yc)/cp.linalg.norm(Yc))
+        del Y, Yc
+        C = cp.asnumpy(Rm)
+        lift = lambda A: cp.asnumpy(U @ cp.asarray(np.ascontiguousarray(A)))
+    else:
+        import scipy.linalg as sla
+        Y = np.concatenate([X[k] for k in range(n_traj)], axis=1)
+        U, C = sla.qr(Y, mode="economic")
+        err = float(np.linalg.norm(U @ C[:, cols] - Y[:, cols])
+                    / np.linalg.norm(Y[:, cols]))
+        del Y
+        lift = lambda A: U @ np.ascontiguousarray(A)
+    C = np.ascontiguousarray(
+        np.stack([C[:, k*n_t:(k + 1)*n_t] for k in range(n_traj)]))
+    return C, lift, err
+
+
 class Pool:
     """Minimal TrainingPool view: compute_data_driven_balancing needs only the
     raw trajectories, the time grid and the (single-rank) layout."""
@@ -99,15 +155,45 @@ def main():
     ap.add_argument("--m-ckpt", type=int, default=25,
                     help="checkpoints (initial conditions) per trajectory")
     ap.add_argument("--q-ckpt", type=int, default=4,
-                    help="snapshots between checkpoints")
+                    help="snapshots between checkpoints (uniform data)")
+    # non-uniformly sampled data (e.g. fom_data_merged): the fine early
+    # samples enrich X_0 with checkpoints from the fast early dynamics
+    ap.add_argument("--ckpt-early", type=float, nargs=3, default=[0.0, 2.0, 20],
+                    metavar=("T0", "T1", "N"),
+                    help="N checkpoints evenly spaced on [T0, T1)")
+    ap.add_argument("--ckpt-late", type=float, nargs=3, default=[0.2, 20.0, 20],
+                    metavar=("T0", "T1", "N"),
+                    help="N checkpoints evenly spaced on [T0, T1] (snapped to "
+                         "the nearest sample; duplicates of the early set "
+                         "dropped)")
+    ap.add_argument("--window-dt", type=float, default=0.2,
+                    help="uniform spacing of the common window (rectangle rule)")
+    ap.add_argument("--preproject", choices=["qr-gpu", "qr-cpu", "none"],
+                    default="qr-gpu",
+                    help="balance the exact (untruncated) QR coefficients of "
+                         "the snapshots instead of the full state; identical "
+                         "result, dimension m = n_traj*n_t instead of N")
+    ap.add_argument("--interp-order", type=int, default=6,
+                    help="Lagrange order where t_c + tau is not a stored sample")
+    ap.add_argument("--dt-reduced", type=float, default=0.2,
+                    help="grid of the saved reduced quantities (the NiTROM / "
+                         "OpInf grid)")
     args = ap.parse_args()
-    if args.out is None:
-        args.out = os.path.join(HERE, "balancing" if args.domain == "rom"
-                                else "balancing_full")
 
     meta = np.load(os.path.join(args.data, "meta.npz"))
     time, params = meta["time"], meta["parameters"]
     n_traj, n_t = len(params), len(time)
+    uniform = np.allclose(np.diff(time), time[1] - time[0], rtol=1e-9, atol=1e-12)
+    if args.out is None:
+        args.out = os.path.join(
+            HERE, ("balancing" if args.domain == "rom" else "balancing_full")
+            + ("" if uniform else "_quad"))
+    # reduced quantities stay on the uniform NiTROM / OpInf grid
+    keep = (np.arange(n_t) if uniform else np.flatnonzero(
+        np.isclose(np.round(time/args.dt_reduced)*args.dt_reduced, time,
+                   rtol=0, atol=1e-9)))
+    print(f"time grid: {'uniform' if uniform else 'non-uniform'}, {n_t} "
+          f"samples; reduced quantities on {len(keep)} of them")
     files = [os.path.join(args.data, f"fluct_{k:03d}.npy") for k in range(n_traj)]
     missing = [f for f in files if not os.path.exists(f)]
     if missing:
@@ -128,9 +214,15 @@ def main():
     X = np.empty((n_traj, N, n_t))
     for k, f in enumerate(files):
         X[k] = np.load(f, mmap_mode="r")[mask]*sqrt_w[:, None]
-    energy = ((X*X).sum(axis=1)).mean(axis=1)        # <||q~||^2>_t = <E_pert>_t
+    energy = ((X[:, :, keep]**2).sum(axis=1)).mean(axis=1)   # <||q~||^2>_t
     print(f"loaded {n_traj} trajectories x {n_t} snapshots "
           f"({X.nbytes/1e9:.1f} GB) in {timer.time() - t0:.0f} s")
+    lift = None
+    if args.preproject != "none":
+        t0 = timer.time()
+        X, lift, err = preproject(X, use_gpu=(args.preproject == "qr-gpu"))
+        print(f"pre-projection ({args.preproject}): N = {N} -> m = {X.shape[1]}, "
+              f"relative reconstruction error {err:.1e}, {timer.time() - t0:.0f} s")
 
     betas = np.unique(params[:, 0])
     families = [[k for k in range(n_traj) if params[k, 0] == b] for b in betas]
@@ -138,12 +230,37 @@ def main():
           + ", ".join(f"beta = {b:g}: {fam}" for b, fam in zip(betas, families)))
 
     t0 = timer.time()
+    if uniform:
+        quad = None
+        kw = dict(n_checkpoints=args.m_ckpt, checkpoint_stride=args.q_ckpt)
+    else:
+        snap = lambda tt: [float(time[np.argmin(np.abs(time - x))]) for x in tt]
+        a0, a1, na = args.ckpt_early
+        b0, b1, nb = args.ckpt_late
+        early = snap(np.linspace(a0, a1, int(na), endpoint=False))
+        late = [t for t in snap(np.linspace(b0, b1, int(nb)))
+                if not np.any(np.isclose(t, early, atol=1e-9))]
+        t_ck = np.array(sorted(set(early) | set(late)))
+        T_w = time[-1] - t_ck[-1]
+        L = int(np.floor(T_w/args.window_dt + 1e-9)) + 1
+        nodes = args.window_dt*np.arange(L)
+        weights = np.full(L, args.window_dt)
+        quad = dict(nodes=nodes, weights=weights, checkpoint_times=t_ck,
+                    interp_order=args.interp_order)
+        kw = dict(quadrature=quad)
+        print(f"checkpoints: {len(early)} in [{a0:g}, {a1:g}) + {len(late)} in "
+              f"[{b0:g}, {b1:g}] = {len(t_ck)} per trajectory: "
+              f"{np.array2string(t_ck, precision=2, max_line_width=200)}")
+        print(f"reference window: uniform, tau = 0..{nodes[-1]:g} every "
+              f"{args.window_dt:g} ({L} samples, rectangle rule); order-"
+              f"{args.interp_order} interpolation only where t_c + tau is not "
+              f"a stored sample")
     Phi, Psi, Sig, info = compute_data_driven_balancing(
-        Pool(X, time), n_checkpoints=args.m_ckpt,
-        checkpoint_stride=args.q_ckpt, families=families, normalize=True)
+        Pool(X, time), families=families, normalize=True, **kw)
     print(f"balancing: {timer.time() - t0:.0f} s, {len(Sig)} balanced modes, "
           f"M ranks kept {[f['rank_M_kept'] for f in info['families']]}, "
-          f"window {info['window_length']} of {n_t} snapshots")
+          f"window {info['window_length']} "
+          + ("snapshots" if uniform else "quadrature nodes"))
     print(f"Hankel singular values [:10] = "
           f"{np.array2string(Sig[:10], precision=3)}")
 
@@ -151,15 +268,23 @@ def main():
     if R < args.r_save:
         print(f"WARNING: only {len(Sig)} balanced modes exist; keeping all")
     Phi, Psi = np.ascontiguousarray(Phi[:, :R]), np.ascontiguousarray(Psi[:, :R])
-    biorth = np.abs(Psi.T @ Phi - np.eye(R)).max()
-    print(f"max |Psi^T Phi - I| over {R} modes = {biorth:.1e}")
 
     # Reduced quantities for the fits: all 2-D GEMMs (the venv's threaded
-    # OpenBLAS returns garbage for 1-D dot products on strided views).
-    Z = np.stack([Psi.T @ X[k] for k in range(n_traj)])        # (n_traj, R, n_t)
-    PhiTX = np.stack([Phi.T @ X[k] for k in range(n_traj)])
+    # OpenBLAS returns garbage for 1-D dot products on strided views).  With
+    # the pre-projection they come straight from the coefficients -- U has
+    # orthonormal columns, so Psi^T x = Psi_c^T c and so on.
+    Xr = X[:, :, keep]                                          # NiTROM grid
+    del X
+    Z = np.stack([Psi.T @ Xr[k] for k in range(n_traj)])       # (n_traj, R, n_t)
+    PhiTX = np.stack([Phi.T @ Xr[k] for k in range(n_traj)])
     PhiTPhi = Phi.T @ Phi
-    sq = (X*X).sum(axis=1)                                      # (n_traj, n_t)
+    sq = (Xr*Xr).sum(axis=1)                                    # (n_traj, n_t)
+    if lift is not None:
+        t0 = timer.time()
+        Phi, Psi = lift(Phi), lift(Psi)
+        print(f"lifted Phi, Psi to N = {Phi.shape[0]} in {timer.time() - t0:.0f} s")
+    biorth = np.abs(Psi.T @ Phi - np.eye(R)).max()
+    print(f"max |Psi^T Phi - I| over {R} modes = {biorth:.1e}")
 
     # How much of each trajectory the oblique projection Phi Psi^T keeps.
     print(f"\nprojection error ||q~ - Phi Psi^T q~|| / ||q~|| (time-integrated):")
@@ -182,10 +307,12 @@ def main():
              m_ckpt=args.m_ckpt, q_ckpt=args.q_ckpt, families=np.array(
                  [np.array(f) for f in families], dtype=object),
              sM=np.array([f["sM"] for f in info["families"]], dtype=object),
-             baseflow=str(meta["baseflow"]), domain=args.domain)
+             baseflow=str(meta["baseflow"]), domain=args.domain,
+             data=os.path.abspath(args.data), preproject=args.preproject,
+             quadrature=np.array(quad, dtype=object))
     np.savez(os.path.join(args.out, f"reduced_r{R}.npz"),
              Z=Z, PhiTX=PhiTX, PhiTPhi=PhiTPhi, sq=sq, energy=energy,
-             time=time, parameters=params)
+             time=time[keep], parameters=params)
     print(f"\nsaved -> {args.out}/balancing.npz, reduced_r{R}.npz")
 
 

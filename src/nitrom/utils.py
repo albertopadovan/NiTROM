@@ -151,6 +151,113 @@ def _checkpoint_indices(n_snapshots: int, n_checkpoints: int, stride: int) -> li
     return idx
 
 
+def composite_gauss_legendre(breaks, n_per_panel: int):
+    r"""
+    Composite Gauss-Legendre rule on the panels ``[breaks[i], breaks[i+1]]``.
+
+    Exact for polynomials of degree ``2 n_per_panel - 1`` on every panel.
+    Panels may have any widths, so a rule can be fine where the integrand
+    changes quickly (e.g. just after an impulse) and coarse elsewhere.
+
+    :param breaks: increasing panel end points, length ``n_panels + 1``
+    :param n_per_panel: nodes per panel
+    :returns: ``(nodes, weights)``, float64 numpy arrays, nodes ascending
+    """
+    import numpy as np
+
+    breaks = np.asarray(breaks, dtype=float)
+    if breaks.ndim != 1 or len(breaks) < 2 or np.any(np.diff(breaks) <= 0):
+        raise ValueError("breaks must be a strictly increasing 1-D array.")
+    x, w = np.polynomial.legendre.leggauss(int(n_per_panel))
+    a, b = breaks[:-1, None], breaks[1:, None]
+    nodes = (0.5 * (b - a) * x[None, :] + 0.5 * (a + b)).ravel()
+    weights = (0.5 * (b - a) * w[None, :]).ravel()
+    return nodes, weights
+
+
+def lagrange_stencils(t_samples, t_eval, order: int):
+    r"""
+    Local barycentric Lagrange interpolation weights on a (possibly non-uniform)
+    sample grid.
+
+    Every evaluation time uses the contiguous block of ``order`` samples that
+    is most compact around it (smallest maximal distance), so on a grid that
+    switches spacing the stencil leans toward the finely sampled side.  A time
+    that coincides with a sample (to round-off) gets that sample exactly.
+
+    :param t_samples: increasing sample times, length ``n``
+    :param t_eval: evaluation times, inside ``[t_samples[0], t_samples[-1]]``
+    :param order: points per stencil (polynomial degree ``order - 1``)
+    :returns: ``(start, W)``: stencil ``e`` uses samples
+        ``start[e] : start[e] + order`` with weights ``W[e]``
+    """
+    import numpy as np
+
+    t = np.asarray(t_samples, dtype=float)
+    te = np.atleast_1d(np.asarray(t_eval, dtype=float))
+    n, p = len(t), int(order)
+    if p < 1 or p > n:
+        raise ValueError(f"order must be in [1, {n}], got {order}.")
+    span = t[-1] - t[0]
+    tol = 1e-10 * max(span, 1.0)
+    if te.min() < t[0] - tol or te.max() > t[-1] + tol:
+        raise ValueError(
+            f"evaluation times [{te.min():g}, {te.max():g}] leave the sample "
+            f"range [{t[0]:g}, {t[-1]:g}]."
+        )
+    start = np.empty(len(te), dtype=int)
+    W = np.zeros((len(te), p))
+    for e, tq in enumerate(te):
+        i = int(np.searchsorted(t, tq))
+        cand = np.arange(max(0, i - p), min(i, n - p) + 1)
+        width = np.maximum(tq - t[cand], t[cand + p - 1] - tq)
+        s0 = int(cand[np.argmin(width)])
+        x = t[s0:s0 + p]
+        start[e] = s0
+        hit = np.flatnonzero(np.abs(x - tq) <= tol)
+        if hit.size:
+            W[e, hit[0]] = 1.0
+            continue
+        bw = np.array([1.0 / np.prod([x[k] - x[m] for m in range(p) if m != k])
+                       for k in range(p)])
+        c = bw / (tq - x)
+        W[e] = c / c.sum()
+    return start, W
+
+
+def _interpolated_window(X_traj, start, W, scale_cols, chunk=8):
+    r"""
+    One window ``(N, n_q)`` at the quadrature nodes: column ``e`` is
+    ``sum_m W[e, m] X_traj[:, start[e] + m]`` times ``scale_cols[e]``.
+
+    Consecutive nodes are processed ``chunk`` at a time as one product of the
+    contiguous sample slice they touch with a small coefficient block, so the
+    cost is ~ ``N * n_q * (chunk + order)`` and no ``(N, n_q, order)`` gather
+    is ever formed.
+    """
+    import numpy as np
+
+    bkend = get_backend()
+    N = X_traj.shape[0]
+    n_q, p = W.shape
+    out = bkend.empty((N, n_q), dtype=X_traj.dtype, device=bkend.device_of(X_traj))
+    for e0 in range(0, n_q, chunk):
+        e1 = min(e0 + chunk, n_q)
+        a = int(start[e0:e1].min())
+        b = int((start[e0:e1] + p).max())
+        C = np.zeros((b - a, e1 - e0))
+        for e in range(e0, e1):
+            C[start[e] - a: start[e] - a + p, e - e0] = W[e] * scale_cols[e]
+        Cb = bkend.asarray(C, dtype=X_traj.dtype, device=bkend.device_of(X_traj))
+        out[:, e0:e1] = X_traj[:, a:b] @ Cb
+    return out
+
+
+def _materialize(v):
+    """A window given as an array (a view) or as a callable building it."""
+    return v() if callable(v) else v
+
+
 def _assign_families(norms, amplitude_ranges):
     """
     Group initial conditions into amplitude families by binning their **raw**
@@ -216,7 +323,7 @@ def _stage_family(views, scales, buf):
     views with the scale applied to the small result instead.
     """
     for i, (v, sc) in enumerate(zip(views, scales)):
-        buf[i] = sc * v
+        buf[i] = sc * _materialize(v)
     return buf[:len(views)]
 
 
@@ -274,10 +381,11 @@ def _balance_from_windows(fam_views, fam_scales, fam_X0, weights, dt,
     bkend = get_backend()
 
     # One staging buffer, sized by the largest family, reused for each Gramian.
-    v0 = fam_views[0][0]
+    v0 = _materialize(fam_views[0][0])
     mmax = max(len(v) for v in fam_views)
     buf = bkend.zeros((mmax,) + tuple(v0.shape), device=bkend.device_of(v0),
                       dtype=v0.dtype)
+    del v0
 
     Qs, fam_info = [], []
     for views, scales, X0, w in zip(fam_views, fam_scales, fam_X0, weights):
@@ -294,7 +402,7 @@ def _balance_from_windows(fam_views, fam_scales, fam_X0, weights, dt,
     for views, scs, w in zip(fam_views, fam_scales, weights):
         for view, sc in zip(views, scs):
             f = sc * float(w * dt) ** 0.5
-            blocks.append(f * (Q.T @ view))     # strided view: no copy needed
+            blocks.append(f * (Q.T @ _materialize(view)))  # views: no copy
             coeffs.append(f)
     H = bkend.concatenate(blocks, axis=1)
 
@@ -306,6 +414,7 @@ def _balance_from_windows(fam_views, fam_scales, fam_X0, weights, dt,
     Phi, col = None, 0
     flat_views = [v for views in fam_views for v in views]
     for win, f in zip(flat_views, coeffs):
+        win = _materialize(win)
         ncols = win.shape[1]
         contrib = win @ Rt[:, col:col + ncols].T
         Phi = f * contrib if Phi is None else Phi + f * contrib
@@ -326,6 +435,7 @@ def compute_data_driven_balancing(
     family_weights: Any = None,
     rcond: float = 1e-4,
     broadcast: bool = True,
+    quadrature: dict | None = None,
 ):
     r"""
     Data-driven balanced truncation from trajectory data alone (balanced
@@ -403,6 +513,27 @@ def compute_data_driven_balancing(
         checkpoints are too nearly collinear to carry information, and
         retaining them puts grid-scale noise into :math:`\Psi`.
     :type rcond: float
+    :param quadrature: time quadrature for non-uniformly sampled data.
+        ``None`` (default) assumes a uniform ``pool.time`` and uses windows of
+        consecutive snapshots with the rectangle rule ``dt``.  Otherwise a dict
+
+        * ``nodes``, ``weights`` -- a rule on the window horizon
+          :math:`\tau \in [0, T_w]` (e.g. :func:`composite_gauss_legendre`,
+          fine where the dynamics are fast);
+        * ``checkpoint_times`` -- checkpoint times, each a sample time of
+          ``pool.time`` (replaces ``n_checkpoints``/``checkpoint_stride``);
+        * ``interp_order`` (default 6) -- points of the local Lagrange
+          interpolation.
+
+        Every window is then evaluated at the same :math:`\tau` nodes,
+        :math:`x(t_c + \tau_q)`, by local Lagrange interpolation of the
+        samples (which may be unevenly spaced), and scaled by
+        :math:`\sqrt{\omega_q}`.  All windows sharing one :math:`\tau`-grid
+        is what keeps :math:`G` a Gramian; the weights replace ``dt``
+        throughout.  With nodes at the sample offsets and ``weights = dt`` on
+        a uniform grid this reproduces the default path to round-off.
+        Windows are rebuilt when needed rather than stored.
+    :type quadrature: dict or None
     :param broadcast: if ``True`` (default), ``Phi``, ``Psi`` and ``Sigma`` are
         broadcast to every rank; otherwise they live only on root
     :type broadcast: bool
@@ -449,9 +580,33 @@ def compute_data_driven_balancing(
     Phi = Psi = Sig = info = None
     if on_root:
         n_traj, _, nt = X_all.shape
-        dt = float(pool.time[1] - pool.time[0])
-        ks = _checkpoint_indices(nt, n_checkpoints, checkpoint_stride)
-        L = nt - ks[-1]
+        if quadrature is None:
+            dt = float(pool.time[1] - pool.time[0])
+            ks = _checkpoint_indices(nt, n_checkpoints, checkpoint_stride)
+            L = nt - ks[-1]
+        else:
+            import numpy as np
+
+            t_h = np.asarray(bkend.to_numpy(pool.time), dtype=float)
+            tau = np.asarray(quadrature["nodes"], dtype=float)
+            omega = np.asarray(quadrature["weights"], dtype=float)
+            if tau.shape != omega.shape or np.any(omega <= 0):
+                raise ValueError("quadrature nodes/weights must match and "
+                                 "weights be positive.")
+            tol = 1e-9 * max(t_h[-1] - t_h[0], 1.0)
+            ks = []
+            for tc in quadrature["checkpoint_times"]:
+                i = int(np.argmin(np.abs(t_h - tc)))
+                if abs(t_h[i] - tc) > tol:
+                    raise ValueError(f"checkpoint time {tc:g} is not a sample "
+                                     f"time of pool.time.")
+                ks.append(i)
+            order = int(quadrature.get("interp_order", 6))
+            stencils = {k: lagrange_stencils(t_h, t_h[k] + tau, order)
+                        for k in ks}
+            sqrt_w = np.sqrt(omega)
+            dt = 1.0          # the weights are folded into the windows
+            L = len(tau)
 
         # Candidate initial conditions: every (trajectory, checkpoint) pair.
         # A window is a scaled slice of the training data, so it is kept as a
@@ -466,7 +621,14 @@ def compute_data_driven_balancing(
                 scale = 1.0 / nrm if (normalize and nrm > 0.0) else 1.0
                 ics.append(scale * col)
                 norms.append(nrm)
-                views.append(X_all[j, :, k:k + L])
+                if quadrature is None:
+                    views.append(X_all[j, :, k:k + L])
+                else:
+                    st, Wst = stencils[k]
+                    views.append(
+                        lambda _X=X_all[j], _s=st, _W=Wst:
+                        _interpolated_window(_X, _s, _W, sqrt_w)
+                    )
                 scales.append(scale)
 
         if families is not None:
@@ -509,7 +671,10 @@ def compute_data_driven_balancing(
             fam_views, fam_scales, fam_X0, w, dt, rank_M, rcond
         )
         info.update(
-            checkpoints=ks, window_length=L, dt=dt, weights=w,
+            checkpoints=ks, window_length=L,
+            dt=dt if quadrature is None else None,
+            quadrature=None if quadrature is None else dict(
+                nodes=tau, weights=omega, interp_order=order), weights=w,
             n_dropped=len(dropped),
             family_amplitudes=[[norms[i] for i in g] for g in groups],
         )

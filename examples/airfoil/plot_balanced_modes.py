@@ -25,7 +25,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from plot_baseflow import rd_bu_r_with_white_center
-from rom_domain import X_BOUNDS, Y_BOUNDS, vorticity
+from rom_domain import X_BOUNDS, Y_BOUNDS, crop_mask, vorticity
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -43,6 +43,8 @@ def main():
     Sig, sqrt_w = bal["Sigma"], bal["sqrt_w"]
     with np.load(str(bal["baseflow"])) as snap:
         coords = {c: snap[c] for c in ("xu", "yu", "xv", "yv", "xi", "eta")}
+    dmask = crop_mask(coords)
+    full = bal["Phi"].shape[0] == dmask.size     # full-mesh balancing?
     cmap = rd_bu_r_with_white_center()
 
     n = len(args.modes)
@@ -51,7 +53,7 @@ def main():
     for row, m in enumerate(args.modes):
         for col, (name, key) in enumerate((("\\Phi", "Phi"), ("\\Psi", "Psi"))):
             field = np.ascontiguousarray(bal[key][:, m - 1])/sqrt_w
-            X, Y, om = vorticity(field, coords)
+            X, Y, om = vorticity(field[dmask] if full else field, coords)
             view = ((X >= args.xlim[0]) & (X <= args.xlim[1])
                     & (Y >= args.ylim[0]) & (Y <= args.ylim[1]))
             lim = float(np.percentile(np.abs(om[view]), 99.5)) or 1.0
@@ -68,7 +70,9 @@ def main():
     fig.suptitle("Balanced modes (vorticity; trial $\\Phi$ left, test $\\Psi$ "
                  "right)", fontsize=13)
     os.makedirs(os.path.join(HERE, "figures"), exist_ok=True)
-    out = os.path.join(HERE, "figures", "airfoil_balanced_modes.png")
+    tag = os.path.basename(os.path.normpath(args.balancing))
+    out = os.path.join(HERE, "figures", f"airfoil_modes_{tag}_"
+                       f"{min(args.modes)}-{max(args.modes)}.png")
     fig.savefig(out, dpi=150)
     print(f"saved -> {out}")
 

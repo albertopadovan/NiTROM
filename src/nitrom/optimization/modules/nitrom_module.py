@@ -10,6 +10,7 @@ from ...time_steppers.time_stepper import (
     solve_ivp,
     solve_ivp_dense,
 )
+from ...projections.linear_projection import LinearProjection
 from ...utils import interp_quadratic
 from .base import InferenceModule
 
@@ -126,6 +127,46 @@ class NitromModule(InferenceModule):
         output Jacobian-transpose without forming the ``(no, N)`` matrix.
     :param reg: Tikhonov regularization weight
     :type reg: float
+    :param gram: evaluate the output mismatch in Gram form (see below).
+        ``None`` (default) uses it whenever it applies, ``False`` forces the
+        general path, ``True`` requires it.
+    :type gram: bool or None
+
+    **Gram form.**  With a :class:`LinearProjection` (decoder
+    :math:`\hat{q} = \Phi S z`, :math:`S = (\Psi^\top\Phi)^{-1}`) and a
+    FOM whose output is the state (``fom.output_is_state = True``), the
+    full-space mismatch expands exactly as
+
+    .. math::
+
+        \lVert x - \Phi S z\rVert^2 = \lVert x\rVert^2
+            - 2\,(Sz)^\top(\Phi^\top x) + (Sz)^\top(\Phi^\top\Phi)(Sz),
+
+    and the adjoint source and decoder gradient only ever need
+    :math:`\Phi^\top X`, :math:`X (SZ)^\top` and :math:`\Phi^\top\Phi`.
+    That is the same full-space error -- the part of the data outside
+    :math:`\mathrm{span}(\Phi)` still enters through :math:`\lVert x\rVert^2`
+    -- but neither the reconstruction nor the error is ever stored as an
+    ``(ntraj, N, nt)`` array.  :math:`\lVert x\rVert^2` is computed once, and
+    :math:`\Phi^\top X` is reused while :math:`\Phi` does not change (e.g.
+    while the bases are frozen).
+
+    .. note::
+
+        The Gram form **requires linearity**: a decoder that is linear in
+        :math:`z` (:class:`LinearProjection`) and an output that is the state
+        itself (the FOM sets ``output_is_state = True``).  Any other
+        combination -- a nonlinear decoder, a linear output ``y = C x``, or a
+        nonlinear output map -- uses the general path, which forms the
+        ``(ntraj, N, nt)`` reconstruction and mismatch explicitly.  The two
+        paths compute the same cost and gradients to round-off (see
+        ``tests/optimization/modules/test_nitrom_gram.py``).
+
+        The Gram form obtains the mismatch by cancellation, so its relative
+        round-off is about :math:`\varepsilon\,\lVert x\rVert^2 /
+        \lVert x - \hat x\rVert^2`: negligible at ordinary training errors,
+        but a model reconstructing the data to ~1e-6 would lose digits.  Pass
+        ``gram=False`` to force the general path in that regime.
     """
 
     def __init__(
@@ -140,6 +181,7 @@ class NitromModule(InferenceModule):
         adjoint_method: str = "discrete",
         atol: float = 1e-6,
         rtol: float = 1e-3,
+        gram: bool | None = None,
     ) -> None:
         super().__init__()
 
@@ -165,6 +207,14 @@ class NitromModule(InferenceModule):
         self.adjoint_method = adjoint_method
         self.atol = atol
         self.rtol = rtol
+        gram_ok = (isinstance(registry.projection, LinearProjection)
+                   and bool(getattr(fom, "output_is_state", False)))
+        if gram and not gram_ok:
+            raise ValueError(
+                "gram=True needs a LinearProjection and a FOM with "
+                "output_is_state = True."
+            )
+        self.gram = gram_ok if gram is None else bool(gram)
 
         # Convenience handles into the registry's components
         self.model = registry.model
@@ -229,6 +279,49 @@ class NitromModule(InferenceModule):
             self._data_output_cache = (X, self.fom.compute_output(X))
         return self._data_output_cache[1]
 
+    def _initial_states(self) -> Any:
+        """Contiguous copy of the initial conditions ``X[:, :, 0]``, cached.
+
+        ``X[:, :, 0]`` is a view with a stride of the whole time axis; reading
+        it gathers one element per ``nt`` from the full data array, which at
+        large ``N`` costs as much as the rest of a cost evaluation (1.7 s of
+        3.4 s for 9 x 673800 x 200).  The data never changes, so gather once.
+        """
+        X = self.training_data.X
+        cached = getattr(self, "_x0_cache", None)
+        if cached is None or cached[0] is not X:
+            self._x0_cache = (X, self.backend.ascontiguous(X[:, :, 0]))
+        return self._x0_cache[1]
+
+    def _gram_data(self) -> Any:
+        """``||x_j(t)||^2`` of the training data, ``(ntraj, nt)``, cached."""
+        X = self.training_data.X
+        cached = getattr(self, "_gram_data_cache", None)
+        if cached is None or cached[0] is not X:
+            self._gram_data_cache = (X, self.backend.sum(X * X, axis=1))
+        return self._gram_data_cache[1]
+
+    def _gram_phi(self) -> tuple:
+        r"""``(Phi^T X, Phi^T Phi)`` for the current :math:`\Phi`.
+
+        ``Phi^T X`` is ``(ntraj, r, nt)``: one GEMM that reads the data once.
+        It is reused for as long as :math:`\Phi` is unchanged -- checked
+        exactly against a stored copy -- which is every evaluation while the
+        bases are frozen.
+        """
+        bkend = self.backend
+        X = self.training_data.X
+        Phi = self.projection.Phi
+        cached = getattr(self, "_gram_phi_cache", None)
+        if (cached is not None and cached[0] is X
+                and cached[1].shape == Phi.shape
+                and bool(bkend.array_equal(cached[1], Phi))):
+            return cached[2], cached[3]
+        PhiTX = bkend.stack([Phi.T @ X[j] for j in range(X.shape[0])], axis=0)
+        PhiTPhi = Phi.T @ Phi
+        self._gram_phi_cache = (X, bkend.copy(Phi), PhiTX, PhiTPhi)
+        return PhiTX, PhiTPhi
+
     def _output_vjp(self, e: Any, Xhat: Any) -> Any:
         r"""Apply the transpose of the output Jacobian to ``e``.
 
@@ -276,7 +369,7 @@ class NitromModule(InferenceModule):
         self._sync_to_registry()
 
         # Encode the initial conditions to the latent space.
-        z0 = self.projection.encode(self.training_data.X[:, :, 0])  # (ntraj, r)
+        z0 = self.projection.encode(self._initial_states())  # (ntraj, r)
 
         # Integrate the latent dynamics over the trajectory time grid.
         dt = (self.time[1] - self.time[0]) / self.n_substeps
@@ -294,10 +387,17 @@ class NitromModule(InferenceModule):
         )  # (ntraj, r, nt)
 
         # Weighted sum-of-squares output mismatch.
-        e = self._data_output() - self.fom.compute_output(
-            self._decode_trajectories(Z)
-        )
-        per_traj = bkend.sum(e * e, axis=(1, 2)) / self.weights.reshape(-1)
+        if self.gram:
+            SZ = self.projection.S @ Z  # (ntraj, r, nt)
+            PhiTX, PhiTPhi = self._gram_phi()
+            e2 = (self._gram_data() - 2.0 * bkend.sum(SZ * PhiTX, axis=1)
+                  + bkend.sum(SZ * (PhiTPhi @ SZ), axis=1))  # (ntraj, nt)
+            per_traj = bkend.sum(e2, axis=1) / self.weights.reshape(-1)
+        else:
+            e = self._data_output() - self.fom.compute_output(
+                self._decode_trajectories(Z)
+            )
+            per_traj = bkend.sum(e * e, axis=(1, 2)) / self.weights.reshape(-1)
         cost = per_traj.sum()
 
         # Regularization on the quadratic tensor H.  It is a global term added
@@ -335,6 +435,7 @@ class NitromModule(InferenceModule):
         if nt < 2:
             return None
 
+        time = np.asarray(self.backend.to_numpy(time), dtype=float)
         t0, tf = float(time[0]), float(time[-1])
         span = tf - t0
         if span <= 0.0:
@@ -386,6 +487,9 @@ class NitromModule(InferenceModule):
 
             X = self.training_data.X  # (ntraj, N, nt)
             time = self.time  # (nt,)
+            # Host copy of the time grid: float() of a device scalar forces a
+            # device sync, once per measurement interval otherwise.
+            time_h = np.asarray(bkend.to_numpy(time), dtype=float)
             dev = bkend.device_of(X)
             dtype = X.dtype
             ntraj, _, nt = X.shape
@@ -394,7 +498,8 @@ class NitromModule(InferenceModule):
             w = (1.0 / self.weights.reshape(-1)).reshape(-1, 1, 1)  # (ntraj, 1, 1)
 
             # --- forward solve at the measurement times --------------------
-            z0 = self.projection.encode(X[:, :, 0])  # (ntraj, r)
+            X0 = self._initial_states()  # (ntraj, N), contiguous
+            z0 = self.projection.encode(X0)  # (ntraj, r)
             dt = (time[1] - time[0]) / self.n_substeps
 
             # When the snapshot grid lands on sub-steps, one dense solve serves
@@ -404,7 +509,7 @@ class NitromModule(InferenceModule):
             want_stages = dense_dt is not None and self.adjoint_method == "discrete"
             if dense_dt is not None:
                 dense = solve_ivp_dense(
-                    self.model.evaluate_rhs, z0, float(time[0]), float(time[-1]),
+                    self.model.evaluate_rhs, z0, float(time_h[0]), float(time_h[-1]),
                     dense_dt, self.time_stepper, save_every=1,
                     with_stages=want_stages, external_forcing=ef,
                 )
@@ -418,27 +523,44 @@ class NitromModule(InferenceModule):
                 )  # (ntraj, r, nt)
 
             # --- output residual and adjoint sources at each snapshot ------
-            Xhat = self._decode_trajectories(Z)  # (ntraj, N, nt)
-            e = self._data_output() - self.fom.compute_output(Xhat)
-            # Weighted full-space output seed v_i = -2 alpha_j^{-1} C^T e_i.
-            cw = -2.0 * w * self._output_vjp(e, Xhat)  # (ntraj, N, nt)
-            N = cw.shape[1]
+            if self.gram:
+                # Gram form: with the seed v = -2 w (x - Phi S z),
+                #   src = S^T Phi^T v = -2 w S^T (Phi^T x - Phi^T Phi S z),
+                #   sum v (S z)^T = -2 [sum_j w_j X_j (S Z_j)^T
+                #                       - Phi sum_j w_j (S Z_j)(S Z_j)^T].
+                S = self.projection.S
+                SZ = S @ Z  # (ntraj, r, nt)
+                PhiTX, PhiTPhi = self._gram_phi()
+                src = -2.0 * w * (S.T @ (PhiTX - PhiTPhi @ SZ))
+                wSZ = w * SZ
+                W_out = X[0] @ bkend.permute(wSZ[0], (1, 0))
+                for j in range(1, ntraj):
+                    W_out = W_out + X[j] @ bkend.permute(wSZ[j], (1, 0))
+                B = bkend.sum(wSZ @ bkend.permute(SZ, (0, 2, 1)), axis=0)
+                W_out = -2.0 * (W_out - self.projection.Phi @ B)  # (N, r)
+                proj_grads = list(self.projection.vjp_decode_from_outer(W_out))
+            else:
+                Xhat = self._decode_trajectories(Z)  # (ntraj, N, nt)
+                e = self._data_output() - self.fom.compute_output(Xhat)
+                # Weighted full-space output seed v_i = -2 alpha_j^{-1} C^T e_i.
+                cw = -2.0 * w * self._output_vjp(e, Xhat)  # (ntraj, N, nt)
+                N = cw.shape[1]
 
-            # Flatten the (trajectory, snapshot) axes into a single batch.
-            Z_flat = bkend.permute(Z, (0, 2, 1)).reshape(-1, r)  # (ntraj*nt, r)
-            cw_flat = bkend.permute(cw, (0, 2, 1)).reshape(-1, N)  # (ntraj*nt, N)
+                # Flatten the (trajectory, snapshot) axes into a single batch.
+                Z_flat = bkend.permute(Z, (0, 2, 1)).reshape(-1, r)  # (ntraj*nt, r)
+                cw_flat = bkend.permute(cw, (0, 2, 1)).reshape(-1, N)  # (ntraj*nt, N)
 
-            # Latent adjoint source: decoder Jacobian-transpose D_z^T applied to
-            # the weighted output seed.
-            src = bkend.permute(
-                self.projection.vjp_decode_state(Z_flat, cw_flat).reshape(
-                    ntraj, nt, r
-                ),
-                (0, 2, 1),
-            )  # (ntraj, r, nt)
+                # Latent adjoint source: decoder Jacobian-transpose D_z^T
+                # applied to the weighted output seed.
+                src = bkend.permute(
+                    self.projection.vjp_decode_state(Z_flat, cw_flat).reshape(
+                        ntraj, nt, r
+                    ),
+                    (0, 2, 1),
+                )  # (ntraj, r, nt)
 
-            # Decoder parameter gradient (vjp_decode sums over its batch).
-            proj_grads = list(self.projection.vjp_decode(Z_flat, cw_flat))
+                # Decoder parameter gradient (vjp_decode sums over its batch).
+                proj_grads = list(self.projection.vjp_decode(Z_flat, cw_flat))
 
             # --- backward adjoint sweep --------------------------------------
             model_grads = [bkend.zeros_like(p) for p in self.model.inner_params()]
@@ -454,7 +576,7 @@ class NitromModule(InferenceModule):
 
                     # Base flow over [t_{k-1}, t_k]: slice the dense solve when
                     # we have one, else re-integrate the interval.
-                    t0i, tfi = float(time[k - 1]), float(time[k])
+                    t0i, tfi = float(time_h[k - 1]), float(time_h[k])
                     delta = tfi - t0i
                     h = delta / self.n_substeps
                     if dense is not None:
@@ -506,7 +628,7 @@ class NitromModule(InferenceModule):
                     lam = lam + src[:, :, k]
 
                     # Re-integrate the base flow over [t_{k-1}, t_k].
-                    t0i, tfi = float(time[k - 1]), float(time[k])
+                    t0i, tfi = float(time_h[k - 1]), float(time_h[k])
                     delta = tfi - t0i
                     a = 0.5 * delta
                     if dense is not None:
@@ -577,7 +699,7 @@ class NitromModule(InferenceModule):
 
             # Measurement at t_0, then encoder gradient seeded with lambda(0).
             lam = lam + src[:, :, 0]
-            for k, g in enumerate(self.projection.vjp_encode(X[:, :, 0], lam)):
+            for k, g in enumerate(self.projection.vjp_encode(X0, lam)):
                 proj_grads[k] = proj_grads[k] + g
 
             # Add regularization gradient on H if reg > 0.0 (see forward()).

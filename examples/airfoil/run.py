@@ -29,8 +29,6 @@ from __future__ import annotations
 import argparse
 import os
 
-import numpy as np
-
 from incompreso import parse_input_file
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -56,7 +54,10 @@ def main():
             f"initial condition already reached t0, so there is nothing to "
             f"march.  Raise t1 in the config or pass --t1.")
 
-    print(f"start: t = {t0:g}, ||q|| = {np.linalg.norm(np.asarray(sim['q0'])):.6f}, "
+    # q0 may live on the GPU (CuPy); reduce on-device and pull back only the scalar
+    q0 = sim["q0"]
+    q0_norm = float((q0 * q0).sum()) ** 0.5
+    print(f"start: t = {t0:g}, ||q|| = {q0_norm:.6f}, "
           f"snapshot numbering continues from {sim['start_step']}", flush=True)
     print(f"marching t = {t0:g} -> {t1:g}  ({int(round((t1 - t0)/dt))} steps of "
           f"dt = {dt:g}), saving every {mjump} steps (= {mjump*dt:g} time "

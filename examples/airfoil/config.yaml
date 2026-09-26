@@ -55,7 +55,7 @@ time_stepper:
   dt: 2e-3
   scheme: RK2
   t0: 0.0
-  t1: 60.0        # base-flow march: ~190 time units past the t = 20 restart
+  t1: 120.0        # base-flow march: ~190 time units past the t = 20 restart
   mjump: 2500      # a snapshot every 5 time units (2500 * dt = 5.0)
 
 initial_condition:
@@ -64,7 +64,7 @@ initial_condition:
   # the march resumes at the right time and keeps numbering contiguous.
   # To extend a finished march, point this at the newest snapshot instead.
   type: file
-  path: baseflow_seed.npz
+  path: bflowdata/snapshot_000012.npz
   # Cold start from the uniform freestream:
   # type: uniform
   # values:

@@ -493,8 +493,11 @@ def solve_ivp_dense(
             else None
         )
 
+    # Host copy of the grid: float() of a device scalar would force a device
+    # sync on every step.
+    tsim_h = bkend.to_numpy(tsim)
     for i in range(1, nt_sim + 1):
-        t = float(tsim[i - 1])
+        t = float(tsim_h[i - 1])
         x, stages_g, _stages_k = _rk_step(
             f, t, x, dt, tableau, newton_tol, newton_max_iter, args, kwargs,
         )
@@ -571,10 +574,12 @@ def solve_adjoint_ivp_discrete(
     if Zint.ndim == 3:
         eye = eye[None]  # (1, n, n) for batch broadcasting
         
+    # Host copy of the sub-grid (see solve_ivp_dense).
+    sub_t_h = bkend.to_numpy(sub_t)
     for j in range(n_substeps - 1, -1, -1):
         z_n = Zint[:, :, j]
-        t_n = float(sub_t[j])
-        h_j = float(sub_t[j+1] - sub_t[j])
+        t_n = float(sub_t_h[j])
+        h_j = float(sub_t_h[j+1] - sub_t_h[j])
         
         # 1. Forward stages: reuse the cached ones, or rebuild them locally.
         if stages_G is not None:

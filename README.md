@@ -158,6 +158,16 @@ container that returns a scalar cost from `forward()` and its **analytic** gradi
 | `PolyManifoldInfModule` | $J = \sum_i w_i\lVert x_i - \mathrm{decode}(z_i)\rVert^2 + \lambda\sum_k\lVert A_k\rVert^2$ — nonlinear-manifold reconstruction error |
 | `NitromModule` | $J = \sum_j \alpha_j^{-1}\sum_i \lVert y^{(j)}(t_i) - \hat y^{(j)}(t_i)\rVert^2$ — output mismatch of the **time-marched** ROM, differentiated by the adjoint |
 
+> **Large state dimensions: the Gram path of `NitromModule`.** When the decoder is linear
+> (`LinearProjection`) and the output is the state (the FOM sets `output_is_state = True`),
+> the mismatch is evaluated as
+> $\lVert x\rVert^2 - 2(Sz)^\top\Phi^\top x + (Sz)^\top\Phi^\top\Phi(Sz)$,
+> $S = (\Psi^\top\Phi)^{-1}$, so the `(ntraj, N, nt)` reconstruction and error are never
+> stored. It is the same full-space cost, just not materialized. **It requires both
+> linearities**; a nonlinear decoder, a linear output $y = Cx$, or a nonlinear output map
+> falls back to the general path automatically. Because it works by cancellation, pass
+> `gram=False` if a model ever fits the data to ~1e-6 relative accuracy or better.
+
 Common controls on any module:
 
 * `set_unlearnable("B")` / `set_learnable(...)` — freeze parameters (their gradients are

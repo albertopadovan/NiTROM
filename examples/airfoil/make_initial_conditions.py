@@ -25,6 +25,10 @@ is strongly stretched and an unweighted norm would let the huge far-field
 cells dominate.  Dual-cell widths come from centred differences of the
 staggered coordinate vectors, which is exact wherever the grid is uniform.
 
+Runs on either incompreso backend (``INCOMPRESO_BACKEND``): the projection
+and divergence check execute on the solver's device, everything else --
+weights, norms, saved arrays, plots -- on host NumPy.
+
 Usage (needs the incompreso venv, with NiTROM on PYTHONPATH):
     PYTHONPATH=../../src ../../../incompreso/.venv/bin/python \
         make_initial_conditions.py [--component u] [--norm W]
@@ -43,6 +47,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from incompreso import parse_input_file
+from incompreso.backend import GPU, to_backend, to_numpy
 
 from plot_baseflow import forcing_locations, rd_bu_r_with_white_center
 
@@ -52,26 +57,35 @@ GAUSS_WIDTH = 1250.0                  # the 1250 of equation (41)
 BETAS = (0.1, 1.0, 2.0)               # section 5.1
 
 
+def staggered_coords(mesh):
+    """Interior (xu, yu, xv, yv) as host arrays, whatever the backend."""
+    return tuple(to_numpy(c)[1:-1]
+                 for c in (mesh.xu, mesh.yu, mesh.xv, mesh.yv))
+
+
 def cell_volume_weights(mesh):
-    """Diagonal of W: local dual-cell area over the smallest one.
+    """Diagonal of W: local dual-cell area over the smallest one."""
+    V = cell_volumes(mesh)
+    return V/V.min()
+
+
+def cell_volumes(mesh):
+    """Dual-cell area of every u and v DOF, stacked like the state vector.
 
     u and v live on different staggered grids, so each gets its own dual
     cell.  ``np.gradient`` of a coordinate vector returns the centred
     spacing (x[i+1] - x[i-1])/2, which is the finite-volume dual width and
     is exact in the uniform near-body region.
     """
-    xu, yu = np.asarray(mesh.xu)[1:-1], np.asarray(mesh.yu)[1:-1]
-    xv, yv = np.asarray(mesh.xv)[1:-1], np.asarray(mesh.yv)[1:-1]
+    xu, yu, xv, yv = staggered_coords(mesh)
     Vu = np.outer(np.gradient(yu), np.gradient(xu)).ravel()
     Vv = np.outer(np.gradient(yv), np.gradient(xv)).ravel()
-    V = np.concatenate([Vu, Vv])
-    return V/V.min()
+    return np.concatenate([Vu, Vv])
 
 
 def gaussian_profile(mesh, x0, y0, component):
     """The raw equation-(41) Gaussian, on the u or v staggered grid."""
-    xu, yu = np.asarray(mesh.xu)[1:-1], np.asarray(mesh.yu)[1:-1]
-    xv, yv = np.asarray(mesh.xv)[1:-1], np.asarray(mesh.yv)[1:-1]
+    xu, yu, xv, yv = staggered_coords(mesh)
     n_u, n_v = len(yu)*len(xu), len(yv)*len(xv)
     q = np.zeros(n_u + n_v)
     if component == "u":
@@ -85,8 +99,7 @@ def gaussian_profile(mesh, x0, y0, component):
 
 def split(mesh, q):
     """(u, v) fields reshaped from the stacked state vector."""
-    xu, yu = np.asarray(mesh.xu)[1:-1], np.asarray(mesh.yu)[1:-1]
-    xv, yv = np.asarray(mesh.xv)[1:-1], np.asarray(mesh.yv)[1:-1]
+    xu, yu, xv, yv = staggered_coords(mesh)
     n_u = len(yu)*len(xu)
     return (q[:n_u].reshape(len(yu), len(xu)),
             q[n_u:].reshape(len(yv), len(xv)),
@@ -119,14 +132,21 @@ def main():
     # amplify the "perturbation" by ~365x.  Perturbations obey homogeneous
     # BCs, so what we want is the linear part, P(q) - P(0).  That it IS the
     # linear part is checked below rather than assumed.
-    n_dof = np.shape(sim["q0"])[0]
-    P0 = np.asarray(ib.enforce_constraints(0.0, np.zeros(n_dof)),
-                    dtype=np.float64)
+    def enforce(q):
+        """``enforce_constraints`` on the solver's device, host in and out."""
+        return to_numpy(ib.enforce_constraints(0.0, to_backend(q))).astype(
+            np.float64, copy=False)
+
+    def div_norm(q):
+        return float(np.linalg.norm(to_numpy(spops.D @ to_backend(q))))
+
+    print(f"backend: {'GPU (CuPy)' if GPU else 'CPU (NumPy)'}")
+    n_dof = sim["q0"].shape[0]
+    P0 = enforce(np.zeros(n_dof))
 
     def leray(q):
         """Modified Leray projection of a PERTURBATION field."""
-        return np.asarray(ib.enforce_constraints(0.0, q),
-                          dtype=np.float64) - P0
+        return enforce(q) - P0
 
     w = cell_volume_weights(mesh)
     sqrt_w = np.sqrt(w)
@@ -139,11 +159,8 @@ def main():
     # linear part and every profile below would be wrong.
     rng = np.random.default_rng(0)
     g = rng.standard_normal(n_dof)*1e-3
-    qb = np.asarray(sim["q0"], dtype=np.float64)
-    d1, d2 = leray(g), (np.asarray(ib.enforce_constraints(0.0, qb + g),
-                                   dtype=np.float64)
-                        - np.asarray(ib.enforce_constraints(0.0, qb),
-                                     dtype=np.float64))
+    qb = to_numpy(sim["q0"]).astype(np.float64, copy=False)
+    d1, d2 = leray(g), enforce(qb + g) - enforce(qb)
     rel = np.linalg.norm(d1 - d2)/np.linalg.norm(d1)
     if rel > 1e-6:
         raise SystemExit(f"enforce_constraints is not affine (base-state "
@@ -165,8 +182,7 @@ def main():
 
         # ``evaluate_divergence_integral`` reads the mesh's own field state,
         # so use the assembled divergence matrix to test an arbitrary vector.
-        d_raw = np.linalg.norm(spops.D @ raw)
-        d_prj = np.linalg.norm(spops.D @ proj)
+        d_raw, d_prj = div_norm(raw), div_norm(proj)
         kept = norm(proj)/norm(raw)
         print(f"{label:>15}{x0:>9.4f}{y0:>9.4f}{d_raw:>14.3e}{d_prj:>14.3e}"
               f"{kept:>13.4f}")

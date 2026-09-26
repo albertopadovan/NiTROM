@@ -117,6 +117,19 @@ class LinearProjection(Projection):
         else:
             # Batched: v is (m, N), z is (m, r) -> v.T @ (z @ S.T) -> (N, r)
             w = v.T @ (z @ self.S.T)  # (N, r)
+        return self.vjp_decode_from_outer(w)
+
+    def vjp_decode_from_outer(self, w: Any) -> tuple:
+        r"""
+        Decoder parameter VJP given the accumulated outer product
+        :math:`w = \sum_m v_m (S z_m)^\top`, shape ``(N, r)``.
+
+        :meth:`vjp_decode` forms ``w`` from full-space seeds ``v``; a caller
+        that can assemble ``w`` more cheaply (e.g. without materializing the
+        seeds) calls this directly, so both routes share the same formula.
+
+        :returns: ``(grad_Phi, grad_Psi)``
+        """
         # grad_Phi = w - Psi @ S^T @ Phi^T @ w
         PhiTw = self.Phi.T @ w  # (r, r)
         grad_Phi = w - self.Psi @ (self.S.T @ PhiTw)  # (N, r)

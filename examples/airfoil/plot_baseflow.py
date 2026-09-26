@@ -32,13 +32,14 @@ FIG_DIR = HERE / "figures"
 AIRFOIL_THICKNESS = 0.12
 AIRFOIL_N_POINTS = 200
 AIRFOIL_ALPHA = 6.0
-FORCING_STANDOFF = 0.015
+# Section 5.1 of the GasNiTROM paper: (x/c, y/c) in the body frame, with x/c
+# measured from the leading edge along the chord and y/c normal to it.
 FORCING_STATIONS = (
-    ("leading edge", 0.02),
-    ("midchord", 0.50),
-    ("trailing edge", 0.98),
+    ("leading edge", 0.02, 0.04),
+    ("midchord", 0.50, 0.07),
+    ("trailing edge", 0.98, 0.02),
 )
-FORCING_X_OVER_C = dict(FORCING_STATIONS)
+FORCING_X_OVER_C = {label: xc for label, xc, _ in FORCING_STATIONS}
 
 BASEFLOW_XLIM = (-2.0, 5.0)
 BASEFLOW_YLIM = (-1.5, 1.5)
@@ -53,25 +54,27 @@ def rd_bu_r_with_white_center() -> ListedColormap:
 
 
 def forcing_locations() -> list[tuple[str, float, float]]:
-    """Return the physical centers of the three forcing stations."""
-    xi0, _, _ = make_airfoil(AIRFOIL_THICKNESS, AIRFOIL_N_POINTS, 0.0)
-    x_upper = to_numpy(xi0)[:AIRFOIL_N_POINTS] + 0.5
+    """Return the physical centers of the three forcing stations.
+
+    The body-frame (x/c, y/c) of each station is shifted so the half-chord
+    sits at the origin and then rotated nose-up by the angle of attack, the
+    same map that takes the leading edge to the first airfoil marker.
+    """
+    alpha = np.deg2rad(AIRFOIL_ALPHA)
+    ca, sa = np.cos(alpha), np.sin(alpha)
 
     xi, eta, _ = make_airfoil(AIRFOIL_THICKNESS, AIRFOIL_N_POINTS, AIRFOIL_ALPHA)
     xi, eta = to_numpy(xi), to_numpy(eta)
+    i_le = int(np.argmin(xi))
+    if not np.allclose((xi[i_le], eta[i_le]), (-0.5 * ca, 0.5 * sa), atol=1e-6):
+        raise RuntimeError("airfoil rotation convention changed; the forcing "
+                           "stations would no longer sit above the surface")
 
     locations = []
-    for label, chord_fraction in FORCING_STATIONS:
-        idx = int(np.argmin(np.abs(x_upper - chord_fraction)))
-        idx = min(max(idx, 1), AIRFOIL_N_POINTS - 2)
-
-        tx = xi[idx + 1] - xi[idx - 1]
-        ty = eta[idx + 1] - eta[idx - 1]
-        tangent_norm = np.hypot(tx, ty)
-        nx, ny = -ty / tangent_norm, tx / tangent_norm
-        x0 = xi[idx] + FORCING_STANDOFF * nx
-        y0 = eta[idx] + FORCING_STANDOFF * ny
-        locations.append((label, float(x0), float(y0)))
+    for label, xc, yc in FORCING_STATIONS:
+        xb = xc - 0.5
+        locations.append((label, float(xb * ca + yc * sa),
+                          float(-xb * sa + yc * ca)))
 
     return locations
 

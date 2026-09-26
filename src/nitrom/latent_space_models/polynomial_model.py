@@ -101,6 +101,38 @@ class PolynomialModel(Model):
         """Return the current parameter tensors as a list."""
         return [getattr(self, name) for name in self.param_names]
 
+    def _torch_flat_operators(self) -> list | None:
+        """``A_k`` flattened to ``(r, r**k)``, for the torch matmul fast path.
+
+        On a GPU the latent dynamics are tiny (``r`` ~ 50, a handful of
+        trajectories) and every kernel launch counts.  ``torch.einsum`` spends
+        ~185 us of host time per call decomposing ``'ijk,...j,...k->...i'`` into
+        permute/reshape/clone/bmm -- including a copy of ``H`` every call --
+        against a few us of GPU work.  For degrees 1 and 2 the same contractions
+        are one or two plain matrix products on these flattened views.
+
+        Returns ``None`` (use the einsum path) off torch or for other degrees.
+        The views are rebuilt whenever :meth:`update_params` replaces a tensor.
+        """
+        if not self.backend.is_torch or not set(self.poly_comp) <= {1, 2}:
+            return None
+        tensors = self.get_params()[: len(self.poly_comp)]
+        cache = getattr(self, "_flat_cache", None)
+        if cache is None or any(a is not b for a, b in zip(cache[0], tensors)):
+            flats = [t.reshape(t.shape[0], -1) for t in tensors]
+            self._flat_cache = (list(tensors), flats)
+        return self._flat_cache[1]
+
+    def _masked(self, out: Any, z: Any) -> Any:
+        """Zero the rows of ``out`` whose ``z`` exceeds the blow-up threshold.
+
+        Branch-free, so no host--device sync (``bool(mask.all())`` would stall
+        the GPU on every call).
+        """
+        xp = self.backend.xp
+        mask = (z * z).sum(axis=-1) < self._thresh_sq
+        return xp.where(mask[:, None], out, xp.zeros_like(out))
+
     def _generate_einsum_subscripts(self) -> None:
         """
         Generates the indices for the einsum evaluation of the
@@ -223,6 +255,19 @@ class PolynomialModel(Model):
         f_fun_lst = kwargs.get("external_forcing")
         tensors = self.get_params()
         bkend = self.backend
+
+        # Torch, batched, degrees 1-2, no forcing: plain matrix products
+        # (see :meth:`_torch_flat_operators`) and a sync-free blow-up guard.
+        if z.ndim == 2 and f_fun_lst is None:
+            flats = self._torch_flat_operators()
+            if flats is not None:
+                dzdt = None
+                for k, M in zip(self.poly_comp, flats):
+                    zk = z if k == 1 else (
+                        z[:, :, None] * z[:, None, :]).reshape(z.shape[0], -1)
+                    term = zk @ M.T
+                    dzdt = term if dzdt is None else dzdt + term
+                return self._masked(dzdt, z)
 
         # z is a vector
         if z.ndim == 1:
@@ -382,6 +427,24 @@ class PolynomialModel(Model):
         """
         tensors = self.get_params()
         bkend = self.backend
+
+        # Torch, batched, degrees 1-2: J(Z)^T z as matrix products.  With
+        # G = z @ H_flat reshaped to (B, r, r), G[b, j, k] = sum_i z_i H_ijk,
+        # and the two Jacobian terms are sum_j Z_j G_jk and sum_k G_jk Z_k.
+        if z.ndim == 2:
+            flats = self._torch_flat_operators()
+            if flats is not None:
+                xp = bkend.xp
+                dzdt = None
+                for k, M in zip(self.poly_comp, flats):
+                    if k == 1:
+                        term = z @ M
+                    else:
+                        G = (z @ M).reshape(z.shape[0], z.shape[1], z.shape[1])
+                        term = (xp.bmm(Z[:, None, :], G)[:, 0, :]
+                                + xp.bmm(G, Z[:, :, None])[:, :, 0])
+                    dzdt = term if dzdt is None else dzdt + term
+                return self._masked(dzdt, z)
 
         # z is a vector
         if z.ndim == 1:

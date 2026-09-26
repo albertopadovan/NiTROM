@@ -1,0 +1,77 @@
+# 2D flow past a NACA 0012 airfoil at Re = 600, angle of attack = 6 deg.
+#
+# Uniform freestream (u = 1) enters from the left; the airfoil (unit
+# chord, 12% thickness) is centred at the origin and rotated to a 6-deg
+# angle of attack.  The mesh is stretched to resolve the body and near
+# wake (dx = dy = 5e-3 in the core) and coarsens toward the far field,
+# giving (ny, nx) = (450, 750) and n = 673800 velocity DOFs.
+#
+# This reproduces the configuration of section 5 of the GasNiTROM paper:
+# domain [-5, 16] x [-4, 4], half-chord at the origin, uniform (u, v) =
+# (1, 0) on every boundary except the outflow, which is zero Neumann.
+#
+# t1/mjump below are set for the BASE-FLOW march (see run.py), not for
+# generating training data -- that needs 200 snapshots at dt = 0.2.
+
+mesh:
+  x:
+    breakpoints: [-5, -2, -1, 1, 1.5, 2, 4, 8, 16]
+    spacings: [0.04, 0.02, 0.005, 0.01, 0.02, 0.04, 0.08, 0.16]
+    mirror: false
+  y:
+    breakpoints: [-4, -3, -2, -1, -0.4, 0]
+    spacings: [0.1, 0.04, 0.02, 0.01, 0.005]
+    mirror: true                       # -> y in [-6, 6]
+
+boundary_conditions:
+  u:
+    x0: { type: dirichlet, value: 1.0 }   # inflow
+    x1: { type: neumann }                 # outflow
+    y0: { type: dirichlet, value: 1.0 }   # freestream
+    y1: { type: dirichlet, value: 1.0 }
+  v:
+    x0: { type: dirichlet, value: 0.0 }
+    x1: { type: neumann }
+    y0: { type: dirichlet, value: 0.0 }
+    y1: { type: dirichlet, value: 0.0 }
+
+spatial_operators:
+  Re: 600
+  poisson_solver:
+    type: eigen
+
+immersed_body:
+  geometry:
+    shape: airfoil
+    thickness: 0.12        # max thickness as a fraction of chord
+    n_points: 200           # markers on the upper surface
+    alpha: 6              # angle of attack [deg]
+  # Stationary-body fast path: build and dense-invert the exact Schur
+  # complement once at setup, so each step is a single dense matvec.
+  reference_quantities: [0.0, 0.0, 10, 10]   # body centre + Chebyshev nodes
+  precompute_exact_schur: true
+
+time_stepper:
+  dt: 2e-3
+  scheme: RK2
+  t0: 0.0
+  t1: 60.0        # base-flow march: ~190 time units past the t = 20 restart
+  mjump: 2500      # a snapshot every 5 time units (2500 * dt = 5.0)
+
+initial_condition:
+  # Continue the base-flow march from t = 20 rather than cold-starting.
+  # A FileIC also carries t0 and the snapshot index over from the file, so
+  # the march resumes at the right time and keeps numbering contiguous.
+  # To extend a finished march, point this at the newest snapshot instead.
+  type: file
+  path: baseflow_seed.npz
+  # Cold start from the uniform freestream:
+  # type: uniform
+  # values:
+  #   u: 1.0
+  #   v: 0.0
+
+output:
+  save_path: bflowdata/
+
+diagnostics: true

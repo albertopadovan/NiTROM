@@ -1,13 +1,14 @@
 """Plot base-flow vorticity and the three forcing-station centers.
 
 Usage:
-    python examples/airfoil/plot_baseflow.py
+    python examples/airfoil/plot_baseflow.py [--snapshot PATH]
 
 Writes ``figures/airfoil_baseflow.{png,eps}`` beside this script.
 """
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -93,11 +94,22 @@ def baseflow_vorticity(snapshot: np.lib.npyio.NpzFile):
 
 
 def main() -> None:
-    with np.load(SNAPSHOT_PATH) as snapshot:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--snapshot", type=Path, default=SNAPSHOT_PATH,
+                    help="flow snapshot to plot (default: %(default)s)")
+    ap.add_argument("--full-domain", action="store_true",
+                    help="show the whole mesh instead of the near-body crop")
+    args = ap.parse_args()
+    if not args.snapshot.exists():
+        raise SystemExit(f"{args.snapshot} not found -- pass --snapshot PATH")
+
+    with np.load(args.snapshot) as snapshot:
         X, Y, omega = baseflow_vorticity(snapshot)
         xi, eta = snapshot["xi"], snapshot["eta"]
 
-    fig_b, ax_b = plt.subplots(figsize=(9, 4), constrained_layout=True)
+    # The full domain is 21 x 8, so the near-body aspect ratio would squash it.
+    figsize = (16, 6.5) if args.full_domain else (9, 4)
+    fig_b, ax_b = plt.subplots(figsize=figsize, constrained_layout=True)
     lim = float(np.percentile(np.abs(omega), 99.5))
     levels = np.linspace(-lim, lim, 200)
     cf = ax_b.contourf(
@@ -130,8 +142,12 @@ def main() -> None:
         )
 
     ax_b.set_aspect("equal")
-    ax_b.set_xlim(*BASEFLOW_XLIM)
-    ax_b.set_ylim(*BASEFLOW_YLIM)
+    if args.full_domain:
+        ax_b.set_xlim(float(X.min()), float(X.max()))
+        ax_b.set_ylim(float(Y.min()), float(Y.max()))
+    else:
+        ax_b.set_xlim(*BASEFLOW_XLIM)
+        ax_b.set_ylim(*BASEFLOW_YLIM)
     ax_b.set_xlabel(r"$x / c$")
     ax_b.set_ylabel(r"$y / c$")
     ax_b.xaxis.label.set_fontsize(22)
@@ -156,8 +172,10 @@ def main() -> None:
     cbar.set_ticklabels(new_labels)
 
     FIG_DIR.mkdir(exist_ok=True)
-    f_base = FIG_DIR / "airfoil_baseflow.png"
-    f_base_eps = FIG_DIR / "airfoil_baseflow.eps"
+    # Keep the two views in separate files so one does not clobber the other.
+    stem = "airfoil_baseflow" + ("_full" if args.full_domain else "")
+    f_base = FIG_DIR / f"{stem}.png"
+    f_base_eps = FIG_DIR / f"{stem}.eps"
     fig_b.savefig(f_base, dpi=300)
     fig_b.savefig(f_base_eps)
     plt.close(fig_b)

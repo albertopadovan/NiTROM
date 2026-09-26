@@ -378,21 +378,19 @@ def riemannian_optimize(
             d = [-gk for gk in g]
             direction.reset()
 
-        # For fixed-step optimizers (Adam, SGD), skip line search and take the proposed direction directly (t=1.0)
-        if hasattr(direction, "lr"):
-            t = 1.0
-            xs_new = [retract(xi, t * di, m) for xi, di, m in zip(xs, d, manifolds, strict=True)]
-            f_new = cost_fn(xs_new)
-            g_new = rgrad_fn(xs_new)
-            ls = (t, xs_new, f_new, g_new)
-        else:
-            # Strong-Wolfe line search, Armijo backtracking as the fallback; both
-            # return the new point with its cost and Riemannian gradient.
-            ls = strong_wolfe_line_search(cost_fn, rgrad_fn, xs, d, manifolds, fval, g)
-            if ls is None:
-                ls = _armijo_backtracking(cost_fn, rgrad_fn, xs, d, manifolds, fval, g)
-            if ls is None and allow_increase:
-                ls = _armijo_backtracking_increase(cost_fn, rgrad_fn, xs, d, manifolds, fval, g)
+        # Strong-Wolfe line search, Armijo backtracking as the fallback; both
+        # return the new point with its cost and Riemannian gradient.  This is
+        # applied to EVERY direction rule, Adam and SGD included: their `lr` is
+        # then only the scale of the proposed direction, and the step length is
+        # chosen to satisfy Armijo, so the cost cannot increase.  (Adam and SGD
+        # used to bypass this and take a fixed unit step, which with lr = 1.0
+        # made the cost grow by orders of magnitude on badly scaled problems --
+        # the line search is the whole reason the descent is monotone.)
+        ls = strong_wolfe_line_search(cost_fn, rgrad_fn, xs, d, manifolds, fval, g)
+        if ls is None:
+            ls = _armijo_backtracking(cost_fn, rgrad_fn, xs, d, manifolds, fval, g)
+        if ls is None and allow_increase:
+            ls = _armijo_backtracking_increase(cost_fn, rgrad_fn, xs, d, manifolds, fval, g)
 
         if ls is None:  # both line searches failed -> stop
             print("    [LineSearch Failed] Line search failed completely. Stopping optimization.")

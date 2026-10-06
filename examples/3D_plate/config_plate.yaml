@@ -1,0 +1,96 @@
+# 3D flow past a thin rectangular plate (chord 1, span 1, aspect ratio 1)
+# fixed at alpha = 15 deg, Re = 500 (chord, U_inf = 1).
+#
+# Mesh and plate geometry are those of
+# GreensFunctionPC_Paper_Examples/3D_pitching_plate, but the plate does not
+# move (no body_motion block) and the flow is an open one: uniform
+# (u, v, w) = (1, 0, 0) on the inflow and the four side/top boundaries, zero
+# Neumann on the outflow x = 10.
+# Plate markers: plate_geometry.npz, from generate_plate.py (LE at the
+# origin, rotated nose up about the spanwise axis through the LE).
+#
+# t1/mjump below are for the initial march from the uniform flow (run.py);
+# override them on the command line rather than editing this file.
+
+mesh:
+  x:
+    breakpoints: [-3, -2, -0.25, 1.25, 5, 10]
+    spacings: [0.1, 0.035, 0.0125, 0.035, 0.1]
+  y:
+    breakpoints: [-3, -2, -0.75, 0]
+    spacings: [0.1, 0.035, 0.0125]
+    mirror: true
+  z:
+    breakpoints: [-3, -2, -0.75, 0]
+    spacings: [0.1, 0.035, 0.0125]
+    mirror: true
+  check_equal_min_spacing: true
+
+boundary_conditions:
+  u:
+    x0: { type: dirichlet, value: 1.0 }   # inflow
+    x1: { type: neumann }                 # outflow
+    y0: { type: dirichlet, value: 1.0 }   # freestream
+    y1: { type: dirichlet, value: 1.0 }
+    z0: { type: dirichlet, value: 1.0 }
+    z1: { type: dirichlet, value: 1.0 }
+  v:
+    x0: { type: dirichlet, value: 0.0 }
+    x1: { type: neumann }
+    y0: { type: dirichlet, value: 0.0 }
+    y1: { type: dirichlet, value: 0.0 }
+    z0: { type: dirichlet, value: 0.0 }
+    z1: { type: dirichlet, value: 0.0 }
+  w:
+    x0: { type: dirichlet, value: 0.0 }
+    x1: { type: neumann }
+    y0: { type: dirichlet, value: 0.0 }
+    y1: { type: dirichlet, value: 0.0 }
+    z0: { type: dirichlet, value: 0.0 }
+    z1: { type: dirichlet, value: 0.0 }
+
+spatial_operators:
+  Re: 200
+  poisson_solver:
+    type: eigen
+    verbose: true
+    rtol: 1.0e-8
+
+immersed_body:
+  geometry:
+    shape: file
+    path: plate_geometry.npz             # relative to this file
+  # Transport-map preconditioner: (x0, y0, z0) of the reference ("mother")
+  # cell, snapped to the grid -- it must lie in the uniform fine region,
+  # since its Green's functions are translated to every marker -- and the
+  # number of Chebyshev nodes per direction.  Same as the pitching plate.
+  reference_quantities: [0, 0, 0, 6, 6, 6]
+  gmres_rtol: 1.0e-11
+  # Stationary-body fast path: build and dense-invert the exact Schur
+  # complement once at setup (3 x 6561 = 19683 Poisson solves, a ~3.1 GB
+  # dense inverse on the GPU), then every step is a single dense matvec
+  # instead of a GMRES solve.  Set to false to fall back to GMRES with the
+  # transport-map preconditioner (no setup cost, ~seconds per step).
+  precompute_exact_schur: true
+
+time_stepper:
+  dt: 1e-3
+  scheme: AB2
+  t0: 0.0
+  t1: 70.0
+  mjump: 2000       # a snapshot every 2.5 time units (~0.5 GB each)
+
+initial_condition:
+  # type: uniform
+  # values:
+  #   u: 1.0
+  #   v: 0.0
+  #   w: 0.0
+  # Restart from a saved snapshot instead (carries t0 and numbering over):
+  type: file
+  path: data/snapshot_000030.npz
+
+output:
+  save_path: data/                       # resolved against this file's directory by run.py
+
+diagnostics: true

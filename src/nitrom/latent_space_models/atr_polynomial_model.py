@@ -33,10 +33,15 @@ class AtrPolynomialModel(GasPolynomialModel):
             + \widehat{y}^\top \widehat{B},
 
     which is negative whenever :math:`\lVert \widehat{y} \rVert >
-    \lVert \widehat{B} \rVert / \lambda_{\min}(\tilde{R})`.  Every sufficiently
-    large sublevel set of :math:`\widehat{V}` is therefore a monotonically
-    attracting trapping region, contained in the ball of radius
-    :meth:`trapping_region_radius` about :math:`m`.
+    \lVert \widehat{B} \rVert / \lambda_{\min}(\tilde{R})`, and in particular
+    everywhere outside the ball of radius :math:`\rho` =
+    :meth:`trapping_region_radius` about :math:`m`.  Every sublevel set of
+    :math:`\widehat{V}` that contains that ball is therefore a monotonically
+    attracting trapping region.  The smallest one is an ellipsoid (the metric
+    is :math:`\tilde{Q}`, not the identity), which reaches up to
+    :math:`\rho\sqrt{\kappa(\tilde{Q})}` from :math:`m` --
+    :meth:`trapping_region_containing_radius` -- so it is the larger ball,
+    not the one of radius :math:`\rho`, that contains the trapping region.
 
     The free parameters are ``K``, ``R``, ``Q``, ``S``, ``Bhat``, ``m`` (plus an
     optional input operator ``B``).  The model assembles and stores the
@@ -274,18 +279,24 @@ class AtrPolynomialModel(GasPolynomialModel):
 
     def trapping_region_radius(self) -> float:
         r"""
-        Radius of a ball about ``m`` that contains the attracting trapping
-        region,
+        Radius :math:`\rho` of the ball about ``m`` outside which the Lyapunov
+        function decreases strictly, :math:`\dot{\widehat{V}} < 0`:
 
         .. math::
 
             \rho = \frac{\lVert \widehat{B} \rVert}
                 {\lambda_{\min}(\tilde{R})\,\lambda_{\min}(\tilde{Q})},
 
-        a conservative bound obtained from
-        :math:`\dot{\widehat{V}} \le -\lambda_{\min}(\tilde{R})
+        from :math:`\dot{\widehat{V}} \le -\lambda_{\min}(\tilde{R})
         \lVert \widehat{y} \rVert^2 + \lVert \widehat{B} \rVert
-        \lVert \widehat{y} \rVert` with :math:`\widehat{y} = \tilde{Q}\widehat{z}`.
+        \lVert \widehat{y} \rVert` and :math:`\lVert \widehat{y} \rVert \ge
+        \lambda_{\min}(\tilde{Q}) \lVert \widehat{z} \rVert`, with
+        :math:`\widehat{y} = \tilde{Q}\widehat{z}`.
+
+        This ball contains every point where :math:`\widehat{V}` can grow; it
+        does **not** in general contain the trapping region itself, which is a
+        sublevel set of :math:`\widehat{V}` enclosing the ball -- see
+        :meth:`trapping_region_containing_radius`.
 
         :rtype: float
         """
@@ -293,6 +304,34 @@ class AtrPolynomialModel(GasPolynomialModel):
         lam_R = float(bkend.eigh(0.5 * (self._Rtil + self._Rtil.T))[0].min())
         lam_Q = float(bkend.eigh(0.5 * (self._Qtil + self._Qtil.T))[0].min())
         return float(bkend.vector_norm(self.Bhat)) / (lam_R * lam_Q)
+
+    def trapping_region_containing_radius(self) -> float:
+        r"""
+        Radius of a ball about ``m`` that contains the attracting trapping
+        region,
+
+        .. math::
+
+            \rho_{\mathrm{TR}} = \rho\,\sqrt{\kappa(\tilde{Q})}
+                = \rho\,\sqrt{\lambda_{\max}(\tilde{Q})/\lambda_{\min}(\tilde{Q})},
+
+        with :math:`\rho` = :meth:`trapping_region_radius`.  The smallest
+        sublevel set of :math:`\widehat{V} = \tfrac12 \widehat{z}^\top
+        \tilde{Q} \widehat{z}` that contains the ball of radius :math:`\rho`
+        is :math:`\{\widehat{V} \le \tfrac12 \lambda_{\max}(\tilde{Q})
+        \rho^2\}`; it is forward invariant (on its boundary
+        :math:`\lVert \widehat{z} \rVert \ge \rho`, so
+        :math:`\dot{\widehat{V}} \le 0`) and reaches exactly
+        :math:`\rho_{\mathrm{TR}}` from ``m`` along the eigenvector of
+        :math:`\lambda_{\min}(\tilde{Q})`.  Every trajectory therefore enters
+        and stays in the ball of this radius.
+
+        :rtype: float
+        """
+        bkend = self.backend
+        lam = bkend.eigh(0.5 * (self._Qtil + self._Qtil.T))[0]
+        kappa = float(lam.max()) / float(lam.min())
+        return self.trapping_region_radius() * kappa ** 0.5
 
     # ------------------------------------------------------------------
     # Retraction

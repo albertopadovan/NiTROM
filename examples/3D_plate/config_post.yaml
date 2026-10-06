@@ -1,0 +1,40 @@
+# Post-processing config: the mesh and boundary conditions of config.yaml
+# only -- no spatial operators, no immersed body, no time stepper.  Keep the
+# mesh and BC blocks in sync with config.yaml.  (Plate: config_post_plate.yaml.)
+
+mesh:
+  x:
+    breakpoints: [-3, -2, -0.75, 0.75, 2, 5, 15]     # fine band covers the wing, x in [-0.5, 0.5]
+    spacings: [0.05, 0.025, 0.0125, 0.025, 0.05, 0.1]
+  y:
+    breakpoints: [-4, -3, -1.5, -0.75, 0]
+    spacings: [0.1, 0.05, 0.025, 0.0125]
+    mirror: true
+  z:
+    breakpoints: [-4, -3, -1.5, -0.75, 0]
+    spacings: [0.1, 0.05, 0.025, 0.0125]
+    mirror: true
+  check_equal_min_spacing: true
+
+boundary_conditions:
+  u:
+    x0: { type: dirichlet, value: 1.0 }   # inflow
+    x1: { type: neumann }                 # outflow
+    y0: { type: dirichlet, value: 1.0 }   # freestream
+    y1: { type: dirichlet, value: 1.0 }
+    z0: { type: dirichlet, value: 1.0 }
+    z1: { type: dirichlet, value: 1.0 }
+  v:
+    x0: { type: dirichlet, value: 0.0 }
+    x1: { type: neumann }
+    y0: { type: dirichlet, value: 0.0 }
+    y1: { type: dirichlet, value: 0.0 }
+    z0: { type: dirichlet, value: 0.0 }
+    z1: { type: dirichlet, value: 0.0 }
+  w:
+    x0: { type: dirichlet, value: 0.0 }
+    x1: { type: neumann }
+    y0: { type: dirichlet, value: 0.0 }
+    y1: { type: dirichlet, value: 0.0 }
+    z0: { type: dirichlet, value: 0.0 }
+    z1: { type: dirichlet, value: 0.0 }

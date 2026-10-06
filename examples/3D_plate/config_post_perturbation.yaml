@@ -1,0 +1,40 @@
+# Post-processing setup for PERTURBATION fields (modes, q' = q - q_b): config_post.yaml
+# with homogeneous Dirichlet values, so interpolation to nodes / Q / vorticity
+# do not pick up the u = 1 inflow and freestream of the full flow.
+
+mesh:
+  x:
+    breakpoints: [-3, -2, -0.75, 0.75, 2, 5, 15]     # fine band covers the wing, x in [-0.5, 0.5]
+    spacings: [0.05, 0.025, 0.0125, 0.025, 0.05, 0.1]
+  y:
+    breakpoints: [-4, -3, -1.5, -0.75, 0]
+    spacings: [0.1, 0.05, 0.025, 0.0125]
+    mirror: true
+  z:
+    breakpoints: [-4, -3, -1.5, -0.75, 0]
+    spacings: [0.1, 0.05, 0.025, 0.0125]
+    mirror: true
+  check_equal_min_spacing: true
+
+boundary_conditions:
+  u:
+    x0: { type: dirichlet, value: 0.0 }   # perturbation: homogeneous
+    x1: { type: neumann }                 # outflow
+    y0: { type: dirichlet, value: 0.0 }
+    y1: { type: dirichlet, value: 0.0 }
+    z0: { type: dirichlet, value: 0.0 }
+    z1: { type: dirichlet, value: 0.0 }
+  v:
+    x0: { type: dirichlet, value: 0.0 }
+    x1: { type: neumann }
+    y0: { type: dirichlet, value: 0.0 }
+    y1: { type: dirichlet, value: 0.0 }
+    z0: { type: dirichlet, value: 0.0 }
+    z1: { type: dirichlet, value: 0.0 }
+  w:
+    x0: { type: dirichlet, value: 0.0 }
+    x1: { type: neumann }
+    y0: { type: dirichlet, value: 0.0 }
+    y1: { type: dirichlet, value: 0.0 }
+    z0: { type: dirichlet, value: 0.0 }
+    z1: { type: dirichlet, value: 0.0 }

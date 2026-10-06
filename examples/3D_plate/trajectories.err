@@ -1,0 +1,5 @@
+/u/padovan3/software/incompreso/src/incompreso/input_parser.py:649: UserWarning: precompute_exact_schur=True with N_ib = 6561 > 1000: this will do 19683 Poisson solves at setup and store a dense (19683, 19683) inverse (~3.10 GB).  May be slow and memory-hungry.
+  ib = ImmersedBody(**ib_kwargs)
+/u/padovan3/software/incompreso/src/incompreso/input_parser.py:649: UserWarning: precompute_exact_schur=True with N_ib = 6561 > 1000: this will do 19683 Poisson solves at setup and store a dense (19683, 19683) inverse (~3.10 GB).  May be slow and memory-hungry.
+  ib = ImmersedBody(**ib_kwargs)
+/var/spool/slurmd/job3297207/slurm_script: line 35: 2892906 Bus error               (core dumped) python -u generate_trajectories.py --baseflow base_flow.npz "$@"

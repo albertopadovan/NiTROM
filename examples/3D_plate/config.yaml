@@ -1,0 +1,95 @@
+# 3D version of the 2D airfoil case (examples/airfoil): a finite NACA 0012
+# wing (chord 1, span 1, end caps) at alpha = 6 deg, Re = 600 (chord, U_inf = 1).
+#
+# Wing markers: wing_geometry.npz, from generate_wing.py (incompreso's
+# make_wing: half-chord at the origin, rotated nose up about it, as in 2D).
+# Open flow: uniform (u, v, w) = (1, 0, 0) on the inflow and the four
+# side/top boundaries, zero Neumann on the outflow x = 15.
+# (The previous test case, the flat plate at 15 deg, is in config_plate.yaml.)
+#
+# t1/mjump below are for the base-flow march from the uniform flow (run.py);
+# override them on the command line rather than editing this file.
+
+mesh:
+  x:
+    breakpoints: [-3, -2, -0.75, 0.75, 2, 5, 15]     # fine band covers the wing, x in [-0.5, 0.5]
+    spacings: [0.05, 0.025, 0.0125, 0.025, 0.05, 0.1]
+  y:
+    breakpoints: [-4, -3, -1.5, -0.75, 0]
+    spacings: [0.1, 0.05, 0.025, 0.0125]
+    mirror: true
+  z:
+    breakpoints: [-4, -3, -1.5, -0.75, 0]
+    spacings: [0.1, 0.05, 0.025, 0.0125]
+    mirror: true
+  check_equal_min_spacing: true
+
+boundary_conditions:
+  u:
+    x0: { type: dirichlet, value: 1.0 }   # inflow
+    x1: { type: neumann }                 # outflow
+    y0: { type: dirichlet, value: 1.0 }   # freestream
+    y1: { type: dirichlet, value: 1.0 }
+    z0: { type: dirichlet, value: 1.0 }
+    z1: { type: dirichlet, value: 1.0 }
+  v:
+    x0: { type: dirichlet, value: 0.0 }
+    x1: { type: neumann }
+    y0: { type: dirichlet, value: 0.0 }
+    y1: { type: dirichlet, value: 0.0 }
+    z0: { type: dirichlet, value: 0.0 }
+    z1: { type: dirichlet, value: 0.0 }
+  w:
+    x0: { type: dirichlet, value: 0.0 }
+    x1: { type: neumann }
+    y0: { type: dirichlet, value: 0.0 }
+    y1: { type: dirichlet, value: 0.0 }
+    z0: { type: dirichlet, value: 0.0 }
+    z1: { type: dirichlet, value: 0.0 }
+
+spatial_operators:
+  Re: 600
+  poisson_solver:
+    type: eigen
+    verbose: true
+    rtol: 1.0e-8
+
+immersed_body:
+  geometry:
+    shape: file
+    path: wing_geometry.npz              # relative to this file (or: shape: wing, thickness: 0.12, alpha: 6, Lz: 1.0)
+  # Transport-map preconditioner: (x0, y0, z0) of the reference ("mother")
+  # cell, snapped to the grid -- it must lie in the uniform fine region,
+  # since its Green's functions are translated to every marker -- and the
+  # number of Chebyshev nodes per direction.  Same as the pitching plate.
+  reference_quantities: [0, 0, 0, 4, 4, 4]
+  gmres_rtol: 1.0e-11
+  # Stationary-body fast path: build and dense-invert the exact Schur
+  # complement once at setup (3 x 14026 = 42078 Poisson solves, a ~14 GB
+  # dense inverse, ~40-45 GB of GPU memory at peak while inverting), then
+  # every step is a single dense matvec instead of a GMRES solve.  Set to
+  # false to fall back to GMRES with the transport-map preconditioner.
+  precompute_exact_schur: true
+
+time_stepper:
+  dt: 1e-3
+  scheme: AB2
+  t0: 0.0
+  t1: 60.0
+  mjump: 2000       # a snapshot every 2 time units
+
+initial_condition:
+  type: uniform
+  values:
+    u: 1.0
+    v: 0.0
+    w: 0.0
+  # Restart from a saved snapshot instead (carries t0 and numbering over):
+  # type: file
+  # path: data_wing/snapshot_000010.npz
+
+output:
+  save_path: data_wing/                  # resolved against this file's directory by run.py
+  vtk: false                             # .npz only; post-processing reads the .npz
+
+diagnostics: true

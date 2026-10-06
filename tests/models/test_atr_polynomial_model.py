@@ -233,6 +233,38 @@ class TestTrappingRegion:
             y = Qtil @ (z - m)
             assert (y @ model.evaluate_rhs(0.0, z)).item() < 0.0
 
+    def test_trapping_region_containing_radius(self, atr_model_and_data):
+        r"""The smallest sublevel set of :math:`\widehat{V}` containing the
+        :math:`\rho`-ball is forward invariant and reaches exactly
+        :math:`\rho\sqrt{\kappa(\tilde{Q})}` from ``m``."""
+        model, params, _, _ = atr_model_and_data
+        Qtil, _, _, _ = _shifted_operators(params)
+        m = params[5]
+        rho = model.trapping_region_radius()
+        rho_tr = model.trapping_region_containing_radius()
+        lam, vec = torch.linalg.eigh(0.5 * (Qtil + Qtil.T))
+        lam_min, lam_max = lam.min().item(), lam.max().item()
+        np.testing.assert_allclose(rho_tr, rho * np.sqrt(lam_max / lam_min),
+                                   rtol=1e-12)
+        assert rho_tr >= rho
+
+        V = lambda zh: 0.5 * (zh @ Qtil @ zh).item()
+        level = 0.5 * lam_max * rho**2           # smallest level containing the ball
+        # tight: along the lambda_min eigenvector the set reaches rho_tr
+        v_min = vec[:, torch.argmin(lam)]
+        np.testing.assert_allclose(V(rho_tr * v_min), level, rtol=1e-10)
+
+        rng = np.random.default_rng(7)
+        for _ in range(20):
+            d = torch.tensor(rng.standard_normal(R), dtype=DTYPE)
+            d = d / torch.linalg.norm(d)
+            # nothing beyond rho_tr lies inside the set
+            assert V(1.0001 * rho_tr * d) > level
+            # forward invariance: V-dot <= 0 on the set's boundary
+            zh = d * np.sqrt(level / V(d))
+            assert abs(V(zh) - level) <= 1e-9 * level
+            assert (Qtil @ zh) @ model.evaluate_rhs(0.0, m + zh) <= 1e-10
+
     def test_shifted_linear_operator_is_hurwitz(self, atr_model_and_data):
         model, _, _, _ = atr_model_and_data
         eigs = torch.linalg.eigvals(model._Ahat).real

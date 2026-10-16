@@ -6,6 +6,7 @@ from nitrom.roms.param_registry import ParamRegistry
 from nitrom.training_data import TrainingData
 
 from ...time_steppers.time_stepper import (
+    DenseSolution,
     solve_adjoint_ivp_discrete,
     solve_ivp,
     solve_ivp_dense,
@@ -116,7 +117,10 @@ class NitromModule(InferenceModule):
     which keeps shared parameters tied by construction.
 
     :param training_data: training data (trajectories ``X``, time grid,
-        forcing callables, weights)
+        forcing callables, weights, and optionally ``time_weights``: per-sample
+        weights :math:`c_i` of shape ``(nt,)`` or ``(ntraj, nt)`` -- the rows of
+        this rank's trajectories -- e.g. the quadrature weights of a
+        non-uniform time grid)
     :type training_data: TrainingData
     :param registry: registry of the ROM parameters spanning the
         latent-space model and the projection
@@ -131,6 +135,24 @@ class NitromModule(InferenceModule):
         ``None`` (default) uses it whenever it applies, ``False`` forces the
         general path, ``True`` requires it.
     :type gram: bool or None
+
+    **Non-uniform time grids.**  Every measurement interval
+    :math:`[t_{k-1}, t_k]` is integrated with ``n_substeps`` fixed steps of
+    :math:`h_k = (t_k - t_{k-1})/n_\mathrm{substeps}`, in the cost and in the
+    adjoint alike, so the gradient is that of the cost on any grid.  On a
+    uniform grid this is one fixed-step solve; on a non-uniform one, one
+    fixed-step solve per run of equal intervals (e.g. two for a fine start
+    followed by a coarse tail), concatenated on the sub-step grid.
+
+    **Per-sample weights.**  With ``time_weights`` the cost is
+
+    .. math::
+
+        J = \sum_j \alpha_j^{-1} \sum_i c_i
+            \lVert y^{(j)}(t_i) - \hat{y}^{(j)}(t_i) \rVert^2,
+
+    i.e. every snapshot scaled by :math:`\sqrt{c_i}` (with trapezoidal
+    :math:`c_i`, a quadrature of the time integral of the mismatch).
 
     **Gram form.**  With a :class:`LinearProjection` (decoder
     :math:`\hat{q} = \Phi S z`, :math:`S = (\Psi^\top\Phi)^{-1}`) and a
@@ -322,6 +344,87 @@ class NitromModule(InferenceModule):
         self._gram_phi_cache = (X, bkend.copy(Phi), PhiTX, PhiTPhi)
         return PhiTX, PhiTPhi
 
+    def _time_weights(self) -> Any:
+        """Per-sample weights ``c`` as ``(ntraj, nt)`` (or ``None``), cached."""
+        tw = getattr(self.training_data, "time_weights", None)
+        if tw is None:
+            return None
+        cached = getattr(self, "_time_weights_cache", None)
+        if cached is not None and cached[0] is tw:
+            return cached[1]
+        bkend = self.backend
+        X = self.training_data.X
+        ntraj, _, nt = X.shape
+        c = bkend.asarray(tw, device=bkend.device_of(X), dtype=X.dtype)
+        if c.ndim == 1:
+            if c.shape[0] != nt:
+                raise ValueError(f"time_weights has {c.shape[0]} entries, the data {nt} snapshots")
+            c = bkend.stack([c] * ntraj, axis=0)
+        if tuple(c.shape) != (ntraj, nt):
+            raise ValueError(f"time_weights must be (nt,) or (ntraj, nt) = ({ntraj}, {nt})")
+        self._time_weights_cache = (tw, c)
+        return c
+
+    def _time_runs(self) -> list | None:
+        """Runs of equal measurement intervals, ``[(k0, k1, delta)]``: the
+        intervals ``[t_{k-1}, t_k]``, ``k0 < k <= k1``, all have length
+        ``delta`` (to 1e-9 relative).  One run on a uniform grid; ``None``
+        for ``rk45``, which has no fixed sub-step grid."""
+        if self.time_stepper == "rk45":
+            return None
+        time = np.asarray(self.backend.to_numpy(self.time), dtype=float)
+        cached = getattr(self, "_time_runs_cache", None)
+        if cached is not None and np.array_equal(cached[0], time):
+            return cached[1]
+        d = np.diff(time)
+        tol = 1e-9 * float(np.max(np.abs(d)))
+        runs, k0 = [], 0
+        for k in range(1, len(d) + 1):
+            if k == len(d) or abs(d[k] - d[k0]) > tol:
+                runs.append((k0, k, float(time[k] - time[k0]) / (k - k0)))
+                k0 = k
+        self._time_runs_cache = (time, runs)
+        return runs
+
+    def _dense_fits(self) -> bool:
+        """Whether the dense solve (states and stages on every sub-step)
+        stays under ``max_dense_bytes``."""
+        ntraj = self.training_data.X.shape[0]
+        r = self.model.state_dimension
+        nt_sim = (len(self.time) - 1) * self.n_substeps
+        itemsize = getattr(self.training_data.X.dtype, "itemsize", 8)
+        n_stages = 4  # upper bound over the fixed-step tableaus
+        return ntraj * r * itemsize * ((nt_sim + 1) + nt_sim * n_stages) <= self.max_dense_bytes
+
+    def _solve_piecewise(self, z0: Any, runs: list, save_every: int,
+                         with_stages: bool = False) -> DenseSolution:
+        """Fixed-step solve over a non-uniform grid, one :func:`solve_ivp_dense`
+        per run of equal intervals with ``h = delta / n_substeps``; the runs are
+        concatenated so that sub-step ``(k - 1) * n_substeps`` is snapshot
+        ``k - 1`` (``save_every = 1``), or the snapshots alone are kept
+        (``save_every = n_substeps``)."""
+        bkend = self.backend
+        time = np.asarray(bkend.to_numpy(self.time), dtype=float)
+        ef = self.forcing_fns or None
+        ts, Xs, Gs, z = [], [], [], z0
+        for i, (k0, k1, delta) in enumerate(runs):
+            sol = solve_ivp_dense(
+                self.model.evaluate_rhs, z, float(time[k0]), float(time[k1]),
+                delta / self.n_substeps, self.time_stepper, save_every=save_every,
+                with_stages=with_stages, external_forcing=ef,
+            )
+            z = sol.X[..., -1]
+            first = 0 if i == 0 else 1  # the run's start is the previous run's end
+            ts.append(sol.t[first:])
+            Xs.append(sol.X[..., first:])
+            if with_stages:
+                Gs.append(sol.stages)
+        return DenseSolution(
+            t=bkend.concatenate(ts, axis=0),
+            X=bkend.concatenate(Xs, axis=-1),
+            stages=bkend.concatenate(Gs, axis=0) if with_stages else None,
+        )
+
     def _output_vjp(self, e: Any, Xhat: Any) -> Any:
         r"""Apply the transpose of the output Jacobian to ``e``.
 
@@ -371,20 +474,26 @@ class NitromModule(InferenceModule):
         # Encode the initial conditions to the latent space.
         z0 = self.projection.encode(self._initial_states())  # (ntraj, r)
 
-        # Integrate the latent dynamics over the trajectory time grid.
-        dt = (self.time[1] - self.time[0]) / self.n_substeps
-        Z = solve_ivp(
-            self.model.evaluate_rhs,
-            z0,
-            self.time[0],
-            self.time[-1],
-            dt,
-            self.time,
-            self.time_stepper,
-            atol=self.atol,
-            rtol=self.rtol,
-            external_forcing=self.forcing_fns or None,
-        )  # (ntraj, r, nt)
+        # Integrate the latent dynamics over the trajectory time grid: one
+        # fixed-step solve on a uniform grid (or with rk45), else one per run
+        # of equal intervals, n_substeps steps per interval throughout.
+        runs = self._time_runs()
+        if runs is None or len(runs) == 1:
+            dt = (self.time[1] - self.time[0]) / self.n_substeps
+            Z = solve_ivp(
+                self.model.evaluate_rhs,
+                z0,
+                self.time[0],
+                self.time[-1],
+                dt,
+                self.time,
+                self.time_stepper,
+                atol=self.atol,
+                rtol=self.rtol,
+                external_forcing=self.forcing_fns or None,
+            )  # (ntraj, r, nt)
+        else:
+            Z = self._solve_piecewise(z0, runs, save_every=self.n_substeps).X
 
         # Weighted sum-of-squares output mismatch.
         if self.gram:
@@ -392,12 +501,15 @@ class NitromModule(InferenceModule):
             PhiTX, PhiTPhi = self._gram_phi()
             e2 = (self._gram_data() - 2.0 * bkend.sum(SZ * PhiTX, axis=1)
                   + bkend.sum(SZ * (PhiTPhi @ SZ), axis=1))  # (ntraj, nt)
-            per_traj = bkend.sum(e2, axis=1) / self.weights.reshape(-1)
         else:
             e = self._data_output() - self.fom.compute_output(
                 self._decode_trajectories(Z)
             )
-            per_traj = bkend.sum(e * e, axis=(1, 2)) / self.weights.reshape(-1)
+            e2 = bkend.sum(e * e, axis=1)  # (ntraj, nt)
+        c = self._time_weights()
+        if c is not None:
+            e2 = e2 * c
+        per_traj = bkend.sum(e2, axis=1) / self.weights.reshape(-1)
         cost = per_traj.sum()
 
         # Regularization on the quadratic tensor H.  It is a global term added
@@ -496,6 +608,9 @@ class NitromModule(InferenceModule):
             r = self.model.state_dimension
             ef = self.forcing_fns or None
             w = (1.0 / self.weights.reshape(-1)).reshape(-1, 1, 1)  # (ntraj, 1, 1)
+            c = self._time_weights()
+            if c is not None:  # per-sample weights: (ntraj, 1, nt)
+                w = w * c.reshape(ntraj, 1, nt)
 
             # --- forward solve at the measurement times --------------------
             X0 = self._initial_states()  # (ntraj, N), contiguous
@@ -505,9 +620,20 @@ class NitromModule(InferenceModule):
             # When the snapshot grid lands on sub-steps, one dense solve serves
             # both the measurement values and every interval of the backward
             # sweep, which otherwise re-integrates each interval from scratch.
+            runs = self._time_runs()
             dense_dt = self._dense_grid()
-            want_stages = dense_dt is not None and self.adjoint_method == "discrete"
-            if dense_dt is not None:
+            want_stages = self.adjoint_method == "discrete"
+            if runs is not None and len(runs) > 1:
+                # Non-uniform grid: per-run fixed-step solves on the sub-step
+                # grid of the backward sweep (h_k = delta_k / n_substeps).
+                if self._dense_fits():
+                    dense = self._solve_piecewise(z0, runs, save_every=1,
+                                                  with_stages=want_stages)
+                    Z = dense.X[:, :, :: self.n_substeps]  # (ntraj, r, nt)
+                else:
+                    dense = None
+                    Z = self._solve_piecewise(z0, runs, save_every=self.n_substeps).X
+            elif dense_dt is not None:
                 dense = solve_ivp_dense(
                     self.model.evaluate_rhs, z0, float(time_h[0]), float(time_h[-1]),
                     dense_dt, self.time_stepper, save_every=1,

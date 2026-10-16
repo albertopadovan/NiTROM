@@ -24,6 +24,8 @@ class OpInfModule(InferenceModule):
     and :math:`f` is evaluated by the underlying model.
 
     :param training_data: training data with ``X``, ``dX``, ``weights``, ``time``
+        and optionally ``time_weights`` (per-sample weights c_i, shape ``(nt,)``
+        or ``(ntraj, nt)``; then w = c_i / alpha_j)
     :type training_data: TrainingData
     :param latent_space_model: a pre-constructed latent-space dynamics model
         (e.g. :class:`PolynomialModel` or :class:`GasPolynomialModel`) whose
@@ -98,6 +100,21 @@ class OpInfModule(InferenceModule):
         # materializing the (ntraj*nt)^2 matrix costs O(n_s) times the memory
         # and turns an elementwise multiply into a GEMM against a diagonal.
         self.w = bkend.repeat_interleave(1 / training_data.weights.reshape(-1), nt)
+
+        # Optional per-sample weights c_i (e.g. trapezoidal quadrature weights
+        # of a non-uniform time grid, normalized to mean 1), ``time_weights``
+        # of shape (nt,) or (ntraj, nt): the residual of sample (j, i) is then
+        # weighted by c_i / alpha_j, i.e. each column is scaled by sqrt(c_i).
+        tw = getattr(training_data, "time_weights", None)
+        if tw is not None:
+            tw = bkend.asarray(tw, device=bkend.device_of(self.w), dtype=self.w.dtype)
+            if tw.ndim == 1:
+                if tw.shape[0] != nt:
+                    raise ValueError(f"time_weights has {tw.shape[0]} entries, the data {nt} snapshots")
+                tw = bkend.stack([tw] * ntraj, axis=0)
+            if tuple(tw.shape) != (ntraj, nt):
+                raise ValueError(f"time_weights must be (nt,) or (ntraj, nt) = ({ntraj}, {nt})")
+            self.w = self.w * tw.reshape(-1)
 
         # The optimizer evaluates the cost and gradient at the same candidate
         # parameters.  Cache the assembly and residual for that candidate so

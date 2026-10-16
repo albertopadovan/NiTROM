@@ -113,6 +113,14 @@ class Backend:
     #: line.  Lower it only alongside a small-``r`` benchmark that shows the win.
     _EINSUM_OPTIMIZE_MIN_COST = 20_000
 
+    #: Memory limit (elements) of the intermediates ``einsum_path`` may form.
+    #: numpy's default is the size of the largest operand, which for the
+    #: polynomial RHS ``'abc,db,dc->da'`` (H of r^3 entries) forbids the batch
+    #: outer product z (x) z (batch x r^2) as soon as batch > r -- numpy then
+    #: falls back to one naive three-operand loop, ~40x slower (r = 50: 0.23 ms
+    #: at batch 45, 10 ms at batch 90).  A generous fixed cap keeps the BLAS path.
+    _EINSUM_MEMORY_LIMIT = 100_000_000
+
     #: Cap on :attr:`_einsum_paths`.  Keys include operand shapes, so a caller
     #: that varies batch sizes freely could otherwise grow the cache without
     #: bound; the hot equations are few, so a flush is cheap and rare.
@@ -257,7 +265,8 @@ class Backend:
         """
         try:
             _, contraction_list = self.xp.einsum_path(
-                equation, *operands, optimize="optimal", einsum_call=True
+                equation, *operands, optimize=("optimal", self._EINSUM_MEMORY_LIMIT),
+                einsum_call=True,
             )
         except TypeError:
             # ``einsum_call`` is numpy-internal; if it ever goes away, degrade
@@ -332,7 +341,9 @@ class Backend:
     def _numpy_einsum_path(self, equation, operands):
         """numpy's own contraction path for ``equation``, or ``None``."""
         try:
-            return self.xp.einsum_path(equation, *operands, optimize="optimal")[0]
+            return self.xp.einsum_path(
+                equation, *operands, optimize=("optimal", self._EINSUM_MEMORY_LIMIT)
+            )[0]
         except (TypeError, ValueError):
             return None
 

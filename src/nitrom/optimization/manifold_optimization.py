@@ -339,7 +339,7 @@ class LBFGSDirection:
 def riemannian_optimize(
     cost_fn, rgrad_fn, x0, manifolds, direction,
     max_iter=200, gtol=1e-10, ftol=1e-9, callback=None,
-    allow_increase=False,
+    allow_increase=False, iterate_callback=None,
 ):
     r"""Generic first-order Riemannian optimizer on a product manifold.
 
@@ -405,6 +405,10 @@ def riemannian_optimize(
             best_f = f_new
         if callback is not None:
             callback(it, fval, gnorm)
+        if iterate_callback is not None:
+            # the accepted iterate itself (e.g. for checkpointing); the
+            # optimizer state is not touched
+            iterate_callback(it, xs, fval, gnorm)
         if 0.0 <= fprev - fval <= ftol * max(abs(fprev), 1.0):
             break
         fprev = fval

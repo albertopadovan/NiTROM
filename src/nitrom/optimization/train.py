@@ -16,6 +16,7 @@ def train(
     n_restarts: int = 0,
     scheduler_creator: Callable[[Any], Any] | None = None,
     allow_increase: bool = False,
+    callback: Callable[..., Any] | None = None,
 ) -> InferenceModule:
     r"""
     Train an :class:`InferenceModule` by minimizing its cost using the module's
@@ -47,6 +48,11 @@ def train(
     :param scheduler_creator: (torch backend only) callable mapping an optimizer
         to a learning-rate scheduler; ``None`` for no scheduling
     :param allow_increase: allow line search to accept steps where cost increases
+    :param callback: (numpy backend only) ``callback(model, it, loss, gradnorm)``,
+        called after every accepted iterate ``it`` (0-based) with the model's
+        parameters set to that iterate -- e.g. to save checkpoints.  It does not
+        touch the optimizer state (no L-BFGS restart); ``gradnorm`` is that of
+        the iterate the step was taken from, as in ``model.gradnorm_history``.
     :returns: the trained model
     """
     manifolds = {
@@ -60,8 +66,10 @@ def train(
     if get_backend().is_numpy:
         return _train_numpy(
             model, manifolds, n_epochs, lr, optimizer_type,
-            print_every, tol, n_restarts, allow_increase,
+            print_every, tol, n_restarts, allow_increase, callback,
         )
+    if callback is not None:
+        raise NotImplementedError("train(callback=...) is implemented for the numpy backend only")
     return _train_torch(
         model, manifolds, n_epochs, lr, optimizer_type,
         print_every, tol, n_restarts, scheduler_creator,
@@ -74,7 +82,7 @@ def train(
 
 def _train_numpy(
     model, manifolds, n_epochs, lr, optimizer_type, print_every, tol, n_restarts,
-    allow_increase,
+    allow_increase, callback=None,
 ):
     import numpy as np
 
@@ -172,11 +180,18 @@ def _train_numpy(
             if attempt == 0
             else [a + scale * rng.standard_normal(a.shape) for a in x0]
         )
+        def at_iterate(it, xs, f, gnorm):
+            # load the accepted iterate into the model, then hand it over
+            for name, arr in zip(names, xs, strict=True):
+                set_p(name, arr)
+            callback(model, it, f, gnorm)
+
         xk, fk = riemannian_optimize(
             cost_fn, rgrad_fn, xs0, mlist, make_direction(),
             max_iter=n_epochs, gtol=tol,
             ftol=max(tol, 1e-12), callback=progress,
             allow_increase=allow_increase,
+            iterate_callback=at_iterate if callback is not None else None,
         )
         if fk < best_f:
             best_xs, best_f = xk, fk

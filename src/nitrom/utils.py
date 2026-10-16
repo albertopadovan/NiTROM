@@ -225,37 +225,37 @@ def lagrange_stencils(t_samples, t_eval, order: int):
     return start, W
 
 
-def _interpolated_window(X_traj, start, W, scale_cols, chunk=8):
+def _window_maps(ks, L, stencils=None, sqrt_w=None):
     r"""
-    One window ``(N, n_q)`` at the quadrature nodes: column ``e`` is
-    ``sum_m W[e, m] X_traj[:, start[e] + m]`` times ``scale_cols[e]``.
+    Every window as a sparse linear map on its trajectory's samples.
 
-    Consecutive nodes are processed ``chunk`` at a time as one product of the
-    contiguous sample slice they touch with a small coefficient block, so the
-    cost is ~ ``N * n_q * (chunk + order)`` and no ``(N, n_q, order)`` gather
-    is ever formed.
+    Window column ``l`` of the window starting at checkpoint ``k`` is
+    ``sum_m coef[l, m] * X_j[:, idx[l, m]]``: on uniform data a single sample,
+    ``idx = k + l`` with ``coef = 1``; with a quadrature, the local Lagrange
+    stencil of the node ``t_k + tau_l`` times :math:`\sqrt{\omega_l}`.
+    Windows are never materialized -- everything downstream works on
+    trajectory-level products (:math:`X_j^\top X_{j'}`, :math:`Q^\top X_j`,
+    :math:`X_j C_j`) and these maps.
+
+    :returns: ``{k: (idx, coef)}`` with ``idx`` (int) and ``coef`` of shape
+        ``(L, p)``
     """
     import numpy as np
 
-    bkend = get_backend()
-    N = X_traj.shape[0]
-    n_q, p = W.shape
-    out = bkend.empty((N, n_q), dtype=X_traj.dtype, device=bkend.device_of(X_traj))
-    for e0 in range(0, n_q, chunk):
-        e1 = min(e0 + chunk, n_q)
-        a = int(start[e0:e1].min())
-        b = int((start[e0:e1] + p).max())
-        C = np.zeros((b - a, e1 - e0))
-        for e in range(e0, e1):
-            C[start[e] - a: start[e] - a + p, e - e0] = W[e] * scale_cols[e]
-        Cb = bkend.asarray(C, dtype=X_traj.dtype, device=bkend.device_of(X_traj))
-        out[:, e0:e1] = X_traj[:, a:b] @ Cb
-    return out
+    maps = {}
+    for k in ks:
+        if stencils is None:
+            maps[k] = (k + np.arange(L)[:, None], np.ones((L, 1)))
+        else:
+            st, W = stencils[k]
+            maps[k] = (st[:, None] + np.arange(W.shape[1])[None, :], W * sqrt_w[:, None])
+    return maps
 
 
-def _materialize(v):
-    """A window given as an array (a view) or as a callable building it."""
-    return v() if callable(v) else v
+def _apply_map(A, idx, coef):
+    """``A`` (rows, n_t) times a window map: ``(rows, L)``,
+    ``out[:, l] = sum_m coef[l, m] A[:, idx[l, m]]``."""
+    return (A[:, idx] * coef[None]).sum(-1)
 
 
 def _assign_families(norms, amplitude_ranges):
@@ -286,45 +286,64 @@ def _assign_families(norms, amplitude_ranges):
     return groups, dropped
 
 
-def _family_gramian_G(windows, dt):
+def _family_gramian_G(fam, maps, X_all, dt, C=None):
     r"""
-    :math:`G_{ij} = \sum_k \tilde{x}^{(i)}(t_k)^\top \tilde{x}^{(j)}(t_k)\,\Delta t`
-    for one family.
+    :math:`G_{ii'} = \sum_l \Delta t\, \tilde{x}^{(i)}(\tau_l)^\top
+    \tilde{x}^{(i')}(\tau_l)` for one family, without forming any window.
 
-    Every window has the same length, so the double sum over space and time is a
-    plain inner product of the flattened windows,
-    :math:`G = \Delta t\, W_f W_f^\top` with :math:`W_f` the ``(m, N L)``
-    matrix whose rows are the flattened windows.  Since ``windows`` is one
-    contiguous ``(m, N, L)`` block, that reshape is a view and the whole
-    Gramian is a single GEMM: one streaming pass over the family's data, no
-    temporaries.  (The earlier version accumulated the same quantity over
-    column chunks, rebuilding each chunk with a ``concatenate`` -- that copied
-    the family's data once per chunk and dominated the runtime.)
+    Window :math:`i` is :math:`s_i X_j A_i` -- its trajectory's samples
+    :math:`X_j` (``N x n_t``) times its sparse map :math:`A_i` (``n_t x L``,
+    :func:`_window_maps`) times its normalization :math:`s_i` -- so
 
-    The ``n x n`` Gramian this factors is still never formed.
+    .. math::
 
-    :param windows: contiguous ``(m, N, L)`` array of the family's windows
-    :param dt: sampling interval
-    :returns: ``G`` of shape ``(m, m)``
+        G_{ii'} = \Delta t\, s_i s_{i'} \sum_l A_i[:, l]^\top
+                  S_{jj'}\, A_{i'}[:, l], \qquad S_{jj'} = X_j^\top X_{j'} .
+
+    The only full-dimension work is one snapshot Gram matrix :math:`S_{jj'}`
+    (``n_t x n_t``) per pair of trajectories in the family: each snapshot is
+    read once per partner trajectory, however many windows contain it, and
+    nothing of size ``N`` is copied.  The rest is gathers on ``n_t``-sized
+    arrays.  (The previous version staged the ``(m, N, L)`` block of
+    overlapping windows and took one GEMM, which duplicated every snapshot in
+    up to ``L/q`` windows.)
+
+    :param fam: the family's initial conditions as ``(j, k, s)``: trajectory,
+        checkpoint, normalization
+    :param maps: :func:`_window_maps` output
+    :param X_all: ``(n_traj, N, n_t)`` trajectories (backend array)
+    :param dt: rectangle-rule weight (``1`` when the quadrature weights are
+        folded into the maps)
+    :param C: output operator ``(p, N)``; ``G`` is then built from the outputs
+        :math:`y = C\tilde x` (:math:`S_{jj'} = (CX_j)^\top CX_{j'}`).  ``None``
+        observes the full state (:math:`C = I`).
+    :returns: ``G`` of shape ``(m, m)``, float64 numpy
     """
-    Wf = windows.reshape(windows.shape[0], -1)
-    return dt * (Wf @ Wf.T)
+    import numpy as np
 
-
-def _stage_family(views, scales, buf):
-    """Copy one family's scaled windows into ``buf`` and return the used slice.
-
-    The windows are scaled slices of the training data, so they need not be
-    materialized for the whole IC set at once: only the Gramian needs them
-    contiguous (to reshape into a single GEMM), and it needs one family at a
-    time.  Staging through a buffer sized by the largest family therefore cuts
-    peak memory by roughly the number of families.  Everything else downstream
-    -- ``Q^T w`` and the ``Phi`` accumulation -- works directly on the strided
-    views with the scale applied to the small result instead.
-    """
-    for i, (v, sc) in enumerate(zip(views, scales)):
-        buf[i] = sc * _materialize(v)
-    return buf[:len(views)]
+    bkend = get_backend()
+    trajs = sorted({j for j, _, _ in fam})
+    Yt = {a: (X_all[a] if C is None else C @ X_all[a]) for a in trajs}
+    S = {}
+    for ia, a in enumerate(trajs):
+        for b in trajs[ia:]:
+            Sab = np.asarray(bkend.to_numpy(Yt[a].T @ Yt[b]), dtype=float)
+            S[(a, b)], S[(b, a)] = Sab, Sab.T
+    m = len(fam)
+    G = np.empty((m, m))
+    rows = {a: [i for i, (j, _, _) in enumerate(fam) if j == a] for a in trajs}
+    L = next(iter(maps.values()))[0].shape[0]
+    lcol = np.arange(L)[None, :, None]
+    for i2, (j2, k2, s2) in enumerate(fam):
+        idx2, c2 = maps[k2]
+        for a in trajs:
+            T = _apply_map(S[(a, j2)], idx2, c2)                 # (n_t, L)
+            ri = rows[a]
+            idx1 = np.stack([maps[fam[i][1]][0] for i in ri])     # (n_r, L, p)
+            c1 = np.stack([maps[fam[i][1]][1] for i in ri])
+            s1 = np.array([fam[i][2] for i in ri])
+            G[ri, i2] = dt * s1 * s2 * (T[idx1, lcol] * c1).sum(axis=(1, 2))
+    return G
 
 
 def _restricted_observability_factor(G, X0, rank_M, rcond):
@@ -363,62 +382,94 @@ def _restricted_observability_factor(G, X0, rank_M, rcond):
     return Q, dict(sM=s, rank_M_kept=keep, Lambda=lam, n_ic=X0.shape[1])
 
 
-def _balance_from_windows(fam_views, fam_scales, fam_X0, weights, dt,
-                          rank_M, rcond):
+def _balance_from_windows(fams, maps, X_all, fam_X0, weights, dt, rank_M, rcond,
+                          imps, imap, dt_R, C=None):
     r"""
     Lall-Marsden-Glavaski averaged balancing, in factored form.
 
-    With per-family weights :math:`w_c`,
-    :math:`W_c = \sum_c w_c X^{(c)}X^{(c)\top} = XX^\top` and
-    :math:`W_o = \sum_c w_c Q^{(c)}Q^{(c)\top} = QQ^\top`, so the factors are
-    the weighted concatenations.  The balancing transformation follows from the
-    SVD :math:`Q^\top X = L\Sigma R^\top`:
-    :math:`\Phi = XR\Sigma^{-1/2}`, :math:`\Psi = QL\Sigma^{-1/2}`, with
-    :math:`\Psi^\top\Phi = I`.
+    **Reachability** -- the Gramian of the actuators, from the impulse responses
+    only (no checkpoints): with :math:`x^{(j)}(0) = \beta_j b_j`,
 
-    Neither :math:`W_c` nor :math:`W_o` is ever formed.
+    .. math::
+
+        W_R = \sum_a w_a \sum_{j \in F_a} \sum_{k} \omega_k\,
+              \frac{x^{(j)}(t_k)\,x^{(j)}(t_k)^\top}{\lVert x^{(j)}(t_0)\rVert^2}
+            = XX^\top ,
+
+    over the whole trajectory (``imps``, ``imap``; :math:`\omega_k = \Delta t`
+    on a uniform grid).
+
+    **Observability** -- per family, from the checkpoint windows,
+    :math:`\widetilde W_O = \sum_a w_a X_0^{(a)} M_a^{+} G^{(a)} M_a^{+}
+    X_0^{(a)\top} = QQ^\top`.
+
+    The balancing transformation follows from the SVD
+    :math:`H = Q^\top X = L\Sigma R^\top`: :math:`\Phi = XR\Sigma^{-1/2}`,
+    :math:`\Psi = QL\Sigma^{-1/2}`, with :math:`\Psi^\top\Phi = I`.
+
+    Neither Gramian, nor :math:`X`, nor any window is ever formed.  Impulse
+    response :math:`j` enters :math:`X` as :math:`f_j X_j A` (its samples times
+    the time-weight map, :math:`f_j = s_j\sqrt{w_a\,\Delta t_R}`), so
+
+    * :math:`H = Q^\top X` takes one product :math:`P_j = Q^\top X_j` per
+      trajectory;
+    * :math:`\Phi = \sum_j X_j C_j \Sigma^{-1/2}` with
+      :math:`C_j = f_j A R_j^\top` (``n_t x R``): one product per trajectory.
+
+    :param fams: per family, its checkpoint initial conditions as ``(j, k, s)``
+        (observability)
+    :param maps: :func:`_window_maps` output for the checkpoint windows
+    :param X_all: ``(n_traj, N, n_t)`` trajectories (backend array)
+    :param fam_X0: per family, the ``(N, m_c)`` normalized initial conditions
+    :param dt: time weight of the windows (``1`` when folded into ``maps``)
+    :param imps: per family, its impulse responses as ``(j, s)`` (reachability)
+    :param imap: ``(idx, coef)`` map of a whole trajectory (time weights)
+    :param dt_R: time weight of the impulse responses (``1`` when folded into
+        ``imap``)
+    :param C: output operator for :math:`G` (``None``: the full state)
     """
-    bkend = get_backend()
+    import numpy as np
 
-    # One staging buffer, sized by the largest family, reused for each Gramian.
-    v0 = _materialize(fam_views[0][0])
-    mmax = max(len(v) for v in fam_views)
-    buf = bkend.zeros((mmax,) + tuple(v0.shape), device=bkend.device_of(v0),
-                      dtype=v0.dtype)
-    del v0
+    bkend = get_backend()
+    dtype, device = X_all.dtype, bkend.device_of(X_all)
 
     Qs, fam_info = [], []
-    for views, scales, X0, w in zip(fam_views, fam_scales, fam_X0, weights):
-        G = _family_gramian_G(_stage_family(views, scales, buf), dt)
+    for fam, X0, w in zip(fams, fam_X0, weights):
+        G = bkend.asarray(_family_gramian_G(fam, maps, X_all, dt, C), dtype=dtype, device=device)
         Qc, info = _restricted_observability_factor(G, X0, rank_M, rcond)
         Qs.append(bkend.sqrt(bkend.asarray(w, dtype=Qc.dtype,
                                            device=bkend.device_of(Qc))) * Qc)
         fam_info.append(info)
     Q = bkend.concatenate(Qs, axis=1)
 
-    # H = Q^T X, one block per trajectory.  X is never assembled: each block is
-    # a scaled slice of Q^T applied to the window it came from.
-    blocks, coeffs = [], []
-    for views, scs, w in zip(fam_views, fam_scales, weights):
-        for view, sc in zip(views, scs):
-            f = sc * float(w * dt) ** 0.5
-            blocks.append(f * (Q.T @ _materialize(view)))  # views: no copy
-            coeffs.append(f)
-    H = bkend.concatenate(blocks, axis=1)
+    # H = Q^T X over the impulse responses, from P_j = Q^T X_j.
+    idx, c = imap
+    used = sorted({j for imp in imps for j, _ in imp})
+    P = {j: np.asarray(bkend.to_numpy(Q.T @ X_all[j]), dtype=float) for j in used}
+    cols, blocks = [], []
+    for imp, w in zip(imps, weights):
+        for j, sc in imp:
+            f = sc * float(w * dt_R) ** 0.5
+            blocks.append(f * _apply_map(P[j], idx, c))
+            cols.append((j, f))
+    H = bkend.asarray(np.concatenate(blocks, axis=1), dtype=dtype, device=device)
 
     Lsv, Sig, Rt = bkend.svd(H, full_matrices=False)
     rmax = int((Sig > 1e-12 * Sig[0]).sum())
     Lsv, Sig, Rt = Lsv[:, :rmax], Sig[:rmax], Rt[:rmax]
 
-    # Phi = X R Sigma^{-1/2}, accumulated window by window.
+    # Phi = X R Sigma^{-1/2} = sum_j X_j C_j Sigma^{-1/2}.
+    Rt_h = np.asarray(bkend.to_numpy(Rt), dtype=float)
+    n_t = X_all.shape[2]
+    L = idx.shape[0]
     Phi, col = None, 0
-    flat_views = [v for views in fam_views for v in views]
-    for win, f in zip(flat_views, coeffs):
-        win = _materialize(win)
-        ncols = win.shape[1]
-        contrib = win @ Rt[:, col:col + ncols].T
-        Phi = f * contrib if Phi is None else Phi + f * contrib
-        col += ncols
+    for j, f in cols:
+        Cj = np.zeros((n_t, rmax))
+        contrib = f * c[..., None] * Rt_h[:, col:col + L].T[:, None, :]   # (L, p, R)
+        np.add.at(Cj, idx.ravel(), contrib.reshape(-1, rmax))
+        term = X_all[j] @ bkend.asarray(Cj, dtype=dtype, device=device)
+        Phi = term if Phi is None else Phi + term
+        col += L
     Phi = Phi / bkend.sqrt(Sig)
     Psi = Q @ (Lsv / bkend.sqrt(Sig))
     return Phi, Psi, Sig, dict(Q=Q, L=Lsv, H=H, families=fam_info)
@@ -436,6 +487,7 @@ def compute_data_driven_balancing(
     rcond: float = 1e-4,
     broadcast: bool = True,
     quadrature: dict | None = None,
+    output_operator: Any = None,
 ):
     r"""
     Data-driven balanced truncation from trajectory data alone (balanced
@@ -446,8 +498,15 @@ def compute_data_driven_balancing(
     full-order operator is never used, and -- unlike textbook balancing --
     neither :math:`n \times n` Gramian is ever formed: only their factors.
 
-    **Controllability.** :math:`W_c = XX^\top` with
-    :math:`X = \sqrt{\Delta t}\,[\text{all windows}]`.
+    **Reachability.** :math:`W_R = XX^\top` is the empirical Gramian of the
+    actuators: the impulse responses themselves, over the whole sampled
+    horizon, each normalized by its initial amplitude and weighted by its
+    family (Lall's :math:`(1/s)\sum_k \alpha_k^{-2}\sum_j \int x x^\top dt`),
+    :math:`X = [\sqrt{w_a\omega_k}\, x^{(j)}(t_k)/\lVert x^{(j)}(t_0)\rVert]`.
+    Checkpoints are **not** used here -- they only enrich the observability
+    estimate below.  (Checkpoint windows in :math:`W_R` would give the Gramian
+    of the unit-norm checkpoint directions instead of the actuators', and
+    count overlapping time intervals several times.)
 
     **Observability.** Adjoint trajectories are unavailable, so :math:`W_o` is
     estimated on :math:`\mathrm{span}(X_0)`:
@@ -456,15 +515,18 @@ def compute_data_driven_balancing(
 
         W_{o,X_0} = X_0 M^\dagger G M^\dagger X_0^\top = QQ^\top,
         \qquad M = X_0^\top X_0,
-        \qquad G_{ij} = \sum_k x^{(i)\top}(t_k)x^{(j)}(t_k)\,\Delta t .
+        \qquad G_{ij} = \sum_k y^{(i)\top}(t_k)y^{(j)}(t_k)\,\Delta t ,
+
+    with :math:`y = Cx` the outputs (``output_operator``; the full state,
+    :math:`C = I`, by default).
 
     :math:`M^\dagger` is truncated at ``rank_M`` -- see
     :func:`_restricted_observability_factor` for why that matters.
 
-    **Checkpointing.** The dynamics are autonomous, so any sampled state is a
-    legitimate initial condition at :math:`t = 0`.  Checkpoints at snapshots
-    ``0, q, 2q, ...`` therefore enlarge :math:`\mathrm{span}(X_0)` at no
-    simulation cost.  Each one contributes the equal-length window that follows
+    **Checkpointing** (observability only). The dynamics are autonomous, so any
+    sampled state is a legitimate initial condition at :math:`t = 0`.
+    Checkpoints at snapshots ``0, q, 2q, ...`` therefore enlarge
+    :math:`\mathrm{span}(X_0)` at no simulation cost.  Each one contributes the equal-length window that follows
     it, so every :math:`G_{ij}` covers the same horizon; ``n_checkpoints`` and
     ``checkpoint_stride`` trade against the window length
     ``L = n_snapshots - (m-1)q``.
@@ -501,9 +563,10 @@ def compute_data_driven_balancing(
         it would under ``amplitude_ranges``.  Takes precedence over
         ``amplitude_ranges`` when both are given.
     :type families: list or None
-    :param normalize: if ``True`` (default), divide every trajectory by the norm
-        of its own initial condition, so all columns of :math:`X_0` are unit
-        norm.  This is Lall's :math:`1/c^2` Gramian scaling.
+    :param normalize: if ``True`` (default), divide every checkpoint window by
+        the norm of its own initial state, so all columns of :math:`X_0` are
+        unit norm, and every impulse response by the norm of its initial
+        condition.  This is Lall's :math:`1/c^2` Gramian scaling.
     :type normalize: bool
     :param family_weights: per-family weights :math:`w_c`; defaults to
         :math:`1/s`
@@ -529,11 +592,18 @@ def compute_data_driven_balancing(
         :math:`x(t_c + \tau_q)`, by local Lagrange interpolation of the
         samples (which may be unevenly spaced), and scaled by
         :math:`\sqrt{\omega_q}`.  All windows sharing one :math:`\tau`-grid
-        is what keeps :math:`G` a Gramian; the weights replace ``dt``
-        throughout.  With nodes at the sample offsets and ``weights = dt`` on
+        is what keeps :math:`G` a Gramian; the weights replace ``dt`` in
+        :math:`G`.  The impulse responses of :math:`W_R` use every sample of
+        ``pool.time`` with the weights :math:`\omega_k = (t_{k+1} -
+        t_{k-1})/2` (one-sided at the ends), which are ``dt`` on a uniform grid.  With nodes at the sample offsets and ``weights = dt`` on
         a uniform grid this reproduces the default path to round-off.
         Windows are rebuilt when needed rather than stored.
     :type quadrature: dict or None
+    :param output_operator: matrix :math:`C` of shape ``(p, N)`` defining the
+        outputs :math:`y = Cx` whose energy :math:`G` measures; ``None``
+        (default) observes the full state.  Only :math:`G` (hence
+        :math:`\widetilde W_O`) depends on it.
+    :type output_operator: array or None
     :param broadcast: if ``True`` (default), ``Phi``, ``Psi`` and ``Sigma`` are
         broadcast to every rank; otherwise they live only on root
     :type broadcast: bool
@@ -608,12 +678,14 @@ def compute_data_driven_balancing(
             dt = 1.0          # the weights are folded into the windows
             L = len(tau)
 
-        # Candidate initial conditions: every (trajectory, checkpoint) pair.
-        # A window is a scaled slice of the training data, so it is kept as a
-        # (strided) VIEW plus its scale rather than copied out.  Materializing
-        # all of them would cost n_ic * N * L * 8 bytes -- 11 GB for 210 windows
-        # of a 19800-state cavity -- where the data itself is under half a GB.
-        ics, norms, views, scales = [], [], [], []
+        # Candidate initial conditions: every (trajectory, checkpoint) pair,
+        # kept as (trajectory, checkpoint, normalization).  Its window is never
+        # materialized: it is the trajectory's samples times a sparse map
+        # (_window_maps), and every product the balancing needs is taken at
+        # trajectory level.
+        maps = _window_maps(ks, L, None if quadrature is None else stencils,
+                            None if quadrature is None else sqrt_w)
+        ics, norms, ic_keys = [], [], []
         for j in range(n_traj):
             for k in ks:
                 col = X_all[j, :, k]
@@ -621,15 +693,7 @@ def compute_data_driven_balancing(
                 scale = 1.0 / nrm if (normalize and nrm > 0.0) else 1.0
                 ics.append(scale * col)
                 norms.append(nrm)
-                if quadrature is None:
-                    views.append(X_all[j, :, k:k + L])
-                else:
-                    st, Wst = stencils[k]
-                    views.append(
-                        lambda _X=X_all[j], _s=st, _W=Wst:
-                        _interpolated_window(_X, _s, _W, sqrt_w)
-                    )
-                scales.append(scale)
+                ic_keys.append((j, k, scale))
 
         if families is not None:
             # Explicit parent grouping: every checkpoint of trajectory j
@@ -661,14 +725,36 @@ def compute_data_driven_balancing(
                 f"families were formed."
             )
 
-        fam_views = [[views[i] for i in g] for g in groups]
-        fam_scales = [[scales[i] for i in g] for g in groups]
+        # Reachability: the impulse responses, over every sample, each in the
+        # family of its earliest checkpoint (that of t = 0 when it is one) and
+        # normalized by its initial amplitude.
+        import numpy as np
+        if quadrature is None:
+            imap, dt_R = (np.arange(nt)[:, None], np.ones((nt, 1))), dt
+        else:
+            om = np.empty(nt)
+            om[1:-1] = 0.5 * (t_h[2:] - t_h[:-2])
+            om[0], om[-1] = t_h[1] - t_h[0], t_h[-1] - t_h[-2]
+            imap, dt_R = (np.arange(nt)[:, None], np.sqrt(om)[:, None]), 1.0
+        fam_of = {i: a for a, g in enumerate(groups) for i in g}
+        imps = [[] for _ in groups]
+        for j in range(n_traj):
+            i0 = j * len(ks)                       # (j, ks[0]): earliest checkpoint
+            if i0 in fam_of:
+                nrm0 = float(bkend.vector_norm(X_all[j, :, 0]))
+                imps[fam_of[i0]].append(
+                    (j, 1.0 / nrm0 if (normalize and nrm0 > 0.0) else 1.0))
+
+        fams = [[ic_keys[i] for i in g] for g in groups]
         fam_X0 = [
             bkend.concatenate([ics[i].reshape(-1, 1) for i in g], axis=1)
             for g in groups
         ]
+        Cmat = (None if output_operator is None else
+                bkend.asarray(output_operator, dtype=X_all.dtype,
+                              device=bkend.device_of(X_all)))
         Phi, Psi, Sig, info = _balance_from_windows(
-            fam_views, fam_scales, fam_X0, w, dt, rank_M, rcond
+            fams, maps, X_all, fam_X0, w, dt, rank_M, rcond, imps, imap, dt_R, Cmat
         )
         info.update(
             checkpoints=ks, window_length=L,

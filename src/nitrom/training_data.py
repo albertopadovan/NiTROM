@@ -9,13 +9,9 @@ from typing import Any
 import dill
 import numpy as np
 
-from .backend import (
-    comm_rank_size,
-    distributed_rank_size,
-    get_backend,
-    mpi_comm_world,
-)
-from .finite_difference import time_derivative
+from .backend import get_backend
+from .distributed import comm_rank_size, distributed_rank_size, mpi_comm_world
+from .numerics import time_derivative
 
 
 class TrainingPool:
@@ -47,9 +43,14 @@ class TrainingPool:
         ``mpiexec`` (NumPy backend), ``torch.distributed``/``torchrun`` for
         PyTorch, single-process otherwise -- so a parallel job shards correctly
         without the caller having to wire up rank/size by hand.
-    **kwargs
-        Optional ``fname_weights``, ``fname_forcing``, ``fname_derivs``,
-        ``fd_stencil_size``.
+    fname_weights, fname_forcing, fname_derivs : str, optional
+        Per-trajectory file patterns for weights, forcing, and derivatives.
+    fd_stencil_size : int, optional
+        Finite-difference stencil width when derivatives must be generated.
+    num_shifts : int, optional
+        Number of virtual time windows per physical trajectory.
+    shift_start_times : sequence of float, optional
+        Explicit window start times; overrides ``num_shifts``.
 
     Notes
     -----
@@ -57,7 +58,7 @@ class TrainingPool:
     present on disk. Whenever a derivative file is missing -- whether
     ``fname_derivs`` was omitted entirely or simply hasn't been generated
     yet for that trajectory -- it is synthesized with a high-order
-    finite-difference stencil (:func:`nitrom.finite_difference.time_derivative`,
+    finite-difference stencil (:func:`nitrom.numerics.finite_difference.time_derivative`,
     fourth-order accurate by default via ``fd_stencil_size=5``) applied to
     the loaded trajectory and cached to disk at that path (or, if
     ``fname_derivs`` was omitted, at a ``deriv_<idx>.npy`` path derived from
@@ -70,10 +71,16 @@ class TrainingPool:
         n_traj: int,
         fname_traj: str,
         fname_time: str,
+        *,
         dtype: Any = None,
         device: str = "cpu",
         comm: Any = None,
-        **kwargs: Any,
+        fname_weights: str | None = None,
+        fname_forcing: str | None = None,
+        fname_derivs: str | None = None,
+        fd_stencil_size: int = 5,
+        num_shifts: int = 1,
+        shift_start_times: list[float] | tuple[float, ...] | None = None,
     ) -> None:
         self.backend = get_backend()
         self.dtype = dtype if dtype is not None else self.backend.float32
@@ -81,7 +88,7 @@ class TrainingPool:
         # Figure out the process group ourselves: an explicit communicator wins;
         # otherwise auto-detect from the active backend (COMM_WORLD under
         # mpiexec, torch.distributed under torchrun, else single-process).  The
-        # resolved communicator is stored so collectives (e.g. compute_POD) use
+        # resolved communicator is stored so collectives (e.g. compute_pod) use
         # the same group the data was sharded over.
         if comm is not None:
             self.comm = comm
@@ -91,11 +98,11 @@ class TrainingPool:
             # Keep COMM_WORLD around for numpy collectives (None if MPI absent).
             self.comm = mpi_comm_world() if self.backend.is_numpy else None
 
-        self.shift_start_times = kwargs.get("shift_start_times", None)
+        self.shift_start_times = shift_start_times
         if self.shift_start_times is not None:
             self.num_shifts = len(self.shift_start_times)
         else:
-            self.num_shifts = int(kwargs.get("num_shifts", 1))
+            self.num_shifts = int(num_shifts)
 
         if self.num_shifts < 1:
             raise ValueError("num_shifts must be >= 1")
@@ -125,12 +132,12 @@ class TrainingPool:
 
         # Load data from file (mapping virtual indices to physical indices)
         self.load_trajectories(fname_traj)
-        self.load_weights(kwargs)
-        self.load_forcing(kwargs)
+        self.load_weights(fname_weights)
+        self.load_forcing(fname_forcing)
         self.time = self.backend.asarray(
             np.load(fname_time), dtype=self.dtype, device=self.device
         )
-        self.load_time_derivatives(kwargs, fname_traj)
+        self.load_time_derivatives(fname_traj, fname_derivs, fd_stencil_size)
 
     #: Environment variables any of which, set to "1", pins BLAS to one thread.
     _THREAD_ENV_VARS = (
@@ -185,32 +192,37 @@ class TrainingPool:
 
     def load_trajectories(self, fname_traj: str) -> None:
         """Load trajectory snapshots from ``.npy`` files into :attr:`X`."""
-        self.fnames_traj = [fname_traj % (k // self.num_shifts) for k in self.traj_indices]
+        self.fnames_traj = [
+            fname_traj % (k // self.num_shifts) for k in self.traj_indices
+        ]
         X = [np.load(f) for f in self.fnames_traj]
-        self.X = self.backend.asarray(
-            np.stack(X), dtype=self.dtype, device=self.device
-        )
+        self.X = self.backend.asarray(np.stack(X), dtype=self.dtype, device=self.device)
         _, self.N, self.n_snapshots = self.X.shape
 
-    def load_weights(self, kwargs: dict[str, Any]) -> None:
+    def load_weights(self, fname_weights: str | None) -> None:
         """Load per-trajectory importance weights (default: all ones)."""
-        fname_weights: str | None = kwargs.get("fname_weights")
         if fname_weights is not None:
-            self.fnames_weights = [fname_weights % (k // self.num_shifts) for k in self.traj_indices]
+            self.fnames_weights = [
+                fname_weights % (k // self.num_shifts) for k in self.traj_indices
+            ]
             weights = [np.load(f) for f in self.fnames_weights]
             self.weights = self.backend.asarray(
                 np.stack(weights).reshape(-1), dtype=self.dtype, device=self.device
             )
         else:
-            self.weights = self.backend.zeros(
-                (self.my_n_traj,), dtype=self.dtype, device=self.device
-            ) + 1.0
+            self.weights = (
+                self.backend.zeros(
+                    (self.my_n_traj,), dtype=self.dtype, device=self.device
+                )
+                + 1.0
+            )
 
-    def load_forcing(self, kwargs: dict[str, Any]) -> None:
+    def load_forcing(self, fname_forcing: str | None) -> None:
         """Load per-trajectory forcing callables from pickle files."""
-        fname_forcing: str | None = kwargs.get("fname_forcing")
         if fname_forcing is not None:
-            self.fnames_forcing = [fname_forcing % (k // self.num_shifts) for k in self.traj_indices]
+            self.fnames_forcing = [
+                fname_forcing % (k // self.num_shifts) for k in self.traj_indices
+            ]
             self.forcing_fns: list[Callable] = []
             for f in self.fnames_forcing:
                 with open(f, "rb") as fh:
@@ -225,9 +237,7 @@ class TrainingPool:
         """Wrap a forcing callable so it returns a backend array of the right dtype."""
 
         def wrapped(t):
-            return self.backend.asarray(
-                fn(t), dtype=self.dtype, device=self.device
-            )
+            return self.backend.asarray(fn(t), dtype=self.dtype, device=self.device)
 
         return wrapped
 
@@ -257,7 +267,9 @@ class TrainingPool:
         np.save(tmp_path, array)
         os.replace(tmp_path, path)
 
-    def load_time_derivatives(self, kwargs: dict[str, Any], fname_traj: str) -> None:
+    def load_time_derivatives(
+        self, fname_traj: str, fname_deriv: str | None, stencil_size: int
+    ) -> None:
         """Load time derivatives, generating and caching any that are missing.
 
         If ``fname_derivs`` is given, its files are used (and generated at
@@ -267,12 +279,13 @@ class TrainingPool:
         finite-difference stencil and saved, so it doesn't need to be
         regenerated on subsequent calls.
         """
-        fname_deriv: str | None = kwargs.get("fname_derivs")
         if fname_deriv is None:
             fname_deriv = self._default_deriv_pattern(fname_traj)
-        stencil_size = int(kwargs.get("fd_stencil_size", 5))
+        stencil_size = int(stencil_size)
 
-        self.fnames_deriv = [fname_deriv % (k // self.num_shifts) for k in self.traj_indices]
+        self.fnames_deriv = [
+            fname_deriv % (k // self.num_shifts) for k in self.traj_indices
+        ]
         time_np = self.backend.to_numpy(self.time)
 
         dX = []
@@ -295,10 +308,10 @@ class TrainingData:
         self,
         pool,
         which_trajs,
-        percent_time_length,
-        leggauss_deg,
-        nsave_rom,
-        **kwargs,
+        percent_time_length: float = 1.0,
+        *,
+        shift_start_times=None,
+        num_shifts: int | None = None,
     ):
         """
         Training-data view passed to the optimizer.
@@ -306,15 +319,14 @@ class TrainingData:
         pool:                an instance of TrainingPool
         which_trajs:         integer indices selecting a subset of pool's trajectories
         percent_time_length: fraction in (0, 1] of each trajectory's snapshots to use
-        leggauss_deg:        number of Gauss-Legendre quadrature points for the gradient
-        nsave_rom:           number of ROM snapshots stored between two FOM snapshots
         """
         self.pool = pool
         self.backend = pool.backend
         bkend = self.backend
 
-        shift_start_times = kwargs.get("shift_start_times", getattr(pool, "shift_start_times", None))
-        num_shifts = kwargs.get("num_shifts", pool.num_shifts)
+        if shift_start_times is None:
+            shift_start_times = pool.shift_start_times
+        num_shifts = pool.num_shifts if num_shifts is None else num_shifts
         if shift_start_times is not None:
             num_shifts = len(shift_start_times)
         if num_shifts < 1:
@@ -357,33 +369,39 @@ class TrainingData:
                         f"n_keep ({n_keep}) is larger than n_snapshots_total ({n_snapshots_total})"
                     )
                 start_indices = np.linspace(0, max_start_idx, num_shifts, dtype=int)
-            
+
             X_list = []
             dX_list = []
             forcing_fns_list = []
-            
+
             for local_idx in self.local_trajs:
-                g_idx = self.global_trajs[local_idx]
+                g_idx = pool.traj_indices[int(local_idx)]
                 shift_idx = int(g_idx % num_shifts)
                 start_idx = start_indices[shift_idx]
-                
+
                 # Use local_idx:local_idx+1 to preserve 3D shape (1, N, n_keep)
-                X_slice = pool.X[local_idx : local_idx + 1, :, start_idx : start_idx + n_keep]
-                dX_slice = pool.dX[local_idx : local_idx + 1, :, start_idx : start_idx + n_keep]
-                
+                X_slice = pool.X[
+                    local_idx : local_idx + 1, :, start_idx : start_idx + n_keep
+                ]
+                dX_slice = pool.dX[
+                    local_idx : local_idx + 1, :, start_idx : start_idx + n_keep
+                ]
+
                 X_list.append(X_slice)
                 dX_list.append(dX_slice)
-                
+
                 if pool.forcing_fns:
                     fn = pool.forcing_fns[local_idx]
                     if fn is not None:
                         shift_time = float(pool.time[start_idx] - pool.time[0])
+
                         def make_shifted_fn(original_fn, t_shift):
                             return lambda t: original_fn(t + t_shift)
+
                         forcing_fns_list.append(make_shifted_fn(fn, shift_time))
                     else:
                         forcing_fns_list.append(None)
-            
+
             self.X = bkend.concatenate(X_list, axis=0)
             self.dX = bkend.concatenate(dX_list, axis=0)
             self.forcing_fns = forcing_fns_list
@@ -396,47 +414,15 @@ class TrainingData:
             self.weights = bkend.empty((0,), device=pool.device, dtype=pool.dtype)
 
         self.my_n_traj, _, self.n_snapshots = self.X.shape
-        self.nsave_rom = nsave_rom
-
-        # Gauss-Legendre quadrature points and weights
-        self.leggauss_deg = leggauss_deg
-        tlg, wlg = np.polynomial.legendre.leggauss(self.leggauss_deg)
-        self.tlg = bkend.asarray(tlg, device=pool.device, dtype=pool.dtype)
-        self.wlg = bkend.asarray(wlg, device=pool.device, dtype=pool.dtype)
 
         # Scale the weights so the cost measures the average error over
         # snapshots and trajectories.
         self.weights = self.weights * (len(self.global_trajs) * self.n_snapshots)
 
-        # Parse the keyword arguments
-        self.which_fix = kwargs.get("which_fix", "fix_none")
-        if self.which_fix not in ["fix_tensors", "fix_bases", "fix_none"]:
-            raise ValueError("which_fix must be fix_none, fix_tensors or fix_bases")
-
-        self.l2_pen = kwargs.get("stab_promoting_pen")
-        self.pen_tf = kwargs.get("stab_promoting_tf")
-        self.randic = kwargs.get("stab_promoting_ic")
-
-        if self.l2_pen is not None and self.pen_tf is None:
-            raise ValueError(
-                "If you provide a value for stab_promoting_pen you also have "
-                "to provide a value for stab_promoting_tf"
-            )
-
-        if self.l2_pen is not None and self.randic is None:
-            raise ValueError(
-                "If you provide a value for stab_promoting_pen you also have "
-                "to provide a random ic vector of the same size as the ROM"
-            )
-
-        if self.randic is not None:
-            self.randic = self.randic / bkend.vector_norm(self.randic)
-            self.randic = self.randic.reshape(-1)
-
     def _global_to_local_indices(self, global_indices):
         bkend = self.backend
-        global_indices = bkend.asarray(global_indices)
-        gpu_indices = bkend.asarray(self.pool.traj_indices)
+        global_indices = bkend.asarray(global_indices, device=self.pool.device)
+        gpu_indices = bkend.asarray(self.pool.traj_indices, device=self.pool.device)
 
         # Filter to trajectories owned by this pool, then map global IDs to
         # local positions.

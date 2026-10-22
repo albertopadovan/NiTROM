@@ -1,11 +1,11 @@
 from typing import Any
-from scipy.linalg import solve_continuous_lyapunov
+
 import numpy as np
+from scipy.linalg import solve_continuous_lyapunov
 
-
+from ..distributed import distributed_rank_size
 from .model import Model
 from .polynomial_model import PolynomialModel
-from ..backend import mpi_rank_size
 
 
 class GasPolynomialModel(Model):
@@ -55,6 +55,8 @@ class GasPolynomialModel(Model):
         instability_threshold: float = 1e6,
         gas_params: list | None = None,
         forcing_config: dict | None = None,
+        *,
+        backend=None,
     ):
         # Determine GAS parameter names, shapes, and initializations
         specs = self._gas_param_specs(r, poly_comp)
@@ -70,7 +72,7 @@ class GasPolynomialModel(Model):
         if forcing_exists:
             param_names.append("B")
 
-        super().__init__(r, param_names, device, dtype)
+        super().__init__(r, param_names, device, dtype, backend=backend)
         bkend = self.backend
         self.poly_comp = self._inner_poly_comp(poly_comp)
         self.forcing_exists = forcing_exists
@@ -79,7 +81,8 @@ class GasPolynomialModel(Model):
         if gas_params is not None:
             for name, tensor in zip(param_names, gas_params, strict=True):
                 setattr(
-                    self, name,
+                    self,
+                    name,
                     bkend.asarray(tensor, dtype=self.dtype, device=self.device),
                 )
         else:
@@ -87,7 +90,8 @@ class GasPolynomialModel(Model):
             for name, shape, init in specs:
                 alloc = bkend.zeros if init == "zeros" else bkend.randn
                 setattr(
-                    self, name,
+                    self,
+                    name,
                     alloc(shape, dtype=self.dtype, device=self.device),
                 )
             # Initialize B (fixed value if supplied, else zeros)
@@ -111,6 +115,7 @@ class GasPolynomialModel(Model):
         self.model = PolynomialModel(
             r,
             self.poly_comp,
+            backend=self.backend,
             device=device,
             dtype=self.dtype,
             instability_threshold=instability_threshold,
@@ -293,7 +298,7 @@ class GasPolynomialModel(Model):
             reconstruct the (stabilized) ``A``, or if a structured ``H``
             fails to be reconstructed
         """
-        rank, _ = mpi_rank_size()
+        rank, _ = distributed_rank_size(backend=self.backend)
         printable = rank == 0
 
         bkend = self.backend
@@ -320,10 +325,11 @@ class GasPolynomialModel(Model):
             if optimize_F:
                 from scipy.linalg import solve_triangular
                 from scipy.optimize import approx_fprime
+
                 from nitrom.optimization.manifold_optimization import riemannian_lbfgs
 
                 A_np = bkend.to_numpy(A)
-                
+
                 def build_L(x):
                     L = np.zeros((r, r))
                     L[np.tril_indices(r)] = x
@@ -336,20 +342,20 @@ class GasPolynomialModel(Model):
                         L_inv = solve_triangular(L, np.eye(r), lower=True)
                     except (np.linalg.LinAlgError, ValueError):
                         return 1e18
-                    
+
                     F_np = L_inv @ L_inv.T
-                    
+
                     try:
                         P_np_opt = solve_continuous_lyapunov(A_np.T, -F_np)
                     except ValueError:
                         return 1e18
-                    
+
                     cond_P = np.linalg.cond(P_np_opt)
                     cond_F = np.linalg.cond(F_np)
-                    
+
                     if not np.isfinite(cond_P) or not np.isfinite(cond_F):
                         return 1e18
-                        
+
                     return cond_P + F_cond_penalty * cond_F
 
                 def grad_fn_flat(xs):
@@ -360,8 +366,8 @@ class GasPolynomialModel(Model):
 
                 # Initial guess: L = I
                 x0 = np.eye(r)[np.tril_indices(r)]
-                
-                res_xs, res_f = riemannian_lbfgs(
+
+                res_xs, _res_f = riemannian_lbfgs(
                     cost_fn_flat,
                     grad_fn_flat,
                     x0=[x0],
@@ -369,22 +375,24 @@ class GasPolynomialModel(Model):
                     max_iter=100,
                     callback=(
                         lambda it, f, gnorm: print(
-                            f"F-Optimization Iteration {it+1} | Cost: {f:.4e} | gnorm: {gnorm:.2e}",
-                            flush=True
+                            f"F-Optimization Iteration {it + 1} | Cost: {f:.4e} | gnorm: {gnorm:.2e}",
+                            flush=True,
                         )
-                    ) if printable else None
+                    )
+                    if printable
+                    else None,
                 )
-                
+
                 L_opt = build_L(res_xs[0])
                 L_inv_opt = solve_triangular(L_opt, np.eye(r), lower=True)
-                F = bkend.asarray(L_inv_opt @ L_inv_opt.T, dtype=self.dtype, device=self.device)
+                F = bkend.asarray(
+                    L_inv_opt @ L_inv_opt.T, dtype=self.dtype, device=self.device
+                )
             else:
                 F = eye
 
             # Solve A^T P + P A = -F for the SPD Lyapunov solution P.
-            P_np = solve_continuous_lyapunov(
-                bkend.to_numpy(A.T), bkend.to_numpy(-F)
-            )
+            P_np = solve_continuous_lyapunov(bkend.to_numpy(A.T), bkend.to_numpy(-F))
             P = bkend.asarray(P_np, dtype=self.dtype, device=self.device)
 
         P = 0.5 * (P + P.T)  # symmetrize against round-off
@@ -422,14 +430,16 @@ class GasPolynomialModel(Model):
             )
             # Check if the input H was already structured (skew-symmetric under
             # the P metric).
-            is_structured = float(
-                bkend.vector_norm(H_Pinv + bkend.permute(H_Pinv, (1, 0, 2)))
-                / (bkend.vector_norm(H_Pinv) + 1e-12)
-            ) < 1e-6
+            is_structured = (
+                float(
+                    bkend.vector_norm(H_Pinv + bkend.permute(H_Pinv, (1, 0, 2)))
+                    / (bkend.vector_norm(H_Pinv) + 1e-12)
+                )
+                < 1e-6
+            )
             if is_structured:
                 err_H = float(
-                    bkend.vector_norm(H_recon - H)
-                    / (bkend.vector_norm(H) + 1e-12)
+                    bkend.vector_norm(H_recon - H) / (bkend.vector_norm(H) + 1e-12)
                 )
                 if err_H > 1e-6:
                     raise RuntimeError(
@@ -439,9 +449,7 @@ class GasPolynomialModel(Model):
 
         # Set the GAS parameters (preserving B and any other current params).
         retracted = {"K": K, "R": R, "Q": Q, "S": S}
-        params = [
-            retracted.get(name, getattr(self, name)) for name in self.param_names
-        ]
+        params = [retracted.get(name, getattr(self, name)) for name in self.param_names]
         self.update_params(params)
 
     def evaluate_rhs(self, t: float, z: Any, **kwargs) -> Any:
@@ -458,11 +466,11 @@ class GasPolynomialModel(Model):
 
     def project_inner_gradients(self, inner_grads: list[Any]) -> list[Any]:
         """
-        Project the accumulated inner gradients (w.r.t A, H, [B]) back to the 
+        Project the accumulated inner gradients (w.r.t A, H, [B]) back to the
         GAS parameters (K, R, Q, S, [B]).
         """
         bkend = self.backend
-        
+
         # Unpack inner gradients (indexed by position in poly_comp)
         grad_A = inner_grads[self.poly_comp.index(1)] if 1 in self.poly_comp else None
         grad_H = inner_grads[self.poly_comp.index(2)] if 2 in self.poly_comp else None
@@ -493,7 +501,9 @@ class GasPolynomialModel(Model):
             grad_Qtil += bkend.einsum("jik,jlk->il", self._S_diff, grad_H)
 
             # grad_Q from Qtil = Q^{-1} Q^{-T}
-            grad_Q = -(self._Qinv.T @ (grad_Qtil @ Qtil) + self._Qinv.T @ (grad_Qtil.T @ Qtil))
+            grad_Q = -(
+                self._Qinv.T @ (grad_Qtil @ Qtil) + self._Qinv.T @ (grad_Qtil.T @ Qtil)
+            )
 
             # grad_S_{abc} = Σ_j grad_H_{ajc} Qtil_{bj} - Σ_j grad_H_{bjc} Qtil_{aj}
             grad_S_pre = bkend.einsum("ijk,jl->ilk", grad_H, Qtil)
@@ -505,7 +515,9 @@ class GasPolynomialModel(Model):
 
         return grads
 
-    def inner_vjp_evaluate_rhs(self, z: Any, v: Any, reg: float = 0.0, **kwargs) -> list[Any]:
+    def inner_vjp_evaluate_rhs(
+        self, z: Any, v: Any, reg: float = 0.0, **kwargs
+    ) -> list[Any]:
         r"""
         VJP of the RHS with respect to the inner model parameters.
 
@@ -520,7 +532,11 @@ class GasPolynomialModel(Model):
         return self.model.vjp_evaluate_rhs(z, v, reg=reg, **kwargs)
 
     def inner_batched_vjp_evaluate_rhs(
-        self, Z: Any, V: Any, U: Any = None, out: list | None = None,
+        self,
+        Z: Any,
+        V: Any,
+        U: Any = None,
+        out: list | None = None,
         max_bytes: int = 64 << 20,
     ) -> list[Any]:
         """Batched VJP w.r.t. the inner ``(A, H, [B])`` tensors.

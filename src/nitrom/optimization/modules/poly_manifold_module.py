@@ -1,9 +1,7 @@
 from typing import Any
 
-from nitrom.backend import get_backend
 from nitrom.projections.polynomial_projection import PolynomialProjection
 from nitrom.training_data import TrainingData
-
 
 from .base import InferenceModule
 
@@ -58,9 +56,11 @@ class PolyManifoldInfModule(InferenceModule):
         reg: float = 0.0,
         initial_guess: list | None = None,
     ) -> None:
-        super().__init__()
-        bkend = get_backend()
-        self.backend = bkend
+        super().__init__(backend=getattr(training_data, "backend", None))
+        self.training_data = training_data
+        self.backend.validate_components(training_data)
+        self.backend.validate_arrays(Phi=Phi, Psi=Psi)
+        bkend = self.backend
 
         if Psi is None:
             Psi = Phi
@@ -103,7 +103,9 @@ class PolyManifoldInfModule(InferenceModule):
             ]
 
         # Create the underlying PolynomialProjection
-        self.proj = PolynomialProjection(nonlin_poly_comp, proj_tensors)
+        self.proj = PolynomialProjection(
+            nonlin_poly_comp, proj_tensors, backend=self.backend
+        )
 
         # Register only the A_k tensors as parameters (Phi, Psi are fixed)
         for k in nonlin_poly_comp:

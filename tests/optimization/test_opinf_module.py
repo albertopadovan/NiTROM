@@ -2,12 +2,13 @@
 
 import numpy as np
 import pytest
-import torch
 
 from nitrom.latent_space_models.gas_polynomial_model import GasPolynomialModel
 from nitrom.latent_space_models.polynomial_model import PolynomialModel
 from nitrom.optimization import OpInfModule
 from nitrom.projections.linear_projection import LinearProjection
+
+torch = pytest.importorskip("torch")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -15,20 +16,31 @@ from nitrom.projections.linear_projection import LinearProjection
 
 
 def _make_module(
-    opt_obj, Phi, poly_comp=(1, 2), reg=0.0, gas_flag=False,
-    initial_guess=None, forcing_config=None,
+    opt_obj,
+    Phi,
+    poly_comp=(1, 2),
+    reg=None,
+    gas_flag=False,
+    initial_guess=None,
+    forcing_config=None,
 ):
     """Build a latent-space model then wrap it in an OpInfModule."""
     r = Phi.shape[-1]
     if gas_flag:
         rom = GasPolynomialModel(
-            r, list(poly_comp), dtype=Phi.dtype,
-            gas_params=initial_guess, forcing_config=forcing_config,
+            r,
+            list(poly_comp),
+            dtype=Phi.dtype,
+            gas_params=initial_guess,
+            forcing_config=forcing_config,
         )
     else:
         rom = PolynomialModel(
-            r, list(poly_comp), dtype=Phi.dtype,
-            tensors=initial_guess, forcing_config=forcing_config,
+            r,
+            list(poly_comp),
+            dtype=Phi.dtype,
+            tensors=initial_guess,
+            forcing_config=forcing_config,
         )
     projection = LinearProjection([Phi, Phi])
     return OpInfModule(opt_obj, rom, projection, reg=reg)
@@ -38,7 +50,13 @@ class _MockOptObj:
     """Minimal stand-in for TrainingData with X, dX, weights."""
 
     def __init__(
-        self, ntraj, N, nt, device="cpu", dtype=torch.float64, seed=0,
+        self,
+        ntraj,
+        N,
+        nt,
+        device="cpu",
+        dtype=torch.float64,
+        seed=0,
         forcing_fns=None,
     ):
         rng = np.random.default_rng(seed)
@@ -67,42 +85,41 @@ def _make_phi(N, r, seed=42):
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(params=[False, True], ids=["standard", "gas"])
 def model(request):
     gas_flag = request.param
     opt_obj = _MockOptObj(NTRAJ, N, NT, dtype=DTYPE, seed=0)
     Phi = _make_phi(N, R)
     poly_comp = [1, 2]
-    return _make_module(opt_obj, Phi, poly_comp, reg=0.01, gas_flag=gas_flag)
+    return _make_module(opt_obj, Phi, poly_comp, reg={2: 0.01}, gas_flag=gas_flag)
 
 
 @pytest.fixture()
 def model_standard():
     opt_obj = _MockOptObj(NTRAJ, N, NT, dtype=DTYPE, seed=0)
     Phi = _make_phi(N, R)
-    return _make_module(opt_obj, Phi, [1, 2], reg=0.01, gas_flag=False)
+    return _make_module(opt_obj, Phi, [1, 2], reg={2: 0.01}, gas_flag=False)
 
 
 @pytest.fixture()
 def model_gas():
     opt_obj = _MockOptObj(NTRAJ, N, NT, dtype=DTYPE, seed=0)
     Phi = _make_phi(N, R)
-    return _make_module(opt_obj, Phi, [1, 2], reg=0.01, gas_flag=True)
+    return _make_module(opt_obj, Phi, [1, 2], reg={2: 0.01}, gas_flag=True)
 
 
 def _make_forcing_fns(ntraj, m, seed=77):
     """Create simple linear forcing callables for testing."""
     rng = np.random.default_rng(seed)
     coeffs = [
-        torch.tensor(rng.standard_normal((m,)), dtype=DTYPE)
-        for _ in range(ntraj)
+        torch.tensor(rng.standard_normal((m,)), dtype=DTYPE) for _ in range(ntraj)
     ]
     offsets = [
-        torch.tensor(rng.standard_normal((m,)), dtype=DTYPE)
-        for _ in range(ntraj)
+        torch.tensor(rng.standard_normal((m,)), dtype=DTYPE) for _ in range(ntraj)
     ]
     return [
-        (lambda t, c=c, o=o: c * t + o) for c, o in zip(coeffs, offsets)
+        (lambda t, c=c, o=o: c * t + o) for c, o in zip(coeffs, offsets, strict=False)
     ]
 
 
@@ -112,7 +129,9 @@ def model_standard_forcing():
     opt_obj = _MockOptObj(NTRAJ, N, NT, dtype=DTYPE, seed=0, forcing_fns=forcing_fns)
     Phi = _make_phi(N, R)
     fc = {"forcing_exists": True, "m": M}
-    return _make_module(opt_obj, Phi, [1, 2], reg=0.01, gas_flag=False, forcing_config=fc)
+    return _make_module(
+        opt_obj, Phi, [1, 2], reg={2: 0.01}, gas_flag=False, forcing_config=fc
+    )
 
 
 @pytest.fixture()
@@ -121,15 +140,17 @@ def model_gas_forcing():
     opt_obj = _MockOptObj(NTRAJ, N, NT, dtype=DTYPE, seed=0, forcing_fns=forcing_fns)
     Phi = _make_phi(N, R)
     fc = {"forcing_exists": True, "m": M}
-    return _make_module(opt_obj, Phi, [1, 2], reg=0.01, gas_flag=True, forcing_config=fc)
+    return _make_module(
+        opt_obj, Phi, [1, 2], reg={2: 0.01}, gas_flag=True, forcing_config=fc
+    )
 
 
 # ---------------------------------------------------------------------------
 # Basic tests
 # ---------------------------------------------------------------------------
 
-class TestBasic:
 
+class TestBasic:
     def test_forward_returns_scalar(self, model):
         loss = model()
         assert loss.ndim == 0
@@ -142,10 +163,8 @@ class TestBasic:
         grads = model.gradient()
         params = list(model.parameters())
         assert len(grads) == len(params)
-        for g, p in zip(grads, params):
-            assert g.shape == p.shape, (
-                f"grad shape {g.shape} != param shape {p.shape}"
-            )
+        for g, p in zip(grads, params, strict=False):
+            assert g.shape == p.shape, f"grad shape {g.shape} != param shape {p.shape}"
 
     def test_param_names(self, model):
         names = model.rom.param_names
@@ -155,6 +174,7 @@ class TestBasic:
 # ---------------------------------------------------------------------------
 # Gradient check via torch.autograd
 # ---------------------------------------------------------------------------
+
 
 class TestGradientAutograd:
     """Verify analytic gradient against torch.autograd."""
@@ -175,7 +195,9 @@ class TestGradientAutograd:
             p.grad = None
             p.requires_grad_(False)
 
-        for i, (ga, gad) in enumerate(zip(grads_analytic, grads_autograd)):
+        for i, (ga, gad) in enumerate(
+            zip(grads_analytic, grads_autograd, strict=False)
+        ):
             np.testing.assert_allclose(
                 ga.detach().numpy(),
                 gad.detach().numpy(),
@@ -201,8 +223,8 @@ class TestGradientAutograd:
 # Convergence: loss should decrease
 # ---------------------------------------------------------------------------
 
-class TestConvergence:
 
+class TestConvergence:
     def test_loss_decreases_adam(self, model):
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
         losses = []
@@ -210,7 +232,7 @@ class TestConvergence:
             optimizer.zero_grad()
             loss = model()
             grads = model.gradient()
-            for param, grad in zip(model.parameters(), grads):
+            for param, grad in zip(model.parameters(), grads, strict=False):
                 param.grad = grad.contiguous().clone()
             optimizer.step()
             losses.append(loss.item())
@@ -224,8 +246,8 @@ class TestConvergence:
 # Initial guess
 # ---------------------------------------------------------------------------
 
-class TestInitialGuess:
 
+class TestInitialGuess:
     def test_standard_initial_guess(self):
         opt_obj = _MockOptObj(NTRAJ, N, NT, dtype=DTYPE, seed=0)
         Phi = _make_phi(N, R)
@@ -247,14 +269,17 @@ class TestInitialGuess:
         poly_comp = [1, 2]
 
         init = [
-            torch.eye(R, dtype=DTYPE),       # K
-            torch.eye(R, dtype=DTYPE),       # R
-            torch.eye(R, dtype=DTYPE),       # Q
+            torch.eye(R, dtype=DTYPE),  # K
+            torch.eye(R, dtype=DTYPE),  # R
+            torch.eye(R, dtype=DTYPE),  # Q
             0.01 * torch.randn(R, R, R, dtype=DTYPE),  # S
         ]
         model = _make_module(opt_obj, Phi, poly_comp, gas_flag=True, initial_guess=init)
 
         params = list(model.parameters())
         assert len(params) == 4
-        for p, ig in zip(params, init):
+        for p, ig in zip(params, init, strict=False):
             np.testing.assert_allclose(p.detach().numpy(), ig.numpy())
+
+
+pytestmark = pytest.mark.usefixtures("torch_backend")

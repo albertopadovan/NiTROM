@@ -18,7 +18,6 @@ Manifolds under test:
 import numpy as np
 import pytest
 
-from nitrom.backend import set_backend
 from nitrom.optimization.manifold_optimization import (
     inner,
     project,
@@ -29,13 +28,6 @@ from nitrom.optimization.manifold_optimization import (
 
 N, R = 8, 3
 MATRIX_MANIFOLDS = ["stiefel", "grassmann"]
-
-
-@pytest.fixture(autouse=True)
-def _numpy_backend():
-    set_backend("numpy")
-    yield
-    set_backend("torch")
 
 
 def _point(seed, manifold, n=N, r=R):
@@ -54,14 +46,15 @@ def _assert_tangent(X, T, manifold, atol=1e-11):
     """Assert T lies in the tangent space at X."""
     XtT = X.T @ T
     if manifold == "grassmann":
-        assert np.allclose(XtT, 0.0, atol=atol)            # X^T T = 0
+        assert np.allclose(XtT, 0.0, atol=atol)  # X^T T = 0
     else:
-        assert np.allclose(XtT + XtT.T, 0.0, atol=atol)    # X^T T skew-symmetric
+        assert np.allclose(XtT + XtT.T, 0.0, atol=atol)  # X^T T skew-symmetric
 
 
 # --------------------------------------------------------------------------
 # Tangent projection (= Riemannian gradient under the embedded metric)
 # --------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize("manifold", MATRIX_MANIFOLDS)
 def test_projection_lands_in_tangent_space(manifold):
@@ -97,6 +90,7 @@ def test_projection_euclidean_is_identity():
 # Retraction
 # --------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize("manifold", MATRIX_MANIFOLDS)
 def test_retraction_stays_on_manifold(manifold):
     X = _point(4, manifold)
@@ -130,6 +124,7 @@ def test_retraction_euclidean_is_addition():
 # --------------------------------------------------------------------------
 # Vector transport  (the primary focus)
 # --------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize("manifold", MATRIX_MANIFOLDS)
 def test_transport_lands_in_target_tangent_space(manifold):
@@ -198,6 +193,7 @@ def test_transport_euclidean_is_identity():
 # Metric
 # --------------------------------------------------------------------------
 
+
 def test_inner_is_symmetric_and_frobenius():
     U = np.random.default_rng(27).standard_normal((4, 3))
     V = np.random.default_rng(28).standard_normal((4, 3))
@@ -208,6 +204,7 @@ def test_inner_is_symmetric_and_frobenius():
 # --------------------------------------------------------------------------
 # Riemannian gradient consistency (project + retract, jointly, vs finite diff)
 # --------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize("manifold", MATRIX_MANIFOLDS)
 def test_riemannian_gradient_matches_finite_difference(manifold):
@@ -228,3 +225,6 @@ def test_riemannian_gradient_matches_finite_difference(manifold):
     t = 1e-6
     fd = (f(retract(X, t * xi, manifold)) - f(retract(X, -t * xi, manifold))) / (2 * t)
     assert inner(rgrad, xi) == pytest.approx(fd, abs=1e-6)
+
+
+pytestmark = pytest.mark.usefixtures("numpy_backend")

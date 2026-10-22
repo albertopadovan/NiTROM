@@ -27,8 +27,10 @@ class Model(metaclass=abc.ABCMeta):
         param_names: list[str],
         device: str = "cpu",
         dtype: Any = None,
+        *,
+        backend=None,
     ):
-        self._backend = get_backend()
+        self._backend = backend or get_backend()
         self._r = r
         self._device = device
         self._dtype = dtype if dtype is not None else self._backend.float64
@@ -110,9 +112,9 @@ class Model(metaclass=abc.ABCMeta):
 
     def inner_params(self) -> list[Any]:
         """
-        Return the inner parameter tensors for which `vjp_evaluate_rhs` 
+        Return the inner parameter tensors for which `vjp_evaluate_rhs`
         directly computes gradients. By default, this is `self.get_params()`.
-        
+
         :rtype: list
         """
         return self.get_params()
@@ -121,14 +123,18 @@ class Model(metaclass=abc.ABCMeta):
         """
         Project accumulated inner gradients to the actual model parameters.
         By default, this is the identity mapping.
-        
+
         :param inner_grads: gradients with respect to `inner_params()`
         :rtype: list
         """
         return inner_grads
 
     def batched_vjp_evaluate_rhs(
-        self, Z: Any, V: Any, U: Any = None, out: list | None = None,
+        self,
+        Z: Any,
+        V: Any,
+        U: Any = None,
+        out: list | None = None,
         max_bytes: int = 64 << 20,
     ) -> list:
         """
@@ -157,7 +163,11 @@ class Model(metaclass=abc.ABCMeta):
         return [o + g for o, g in zip(out, grads, strict=True)]
 
     def inner_batched_vjp_evaluate_rhs(
-        self, Z: Any, V: Any, U: Any = None, out: list | None = None,
+        self,
+        Z: Any,
+        V: Any,
+        U: Any = None,
+        out: list | None = None,
         max_bytes: int = 64 << 20,
     ) -> list:
         """Batched parameter VJP w.r.t. :meth:`inner_params`.
@@ -166,14 +176,12 @@ class Model(metaclass=abc.ABCMeta):
         :meth:`batched_vjp_evaluate_rhs` unless the model has a two-level
         parameterization.
         """
-        return self.batched_vjp_evaluate_rhs(
-            Z, V, U=U, out=out, max_bytes=max_bytes
-        )
+        return self.batched_vjp_evaluate_rhs(Z, V, U=U, out=out, max_bytes=max_bytes)
 
     def inner_vjp_evaluate_rhs(self, z: Any, v: Any, *args, **kwargs) -> list:
         """
         VJP of the RHS with respect to the inner parameter tensors.
-        For models without a two-level parameterization, this is identical 
+        For models without a two-level parameterization, this is identical
         to `vjp_evaluate_rhs`.
         """
         return self.vjp_evaluate_rhs(z, v, *args, **kwargs)

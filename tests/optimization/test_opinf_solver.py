@@ -1,24 +1,25 @@
 import numpy as np
 import pytest
-import torch
 
-from nitrom.backend import set_backend, get_backend
+from nitrom.backend import get_backend, set_backend
 from nitrom.latent_space_models.polynomial_model import PolynomialModel
 from nitrom.optimization import OpInfModule, solve_opinf, train
 from nitrom.projections.linear_projection import LinearProjection
 
-
-@pytest.fixture(autouse=True)
-def _restore_backend():
-    yield
-    set_backend("torch")
+torch = pytest.importorskip("torch")
 
 
 class _MockOptObj:
     """Minimal stand-in for TrainingData with X, dX, weights."""
 
     def __init__(
-        self, ntraj, N, nt, device="cpu", dtype=torch.float64, seed=0,
+        self,
+        ntraj,
+        N,
+        nt,
+        device="cpu",
+        dtype=torch.float64,
+        seed=0,
         forcing_fns=None,
     ):
         rng = np.random.default_rng(seed)
@@ -50,7 +51,7 @@ def _make_forcing_fns(ntraj, m, seed=77):
         for _ in range(ntraj)
     ]
     return [
-        (lambda t, c=c, o=o: c * t + o) for c, o in zip(coeffs, offsets)
+        (lambda t, c=c, o=o: c * t + o) for c, o in zip(coeffs, offsets, strict=False)
     ]
 
 
@@ -61,24 +62,26 @@ def _to_numpy(bkend, x):
 
 
 @pytest.mark.parametrize("backend_name", ["numpy", "torch"])
-@pytest.mark.parametrize("forcing", [False, True])
-@pytest.mark.parametrize("fixed_B", [False, True])
-def test_solve_opinf(backend_name, forcing, fixed_B):
-    # Skip invalid configuration: fixed_B has no meaning if forcing is False
-    if fixed_B and not forcing:
-        return
-
+@pytest.mark.parametrize("solver", ["normal", "lstsq"])
+@pytest.mark.parametrize(
+    "forcing,fixed_B",
+    [(False, False), (True, False), (True, True)],
+    ids=["unforced", "learned-B", "fixed-B"],
+)
+def test_solve_opinf(backend_name, forcing, fixed_B, solver):
     # 1. Set backend
     set_backend(backend_name)
     bkend = get_backend()
-    
+
     ntraj, N, nt, r, m = 3, 5, 6, 2, 1
     dtype = bkend.float64
 
     # 2. Set up training data
     forcing_fns = _make_forcing_fns(ntraj, m) if forcing else None
-    opt_obj_torch = _MockOptObj(ntraj, N, nt, dtype=torch.float64, seed=42, forcing_fns=forcing_fns)
-    
+    opt_obj_torch = _MockOptObj(
+        ntraj, N, nt, dtype=torch.float64, seed=42, forcing_fns=forcing_fns
+    )
+
     # Cast to appropriate backend types
     class BackendData:
         def __init__(self, torch_data):
@@ -105,17 +108,17 @@ def test_solve_opinf(backend_name, forcing, fixed_B):
         forcing_config = {"forcing_exists": True, "m": m, "B": B_fixed}
 
     rom = PolynomialModel(r, [1, 2], dtype=dtype, forcing_config=forcing_config)
-    module = OpInfModule(training_data, rom, projection, reg=1e-6)
+    module = OpInfModule(training_data, rom, projection, reg={2: 1e-6})
 
     if forcing and fixed_B:
         module.set_unlearnable("B")
 
     # 4. Solves analytically
-    solve_opinf(module)
+    solve_opinf(module, solver=solver)
 
     # 5. Check gradient at the analytical solution is zero
     grads = module.gradient()
-    for name, grad in zip(module.rom.param_names, grads):
+    for name, grad in zip(module.rom.param_names, grads, strict=False):
         if module.is_learnable[name]:
             grad_np = _to_numpy(bkend, grad)
             # The gradient norm should be extremely small at the minimum
@@ -123,12 +126,15 @@ def test_solve_opinf(backend_name, forcing, fixed_B):
 
     # 6. Check that L-BFGS optimization does not improve the loss significantly
     loss_analytical = float(_to_numpy(bkend, module()))
-    
+
     # Run optimizer for 10 epochs
     train(module, n_epochs=10, lr=1.0, optimizer_type="lbfgs", tol=1e-12)
     loss_optimized = float(_to_numpy(bkend, module()))
-    
+
     # Assert loss did not decrease (within numerical tolerance)
     assert loss_optimized <= loss_analytical + 1e-12
     # Ensure they are extremely close
     assert np.abs(loss_analytical - loss_optimized) < 1e-8
+
+
+pytestmark = pytest.mark.usefixtures("torch_backend")

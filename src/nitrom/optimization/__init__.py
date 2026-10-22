@@ -5,5 +5,13 @@ from .modules import (
     PolyManifoldInfModule,
 )
 from .opinf_solver import solve_opinf
-from .rom_utils import perform_POD
 from .train import train
+
+__all__ = [
+    "InferenceModule",
+    "NitromModule",
+    "OpInfModule",
+    "PolyManifoldInfModule",
+    "solve_opinf",
+    "train",
+]

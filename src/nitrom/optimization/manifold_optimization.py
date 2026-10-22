@@ -44,23 +44,23 @@ def project(X, G, manifold):
     return G
 
 
-def to_manifold(X, manifold):
+def to_manifold(X, manifold, *, backend=None):
     """Retract an ambient point ``X`` onto the manifold (QR factor with a sign
     fix so the map is smooth); identity on the Euclidean manifold."""
     if manifold == "euclidean":
         return X
-    bkend = get_backend()
+    bkend = backend or get_backend()
     Q, R = bkend.qr(X)
     ph = bkend.sign(bkend.diagonal(R))
     ph = bkend.where(ph == 0, bkend.ones_like(ph), ph)
     return Q * ph[None, :]
 
 
-def retract(X, xi, manifold):
+def retract(X, xi, manifold, *, backend=None):
     r"""Retraction :math:`R_X(\xi)`: step from ``X`` along the tangent vector
     ``xi`` and return to the manifold.  QR-based for Stiefel/Grassmann,
     :math:`X + \xi` for Euclidean."""
-    return to_manifold(X + xi, manifold)
+    return to_manifold(X + xi, manifold, backend=backend)
 
 
 def transport(X_new, xi, manifold):
@@ -82,8 +82,19 @@ def _list_inner(Us, Vs):
 
 
 def strong_wolfe_line_search(
-    cost_fn, rgrad_fn, x, d, manifolds, f0, g0,
-    c1=1e-4, c2=0.9, max_iter=25, t_init=1.0,
+    cost_fn,
+    rgrad_fn,
+    x,
+    d,
+    manifolds,
+    f0,
+    g0,
+    c1=1e-4,
+    c2=0.9,
+    max_iter=25,
+    t_init=1.0,
+    *,
+    backend=None,
 ):
     r"""Riemannian strong-Wolfe line search along the retraction.
 
@@ -120,15 +131,19 @@ def strong_wolfe_line_search(
         return None
 
     def eval_cost(t):  # cheap probe: retraction + cost only
-        y = [retract(xi, t * di, m)
-             for xi, di, m in zip(x, d, manifolds, strict=True)]
+        y = [
+            retract(xi, t * di, m, backend=backend)
+            for xi, di, m in zip(x, d, manifolds, strict=True)
+        ]
         f = cost_fn(y)
         return y, f
 
     def eval_grad(y):  # expensive probe: gradient + transported slope at y
         g = rgrad_fn(y)
-        dphi = sum(inner(gi, transport(yi, di, m))
-                   for gi, yi, di, m in zip(g, y, d, manifolds, strict=True))
+        dphi = sum(
+            inner(gi, transport(yi, di, m))
+            for gi, yi, di, m in zip(g, y, d, manifolds, strict=True)
+        )
         return g, dphi
 
     def trial_step(lo, f_lo, dphi_lo, hi, f_hi):
@@ -178,7 +193,7 @@ def strong_wolfe_line_search(
 
 
 def _armijo_backtracking(
-    cost_fn, rgrad_fn, x, d, manifolds, f0, g0, c1=1e-4, max_bt=40,
+    cost_fn, rgrad_fn, x, d, manifolds, f0, g0, c1=1e-4, max_bt=40, *, backend=None
 ):
     r"""Riemannian Armijo backtracking along the retraction.
 
@@ -194,8 +209,10 @@ def _armijo_backtracking(
         return None
     t = 1.0
     for _ in range(max_bt):
-        y = [retract(xi, t * di, m)
-             for xi, di, m in zip(x, d, manifolds, strict=True)]
+        y = [
+            retract(xi, t * di, m, backend=backend)
+            for xi, di, m in zip(x, d, manifolds, strict=True)
+        ]
         f = cost_fn(y)
         if f <= f0 + c1 * t * gd:
             return t, y, f, rgrad_fn(y)
@@ -204,19 +221,27 @@ def _armijo_backtracking(
 
 
 def _armijo_backtracking_increase(
-    cost_fn, rgrad_fn, x, d, manifolds, f0, g0, max_bt=40,
+    cost_fn, rgrad_fn, x, d, manifolds, f0, g0, max_bt=40, *, backend=None
 ):
     r"""Fallback backtracking allowing the cost function to increase by up to 1%."""
     norm_d = _list_inner(d, d) ** 0.5
     t = 1.0 / max(norm_d, 1.0)
-    print(f"    [Armijo-Increase LineSearch] norm_d = {norm_d:.6e} | initial cost = {f0:.6e}")
+    print(
+        f"    [Armijo-Increase LineSearch] norm_d = {norm_d:.6e} | initial cost = {f0:.6e}"
+    )
     for bt in range(max_bt):
-        y = [retract(xi, t * di, m)
-             for xi, di, m in zip(x, d, manifolds, strict=True)]
+        y = [
+            retract(xi, t * di, m, backend=backend)
+            for xi, di, m in zip(x, d, manifolds, strict=True)
+        ]
         f = cost_fn(y)
-        print(f"      [Armijo-Increase Trial] bt_iter = {bt} | t = {t:.6e} | cost = {f:.6e} (target <= {1.01 * f0:.6e})")
+        print(
+            f"      [Armijo-Increase Trial] bt_iter = {bt} | t = {t:.6e} | cost = {f:.6e} (target <= {1.01 * f0:.6e})"
+        )
         if f <= 1.01 * f0:
-            print("Attention: allowing for cost function to increase by up to 1 percent")
+            print(
+                "Attention: allowing for cost function to increase by up to 1 percent"
+            )
             return t, y, f, rgrad_fn(y)
         t *= 0.5
     return None
@@ -244,14 +269,15 @@ class AdamDirection:
     first/second moments are vector-transported to the new tangent space each
     iteration.  The strong-Wolfe line search sets the actual step length."""
 
-    def __init__(self, lr=1.0, b1=0.9, b2=0.999, eps=1e-8):
+    def __init__(self, lr=1.0, b1=0.9, b2=0.999, eps=1e-8, *, backend=None):
+        self.backend = backend or get_backend()
         self.lr, self.b1, self.b2, self.eps = lr, b1, b2, eps
         self.m = None
         self.v = None
         self.step = 0
 
     def direction(self, xs, g, manifolds):
-        bkend = get_backend()
+        bkend = self.backend
         if self.m is None:
             self.m = [bkend.zeros_like(gk) for gk in g]
             self.v = [bkend.zeros_like(gk) for gk in g]
@@ -260,8 +286,8 @@ class AdamDirection:
         for i, (xk, gk, man) in enumerate(zip(xs, g, manifolds, strict=True)):
             self.m[i] = self.b1 * self.m[i] + (1 - self.b1) * gk
             self.v[i] = self.b2 * self.v[i] + (1 - self.b2) * (gk * gk)
-            mhat = self.m[i] / (1 - self.b1 ** self.step)
-            vhat = self.v[i] / (1 - self.b2 ** self.step)
+            mhat = self.m[i] / (1 - self.b1**self.step)
+            vhat = self.v[i] / (1 - self.b2**self.step)
             dk = -self.lr * mhat / (bkend.sqrt(vhat) + self.eps)
             d.append(project(xk, dk, man))  # keep the step tangent
         return d
@@ -269,13 +295,17 @@ class AdamDirection:
     def update(self, xs_new, d, t, g, g_new, manifolds):
         if self.m is None:  # reset() just cleared the moments -> nothing to move
             return
-        bkend = get_backend()
+        bkend = self.backend
         # Transport the first moment (a tangent vector) and the second moment (a
         # per-coordinate variance -> |.| keeps it non-negative) to T_{xs_new}.
-        self.m = [transport(xn, mi, man)
-                  for xn, mi, man in zip(xs_new, self.m, manifolds, strict=True)]
-        self.v = [bkend.abs(transport(xn, vi, man))
-                  for xn, vi, man in zip(xs_new, self.v, manifolds, strict=True)]
+        self.m = [
+            transport(xn, mi, man)
+            for xn, mi, man in zip(xs_new, self.m, manifolds, strict=True)
+        ]
+        self.v = [
+            bkend.abs(transport(xn, vi, man))
+            for xn, vi, man in zip(xs_new, self.v, manifolds, strict=True)
+        ]
 
     def reset(self):
         self.m = None
@@ -310,18 +340,29 @@ class LBFGSDirection:
         return [-rk for rk in r]
 
     def update(self, xs_new, d, t, g, g_new, manifolds):
-        s_k = [transport(xn, t * dk, m)
-               for xn, dk, m in zip(xs_new, d, manifolds, strict=True)]
-        Tg = [transport(xn, gk, m)
-              for xn, gk, m in zip(xs_new, g, manifolds, strict=True)]
+        s_k = [
+            transport(xn, t * dk, m)
+            for xn, dk, m in zip(xs_new, d, manifolds, strict=True)
+        ]
+        Tg = [
+            transport(xn, gk, m) for xn, gk, m in zip(xs_new, g, manifolds, strict=True)
+        ]
         y_k = [gnk - tgk for gnk, tgk in zip(g_new, Tg, strict=True)]
         # Transport the stored history into the new tangent space.
-        self.S = [[transport(xn, sk, m)
-                   for xn, sk, m in zip(xs_new, s, manifolds, strict=True)]
-                  for s in self.S]
-        self.Y = [[transport(xn, yk, m)
-                   for xn, yk, m in zip(xs_new, y, manifolds, strict=True)]
-                  for y in self.Y]
+        self.S = [
+            [
+                transport(xn, sk, m)
+                for xn, sk, m in zip(xs_new, s, manifolds, strict=True)
+            ]
+            for s in self.S
+        ]
+        self.Y = [
+            [
+                transport(xn, yk, m)
+                for xn, yk, m in zip(xs_new, y, manifolds, strict=True)
+            ]
+            for y in self.Y
+        ]
         sy = _list_inner(s_k, y_k)
         if sy > 1e-10:
             self.S.append(s_k)
@@ -337,9 +378,19 @@ class LBFGSDirection:
 
 
 def riemannian_optimize(
-    cost_fn, rgrad_fn, x0, manifolds, direction,
-    max_iter=200, gtol=1e-10, ftol=1e-9, callback=None,
-    allow_increase=False, iterate_callback=None,
+    cost_fn,
+    rgrad_fn,
+    x0,
+    manifolds,
+    direction,
+    max_iter=200,
+    gtol=1e-10,
+    ftol=1e-9,
+    callback=None,
+    allow_increase=False,
+    iterate_callback=None,
+    *,
+    backend=None,
 ):
     r"""Generic first-order Riemannian optimizer on a product manifold.
 
@@ -360,8 +411,15 @@ def riemannian_optimize(
     """
     import numpy as np
 
-    xs = [to_manifold(np.asarray(a, dtype=float).copy(), m)
-          for a, m in zip(x0, manifolds, strict=True)]
+    from ..backend._numpy import NumpyBackend
+
+    backend = backend or NumpyBackend()
+    if not backend.is_numpy:
+        raise ValueError("riemannian_optimize requires the NumPy backend")
+    xs = [
+        to_manifold(np.asarray(a, dtype=float).copy(), m, backend=backend)
+        for a, m in zip(x0, manifolds, strict=True)
+    ]
     g = rgrad_fn(xs)
     fval = cost_fn(xs)
     fprev = fval
@@ -386,14 +444,22 @@ def riemannian_optimize(
         # used to bypass this and take a fixed unit step, which with lr = 1.0
         # made the cost grow by orders of magnitude on badly scaled problems --
         # the line search is the whole reason the descent is monotone.)
-        ls = strong_wolfe_line_search(cost_fn, rgrad_fn, xs, d, manifolds, fval, g)
+        ls = strong_wolfe_line_search(
+            cost_fn, rgrad_fn, xs, d, manifolds, fval, g, backend=backend
+        )
         if ls is None:
-            ls = _armijo_backtracking(cost_fn, rgrad_fn, xs, d, manifolds, fval, g)
+            ls = _armijo_backtracking(
+                cost_fn, rgrad_fn, xs, d, manifolds, fval, g, backend=backend
+            )
         if ls is None and allow_increase:
-            ls = _armijo_backtracking_increase(cost_fn, rgrad_fn, xs, d, manifolds, fval, g)
+            ls = _armijo_backtracking_increase(
+                cost_fn, rgrad_fn, xs, d, manifolds, fval, g, backend=backend
+            )
 
         if ls is None:  # both line searches failed -> stop
-            print("    [LineSearch Failed] Line search failed completely. Stopping optimization.")
+            print(
+                "    [LineSearch Failed] Line search failed completely. Stopping optimization."
+            )
             break
         t, xs_new, f_new, g_new = ls
 
@@ -417,8 +483,18 @@ def riemannian_optimize(
 
 
 def riemannian_lbfgs(
-    cost_fn, rgrad_fn, x0, manifolds, max_iter=200, history_size=100,
-    gtol=1e-10, ftol=1e-9, callback=None, allow_increase=False,
+    cost_fn,
+    rgrad_fn,
+    x0,
+    manifolds,
+    max_iter=200,
+    history_size=100,
+    gtol=1e-10,
+    ftol=1e-9,
+    callback=None,
+    allow_increase=False,
+    *,
+    backend=None,
 ):
     r"""Riemannian L-BFGS: :func:`riemannian_optimize` with an
     :class:`LBFGSDirection` (vector-transported curvature memory).
@@ -426,7 +502,15 @@ def riemannian_lbfgs(
     :returns: ``(x_star, f_star)`` -- the best point found and its cost.
     """
     return riemannian_optimize(
-        cost_fn, rgrad_fn, x0, manifolds, LBFGSDirection(history_size),
-        max_iter=max_iter, gtol=gtol, ftol=ftol, callback=callback,
+        cost_fn,
+        rgrad_fn,
+        x0,
+        manifolds,
+        LBFGSDirection(history_size),
+        max_iter=max_iter,
+        gtol=gtol,
+        ftol=ftol,
+        callback=callback,
         allow_increase=allow_increase,
+        backend=backend,
     )

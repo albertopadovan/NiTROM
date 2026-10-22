@@ -15,7 +15,6 @@ whose optimal value is minus the sum of the r largest eigenvalues.
 import numpy as np
 import pytest
 
-from nitrom.backend import set_backend
 from nitrom.optimization.manifold_optimization import (
     inner,
     project,
@@ -25,14 +24,6 @@ from nitrom.optimization.manifold_optimization import (
     to_manifold,
     transport,
 )
-
-
-@pytest.fixture(autouse=True)
-def _numpy_backend():
-    # riemannian_lbfgs works in numpy; restore torch for the rest of the suite.
-    set_backend("numpy")
-    yield
-    set_backend("torch")
 
 
 def _rayleigh(N, r, seed):
@@ -60,12 +51,17 @@ def test_rayleigh_reaches_top_eigenspace(manifold):
     rng = np.random.default_rng(1)
     X0 = to_manifold(rng.standard_normal((N, r)), manifold)
     xs, f = riemannian_lbfgs(
-        cost_fn, rgrad_fn, [X0], [manifold],
-        max_iter=300, gtol=1e-12, ftol=1e-15,
+        cost_fn,
+        rgrad_fn,
+        [X0],
+        [manifold],
+        max_iter=300,
+        gtol=1e-12,
+        ftol=1e-15,
     )
     X = xs[0]
     assert np.allclose(X.T @ X, np.eye(r), atol=1e-10)  # on the manifold
-    assert f == pytest.approx(f_opt, abs=1e-6)          # global optimum
+    assert f == pytest.approx(f_opt, abs=1e-6)  # global optimum
 
 
 def test_euclidean_quadratic():
@@ -82,8 +78,13 @@ def test_euclidean_quadratic():
         return [A @ xs[0] - b]
 
     xs, _ = riemannian_lbfgs(
-        cost_fn, rgrad_fn, [np.zeros(3)], ["euclidean"],
-        max_iter=100, gtol=1e-13, ftol=1e-18,
+        cost_fn,
+        rgrad_fn,
+        [np.zeros(3)],
+        ["euclidean"],
+        max_iter=100,
+        gtol=1e-13,
+        ftol=1e-18,
     )
     assert np.allclose(xs[0], x_star, atol=1e-8)
 
@@ -105,12 +106,17 @@ def test_product_manifold_stiefel_and_euclidean():
     rng = np.random.default_rng(2)
     X0 = to_manifold(rng.standard_normal((N, r)), "stiefel")
     xs, f = riemannian_lbfgs(
-        cost_fn, rgrad_fn, [X0, np.zeros(2)], ["stiefel", "euclidean"],
-        max_iter=300, gtol=1e-12, ftol=1e-15,
+        cost_fn,
+        rgrad_fn,
+        [X0, np.zeros(2)],
+        ["stiefel", "euclidean"],
+        max_iter=300,
+        gtol=1e-12,
+        ftol=1e-15,
     )
     X, y = xs
     assert np.allclose(X.T @ X, np.eye(r), atol=1e-10)  # Stiefel factor on manifold
-    assert np.allclose(y, c, atol=1e-7)                 # Euclidean factor at optimum
+    assert np.allclose(y, c, atol=1e-7)  # Euclidean factor at optimum
     assert f == pytest.approx(f_opt, abs=1e-6)
 
 
@@ -166,8 +172,17 @@ def test_transport_keeps_history_consistent():
     rng = np.random.default_rng(5)
     X0 = to_manifold(rng.standard_normal((N, r)), "stiefel")
     xs, f = riemannian_lbfgs(
-        cost_fn, rgrad_fn, [X0], ["stiefel"],
-        max_iter=500, history_size=20, gtol=1e-12, ftol=1e-15,
+        cost_fn,
+        rgrad_fn,
+        [X0],
+        ["stiefel"],
+        max_iter=500,
+        history_size=20,
+        gtol=1e-12,
+        ftol=1e-15,
     )
     assert np.allclose(xs[0].T @ xs[0], np.eye(r), atol=1e-10)
     assert f == pytest.approx(f_opt, abs=1e-6)
+
+
+pytestmark = pytest.mark.usefixtures("numpy_backend")

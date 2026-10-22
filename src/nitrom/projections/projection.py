@@ -19,8 +19,10 @@ class Projection(metaclass=abc.ABCMeta):
         param_names: list[str],
         device: str = "cpu",
         dtype: Any = None,
+        *,
+        backend=None,
     ):
-        self._backend = get_backend()
+        self._backend = backend or get_backend()
         self._n = n
         self._r = r
         self._device = device

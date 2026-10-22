@@ -1,3 +1,6 @@
+from collections.abc import Mapping
+from math import isfinite
+from numbers import Integral, Real
 from typing import Any
 
 from nitrom.latent_space_models.gas_polynomial_model import GasPolynomialModel
@@ -18,7 +21,7 @@ class OpInfModule(InferenceModule):
     .. math::
 
         J = \sum_{i} w_i \lVert \dot{z}_i - f(t_i, z_i) \rVert^2
-            + \lambda \sum_k \lVert A_k \rVert^2
+            + \sum_k \lambda_k \lVert A_k \rVert_F^2
 
     where :math:`z = \Phi^\top x`, :math:`\dot{z} = \Phi^\top \dot{x}`,
     and :math:`f` is evaluated by the underlying model.
@@ -37,8 +40,11 @@ class OpInfModule(InferenceModule):
         latent space; the training data are projected with
         :meth:`Projection.encode`
     :type projection: Projection
-    :param reg: Tikhonov regularization weight
-    :type reg: float
+    :param reg: Nonnegative Tikhonov weights keyed by polynomial degree,
+        e.g. ``{3: 0.01}`` penalizes only the cubic operator. Omitted degrees
+        are unpenalized; ``None`` or ``{}`` disables regularization. Penalties
+        apply to physical operator tensors, including for constrained models.
+    :type reg: Mapping[int, float] or None
     """
 
     def __init__(
@@ -46,11 +52,27 @@ class OpInfModule(InferenceModule):
         training_data: TrainingData,
         latent_space_model: PolynomialModel | GasPolynomialModel,
         projection: Projection,
-        reg: float = 0.0,
+        reg: Mapping[int, float] | None = None,
     ) -> None:
-        super().__init__()
+        super().__init__(backend=latent_space_model.backend)
+        self.backend.validate_components(training_data, projection)
+        self.training_data = training_data
 
-        self.reg = reg
+        if reg is not None and not isinstance(reg, Mapping):
+            raise TypeError(
+                "reg must map polynomial degrees to weights, e.g. {2: 0.01}"
+            )
+        self.reg = {}
+        for degree, weight in reg.items() if reg is not None else ():
+            if isinstance(degree, bool) or not isinstance(degree, Integral):
+                raise TypeError("reg keys must be integer polynomial degrees")
+            if degree not in latent_space_model.poly_comp:
+                raise ValueError(f"reg degree {degree} is not present in poly_comp")
+            if isinstance(weight, bool) or not isinstance(weight, Real):
+                raise TypeError("reg weights must be real numbers")
+            if not isfinite(weight) or weight < 0:
+                raise ValueError("reg weights must be finite and nonnegative")
+            self.reg[int(degree)] = float(weight)
         self.rom = latent_space_model
         self.projection = projection
         self.backend = latent_space_model.backend
@@ -110,10 +132,14 @@ class OpInfModule(InferenceModule):
             tw = bkend.asarray(tw, device=bkend.device_of(self.w), dtype=self.w.dtype)
             if tw.ndim == 1:
                 if tw.shape[0] != nt:
-                    raise ValueError(f"time_weights has {tw.shape[0]} entries, the data {nt} snapshots")
+                    raise ValueError(
+                        f"time_weights has {tw.shape[0]} entries, the data {nt} snapshots"
+                    )
                 tw = bkend.stack([tw] * ntraj, axis=0)
             if tuple(tw.shape) != (ntraj, nt):
-                raise ValueError(f"time_weights must be (nt,) or (ntraj, nt) = ({ntraj}, {nt})")
+                raise ValueError(
+                    f"time_weights must be (nt,) or (ntraj, nt) = ({ntraj}, {nt})"
+                )
             self.w = self.w * tw.reshape(-1)
 
         # The optimizer evaluates the cost and gradient at the same candidate
@@ -185,9 +211,10 @@ class OpInfModule(InferenceModule):
                 i_A = self.rom.poly_comp.index(1)
                 i_H = self.rom.poly_comp.index(2)
                 A, H = tensors[i_A], tensors[i_H]
-                return self.Z_flat @ A.T + self.Z_2_flat @ H.reshape(
-                    self.rom.state_dimension, -1
-                ).T
+                return (
+                    self.Z_flat @ A.T
+                    + self.Z_2_flat @ H.reshape(self.rom.state_dimension, -1).T
+                )
             return self.rom.evaluate_rhs(0.0, self.Z_flat)
 
         fZ = self._evaluate_rhs_all()
@@ -202,7 +229,7 @@ class OpInfModule(InferenceModule):
         self._cached_residual_flat = residual
         return residual
 
-    def _quadratic_inner_vjp(self, v: Any, reg: float) -> list[Any]:
+    def _quadratic_inner_vjp(self, v: Any) -> list[Any]:
         """VJP of an unforced linear--quadratic ROM using cached features."""
         r = self.rom.state_dimension
         tensors = self.rom.inner_params()
@@ -211,8 +238,6 @@ class OpInfModule(InferenceModule):
         grads = [None] * len(tensors)
         grads[i_A] = v.T @ self.Z_flat
         grads[i_H] = (v.T @ self.Z_2_flat).reshape(r, r, r)
-        if reg > 0.0:
-            grads[i_H] = grads[i_H] + 2.0 * reg * tensors[i_H]
         return grads
 
     def _evaluate_rhs_all(self) -> Any:
@@ -239,7 +264,9 @@ class OpInfModule(InferenceModule):
             t_j = self.time[j]
             z_j = self.Z[:, :, j]  # (ntraj, r)
             fZ[:, :, j] = self.rom.evaluate_rhs(
-                t_j, z_j, external_forcing=self.forcing_fns,
+                t_j,
+                z_j,
+                external_forcing=self.forcing_fns,
             )
         return fZ
 
@@ -254,17 +281,14 @@ class OpInfModule(InferenceModule):
         R_flat = self._residual_flat()
         cost = ((R_flat * self.w[:, None]) * R_flat).sum()
 
-        # Regularization on the quadratic tensor H
-        world_size = self.world_size  # communicator the pool was sharded on
-        reg = self.reg / world_size
-        if hasattr(self.rom, "poly_comp") and 2 in self.rom.poly_comp:
-            if hasattr(self.rom, "model"):
-                idx = self.rom.model.poly_comp.index(2)
-                H = self.rom.model.get_params()[idx]
-            else:
-                idx = self.rom.poly_comp.index(2)
-                H = self.rom.get_params()[idx]
-            cost = cost + reg * bkend.vector_norm(H) ** 2
+        # Each rank contributes its share of the same operator penalty.
+        tensors = self.rom.inner_params()
+        for degree, weight in self.reg.items():
+            if weight:
+                tensor = tensors[self.rom.poly_comp.index(degree)]
+                cost = (
+                    cost + (weight / self.world_size) * bkend.vector_norm(tensor) ** 2
+                )
 
         return cost
 
@@ -283,27 +307,23 @@ class OpInfModule(InferenceModule):
         # VJP: adjoint seed v = -2 * R * W
         if self.forcing_fns is None or len(self.forcing_fns) == 0:
             v = -2.0 * R_flat * self.w[:, None]
-            world_size = self.world_size  # communicator the pool was sharded on
-            reg = self.reg / world_size
             if self._quadratic_fastpath:
-                grads = self._quadratic_inner_vjp(v, reg)
+                grads = self._quadratic_inner_vjp(v)
             else:
-                grads = self.rom.inner_vjp_evaluate_rhs(self.Z_flat, v, reg=reg)
+                grads = self.rom.inner_vjp_evaluate_rhs(self.Z_flat, v)
         else:
             # Accumulate VJP over time snapshots
             grads = None
-            world_size = self.world_size  # communicator the pool was sharded on
-            reg_val = self.reg / world_size
             V = (-2.0 * R_flat * self.w[:, None]).reshape(self.ntraj, self.nt, r)
             for j in range(self.nt):
                 t_j = self.time[j]
-                z_j = self.Z[:, :, j]           # (ntraj, r)
-                v_j = V[:, j, :]                 # (ntraj, r)
-                reg_j = reg_val if j == 0 else 0.0
+                z_j = self.Z[:, :, j]  # (ntraj, r)
+                v_j = V[:, j, :]  # (ntraj, r)
                 grads_j = self.rom.inner_vjp_evaluate_rhs(
-                    z_j, v_j,
-                    reg=reg_j,
-                    external_forcing=self.forcing_fns, t=t_j,
+                    z_j,
+                    v_j,
+                    external_forcing=self.forcing_fns,
+                    t=t_j,
                 )
                 if grads is None:
                     grads = grads_j
@@ -311,6 +331,14 @@ class OpInfModule(InferenceModule):
                     for i in range(len(grads)):
                         grads[i] = grads[i] + grads_j[i]
 
+        # Penalize physical operators before the GAS/ATR parameter chain rule.
+        tensors = self.rom.inner_params()
+        for degree, weight in self.reg.items():
+            if weight:
+                idx = self.rom.poly_comp.index(degree)
+                grads[idx] = (
+                    grads[idx] + (2.0 * weight / self.world_size) * tensors[idx]
+                )
         grads = self.rom.project_inner_gradients(grads)
 
         # Zero the gradient of any non-learnable parameter (base class).

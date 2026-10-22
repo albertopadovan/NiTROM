@@ -21,14 +21,17 @@ class BackendModule:
     parameters are stored as plain arrays.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, backend=None) -> None:
+        object.__setattr__(self, "backend", backend or get_backend())
         object.__setattr__(self, "_params", OrderedDict())
 
     def register_parameter(self, name: str, value: Any) -> None:
         """Register ``value`` as a trainable parameter named ``name``."""
-        bkend = get_backend()
+        bkend = self.backend
+        bkend.validate_arrays(**{name: value})
         if bkend.is_torch:
             import torch
+
             if not isinstance(value, torch.nn.Parameter):
                 value = torch.nn.Parameter(value)
         self._params[name] = value
@@ -38,8 +41,9 @@ class BackendModule:
         # Mirror nn.Module: assigning a torch.nn.Parameter auto-registers it
         # (used by lightweight test modules).  Numpy params must be registered
         # explicitly via register_parameter (plain arrays carry no marker).
-        if get_backend().is_torch:
+        if self.backend.is_torch:
             import torch
+
             if isinstance(value, torch.nn.Parameter):
                 self.register_parameter(name, value)
                 return
@@ -102,11 +106,11 @@ class InferenceModule(BackendModule, abc.ABC):
     @property
     def world_size(self) -> int:
         """Number of ranks this module's data is sharded over."""
-        from nitrom.backend import comm_rank_size, distributed_rank_size
+        from nitrom.distributed import comm_rank_size, distributed_rank_size
 
         comm = self.comm
         if comm is None:
-            return distributed_rank_size()[1]
+            return distributed_rank_size(backend=self.backend)[1]
         return comm_rank_size(comm)[1]
 
     @property
@@ -117,9 +121,7 @@ class InferenceModule(BackendModule, abc.ABC):
         registered parameter on first access.
         """
         if getattr(self, "_is_learnable", None) is None:
-            self._is_learnable = {
-                name: True for name, _ in self.named_parameters()
-            }
+            self._is_learnable = {name: True for name, _ in self.named_parameters()}
         return self._is_learnable
 
     def set_unlearnable(self, *names: str) -> None:
@@ -167,7 +169,7 @@ class InferenceModule(BackendModule, abc.ABC):
         :param grads: gradients, one per parameter, in parameter order
         :returns: the same list with non-learnable entries zeroed
         """
-        bkend = get_backend()
+        bkend = self.backend
         for i, learnable in enumerate(self.is_learnable.values()):
             if not learnable:
                 grads[i] = bkend.zeros_like(grads[i])

@@ -53,11 +53,7 @@ COLORS = {
     "nitrom": "#386cb0",
 }
 
-STYLES = {
-    "galerkin": (0, (1.0, 1.2)),
-    "notgas": (0, (5.0, 2.4)),
-    "gas": "solid"
-}
+STYLES = {"galerkin": (0, (1.0, 1.2)), "notgas": (0, (5.0, 2.4)), "gas": "solid"}
 
 
 def set_plot_style() -> None:

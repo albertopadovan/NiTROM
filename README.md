@@ -1,257 +1,402 @@
 # NiTROM
 
-**N**on-**i**ntrusive **T**rajectory-based **R**educed-**O**rder **M**odelling — a Python
-package for learning low-dimensional models of high-dimensional dynamical systems
-directly from trajectory data.
+NiTROM is a Python package for learning reduced-order models (ROMs) of dynamical
+systems from data. It provides several modeling algorithms, including operator
+inference, polynomial-manifold inference, and joint learning of projections and
+reduced dynamics from trajectories.
 
-NiTROM learns a reduced-order model (ROM) as a pair of objects that are trained
-**together**:
+The package's central contribution is **N**on-**i**ntrusive **T**rajectory-based
+**R**educed-**O**rder **M**odelling (NiTROM): a method that jointly optimizes a
+projection into a low-dimensional latent space and the operators governing the
+latent dynamics by minimizing the output error of the time-integrated ROM.
 
-* a **projection** between the ambient state space $\mathbb{R}^N$ and a latent space
-  $\mathbb{R}^r$ (linear/oblique, or a polynomial manifold), and
-* a **latent-space dynamics model** $\dot{z} = f(z, u)$ (polynomial, optionally
-  constrained to be globally asymptotically stable).
+NiTROM training uses analytic adjoint gradients and supports optimization of trial
+and test bases on Grassmann and Stiefel manifolds. Full-order governing operators
+are not required; NiTROM needs trajectories, input signals for forced systems, and
+an output map with its derivative or adjoint action. The other inference methods
+can be used independently or to initialize a NiTROM fit.
 
-Unlike intrusive projection-based ROMs, no access to the full-order operators is
-required — only trajectory data. Unlike plain operator inference, the cost is the
-*trajectory* mismatch obtained by actually time-marching the ROM, and the bases are
-optimized alongside the operators using **analytic adjoint gradients** on matrix
-manifolds.
+## Features
 
----
-
-## What's in the box
-
-| Capability | Where |
+| Capability | Public API |
 | --- | --- |
-| NiTROM trajectory-matching training (adjoint gradients, learned bases) | [NitromModule](src/nitrom/optimization/modules/nitrom_module.py) |
-| Operator inference (gradient-based **and** closed-form least squares) | [OpInfModule](src/nitrom/optimization/modules/opinf_module.py), [solve_opinf](src/nitrom/optimization/opinf_solver.py) |
-| Polynomial-manifold (nonlinear decoder) inference | [PolyManifoldInfModule](src/nitrom/optimization/modules/poly_manifold_module.py) |
-| Stability-guaranteed (GAS) polynomial models | [GasPolynomialModel](src/nitrom/latent_space_models/gas_polynomial_model.py) |
-| Riemannian optimization on Grassmann / Stiefel manifolds | [manifold_optimization.py](src/nitrom/optimization/manifold_optimization.py) |
-| Batched RK2/RK4/backward-Euler/RK45 integrators + discrete adjoint | [time_steppers/](src/nitrom/time_steppers/time_stepper.py) |
-| NumPy **or** PyTorch backend, MPI / `torchrun` trajectory parallelism | [backend.py](src/nitrom/backend.py) |
-| POD, trajectory loading/sharding, quadratic interpolation | [utils.py](src/nitrom/utils.py), [training_data.py](src/nitrom/training_data.py) |
+| Joint learning of projections and dynamics from trajectory errors | `NitromModule`, `ParamRegistry`, `train` |
+| Operator inference from projected time derivatives | `OpInfModule`, `solve_opinf` |
+| Polynomial-manifold decoder inference | `PolynomialProjection`, `PolyManifoldInfModule` |
+| Polynomial latent dynamics, including constant and input terms | `PolynomialModel` |
+| Globally asymptotically stable unforced dynamics | `GasPolynomialModel` |
+| Dynamics with an attracting trapping region | `AtrPolynomialModel` |
+| POD and data-driven balancing from trajectories | `compute_pod`, `compute_data_driven_balancing` |
+| Batched integration and discrete adjoints | `step`, `solve_ivp`, `solve_fixed_ivp`, `solve_adjoint_ivp_discrete` |
+| CPU/GPU arrays and trajectory parallelism | NumPy/PyTorch backends, MPI/PyTorch distributed training |
 
----
+The APIs above are exported from `nitrom`. Numerical helpers for interpolation,
+quadrature, and finite-difference derivatives live in `nitrom.numerics`.
 
 ## Installation
+
+Requires Python 3.10 or newer. From a source checkout:
 
 ```bash
 git clone https://github.com/albertopadovan/NiTROM.git
 cd NiTROM
-pip install -e .              # runtime deps: numpy, scipy, numba, matplotlib, torch, dill
-pip install -e ".[dev]"       # + pytest, ruff
+python -m pip install -e .
 ```
 
-Requires Python ≥ 3.10. `mpi4py` is optional and only needed for MPI-parallel training
-on the NumPy backend; `torch` is imported lazily, so a NumPy-only session never pulls
-it in.
+The base installation requires NumPy, SciPy, and dill. Install optional features
+with extras:
 
----
+```bash
+python -m pip install -e '.[plot]'                 # examples and plotting
+python -m pip install -e '.[torch]'                # PyTorch arrays and optimizers
+python -m pip install -e '.[mpi]'                  # NumPy trajectory parallelism
+python -m pip install -e '.[dev,torch,mpi,plot]'    # development with all extras
+```
+
+MPI runs also need an MPI runtime and launcher. Select a PyTorch installation
+suited to your hardware for GPU use. PyTorch is imported only when needed; the
+NumPy backend is the default.
+
+## Setting up a case
+
+The projection, latent dynamics, and fitting objective are separate choices. For
+example, the same polynomial dynamics can be fitted with operator inference and
+then refined together with the bases using NiTROM.
+
+| Decision | What to choose |
+| --- | --- |
+| Data and loss | Training trajectories, input signals, time windows, normalization weights, and outputs to match. OpInf needs state derivatives; NiTROM needs the output map and its derivative or adjoint action. |
+| Reduced coordinates | Latent dimension `r`; an orthogonal or oblique linear projection, or a polynomial-manifold decoder; and initial bases from POD, data-driven balancing, or supplied bases. |
+| Latent dynamics | Polynomial degrees, constant and input terms, and whether to use unconstrained dynamics (`PolynomialModel`), enforce global asymptotic stability of the unforced origin (`GasPolynomialModel`), or enforce an attracting trapping region (`AtrPolynomialModel`). |
+| Fitting algorithm | `OpInfModule` for derivative matching, `PolyManifoldInfModule` for decoder reconstruction, or `NitromModule` for integrated output matching. Ordinary polynomial OpInf supports a direct `solve_opinf` fit; constrained models and NiTROM use iterative `train`. |
+| Optimization | Initial operators, fixed versus learned parameters, basis manifold constraints, regularization, optimizer, and stopping criteria. Decoder inference holds the bases fixed; NiTROM can learn them jointly with the dynamics. |
+| Time integration | Integration method and resolution or adaptive tolerances. For NiTROM, also choose discrete or continuous adjoints and the corresponding quadrature controls. |
+| Validation | Held-out initial conditions and inputs, prediction horizon, output-error measures, and checks of rollout stability and sensitivity to latent dimension and integration resolution. |
 
 ## Quick start
 
+This self-contained NumPy example generates four trajectories of a three-state
+linear system, fits a quadratic two-state ROM with operator inference, then
+refines its bases and dynamics with NiTROM. It needs only the base installation.
+Temporary trajectory files are removed after loading.
+
 ```python
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
 import numpy as np
-from nitrom.backend import set_backend
-from nitrom.training_data import TrainingPool, TrainingData
-from nitrom.utils import compute_POD
-from nitrom.projections.linear_projection import LinearProjection
-from nitrom.latent_space_models.polynomial_model import PolynomialModel
-from nitrom.roms.param_registry import ParamRegistry
-from nitrom.optimization import NitromModule, train
 
-set_backend("numpy")          # or "torch" for autograd / GPU
-
-# 1. Load trajectories from disk (sharded across ranks under mpiexec/torchrun)
-pool = TrainingPool(
-    n_traj=4,
-    fname_traj="./trajectories/traj_%03d.npy",
-    fname_time="./trajectories/time.npy",
-    fname_weights="./trajectories/weight_%03d.npy",
-    fname_forcing="./trajectories/forcing_%03d.pkl",
-    fname_derivs="./trajectories/deriv_%03d.npy",
-    dtype=np.float64,
+from nitrom import (
+    LinearProjection,
+    NitromModule,
+    OpInfModule,
+    ParamRegistry,
+    PolynomialModel,
+    TrainingData,
+    TrainingPool,
+    compute_pod,
+    set_backend,
+    solve_ivp,
+    solve_opinf,
+    train,
 )
-data = TrainingData(pool, which_trajs=[0, 1, 2, 3],
-                    percent_time_length=1.0, leggauss_deg=5, nsave_rom=15)
 
-# 2. Initial bases from POD; oblique projection (Psi = Phi here => orthogonal)
-U, _, _ = compute_POD(pool, normalize=True)
-Phi = U[:, :2]
-projection = LinearProjection([Phi, Phi])
+set_backend("numpy")
+time = np.linspace(0.0, 4.0, 51)
+rates = np.array([-0.3, -0.8, -1.5])
+rng = np.random.default_rng(0)
 
-# 3. Latent quadratic model  zdot = A z + H:zz^T (+ B u)
+with TemporaryDirectory() as directory:
+    root = Path(directory)
+    np.save(root / "time.npy", time)
+    for j in range(4):
+        x0 = rng.standard_normal(3)
+        X = x0[:, None] * np.exp(rates[:, None] * time)
+        np.save(root / f"traj_{j:03d}.npy", X)
+        np.save(root / f"deriv_{j:03d}.npy", rates[:, None] * X)
+
+    pool = TrainingPool(
+        n_traj=4,
+        fname_traj=str(root / "traj_%03d.npy"),
+        fname_time=str(root / "time.npy"),
+        fname_derivs=str(root / "deriv_%03d.npy"),
+        dtype=np.float64,
+    )
+
+data = TrainingData(pool, which_trajs=list(range(4)))
+U, _, _ = compute_pod(pool)
+Phi = U[:, :2].copy()
+projection = LinearProjection([Phi.copy(), Phi.copy()])
 model = PolynomialModel(r=2, poly_comp=[1, 2], dtype=np.float64)
 
-# 4. Train bases and operators jointly, on their natural manifolds
-registry = ParamRegistry(model, projection)
-rom = NitromModule(data, registry, fom=my_fom, n_substeps=15)
+# Fit dynamics on the initial POD coordinates.
+opinf = OpInfModule(data, model, projection, reg={2: 1e-6})
+solve_opinf(opinf, solver="lstsq")
+
+# NiTROM needs an output map, not the full-order governing operators.
+class StateOutput:
+    output_is_state = True
+
+    def compute_output(self, q):
+        return q
+
+    def compute_output_derivative(self, q):
+        return np.eye(3)
+
+
+rom = NitromModule(
+    data, ParamRegistry(model, projection), fom=StateOutput(), n_substeps=2
+)
 rom.set_manifold_types(["Phi", "Psi"], ["grassmann", "stiefel"])
-train(rom, n_epochs=400, lr=1.0, optimizer_type="lbfgs", tol=1e-14)
+train(rom, n_epochs=20, lr=1.0, optimizer_type="lbfgs", print_every=0)
+
+# Predict from an ambient initial condition using the trained components.
+z0 = projection.encode(pool.X[0, :, 0])
+Z = solve_ivp(model.evaluate_rhs, z0, time[0], time[-1], 0.04, time)
+X_rom = projection.decode(Z.T).T
+print(X_rom.shape)  # (3, 51)
 ```
 
-Run in parallel over trajectories with `mpiexec -n 4 python train.py` (NumPy backend)
-or `torchrun --nproc_per_node=4 train.py` (PyTorch backend) — the cost and gradient are
-all-reduced automatically and every rank runs the identical optimizer in lockstep.
+This demonstrates the API on a small system. The [examples](examples/README.md)
+provide forced systems, model comparisons, saved predictions, and plotting.
 
----
+## Data and coordinates
 
-## Core concepts
+[`TrainingPool`](src/nitrom/training_data.py) loads `.npy` trajectories and shards
+them across ranks in a distributed run. Each trajectory file has shape `(N, nt)`;
+the shared time file has shape `(nt,)`. Loaded arrays have shape
+`(local_ntraj, N, nt)`.
 
-### Data
+Optional file patterns supply one scalar normalization weight, one dill-serialized
+input callable `u(t)`, and one derivative array of shape `(N, nt)` per trajectory.
+Missing derivatives are estimated with finite differences and cached to disk,
+even when only NiTROM training is planned. The default stencil has five points.
+Weights default to one; larger weights reduce a trajectory's contribution to the
+loss. Specify `dtype` explicitly when needed: pools default to `float32`, while
+latent models default to `float64`.
 
-[`TrainingPool`](src/nitrom/training_data.py) loads trajectory snapshots, per-trajectory
-weights, time derivatives, and forcing callables from disk and shards them across
-ranks (auto-detecting `MPI.COMM_WORLD` or the `torch.distributed` process group).
-[`TrainingData`](src/nitrom/training_data.py) is the view handed to an optimizer: it
-selects a subset of trajectories, truncates them to a fraction of their length, sets up
-Gauss–Legendre quadrature for the adjoint integrals, and can expand each physical
-trajectory into several time-shifted "virtual" trajectories.
+[`TrainingData`](src/nitrom/training_data.py) selects trajectories with
+`which_trajs` and a fraction of their snapshots with `percent_time_length`. It
+scales normalization weights so losses average over the selected trajectories
+and snapshots. `num_shifts` and `shift_start_times` support multiple time windows
+per physical trajectory. Inference modules can also consume per-sample
+`data.time_weights` of shape `(nt,)` or `(local_ntraj, nt)` for OpInf and NiTROM.
+
+[`compute_pod`](src/nitrom/bases/pod.py) returns `(U, singular_values, V)`.
+`normalize=True` divides each trajectory by the square root of its pool weight.
+[`compute_data_driven_balancing`](src/nitrom/bases/balancing.py) builds trial and
+test bases from empirical reachability and observability factors; see the
+[CGL example](examples/cgl/README.md) for its use with impulse-response data.
 
 ### Projections
 
-[`Projection`](src/nitrom/projections/projection.py) defines `encode`/`decode` plus the
-VJPs the adjoint needs.
+[`LinearProjection`](src/nitrom/projections/linear_projection.py) takes two bases
+`[Phi, Psi]`, each of shape `(N, r)`, with invertible $\Psi^\top\Phi$. Its default
+coordinate convention is
 
-* [`LinearProjection`](src/nitrom/projections/linear_projection.py) — oblique projection
-  with trial basis $\Phi$ and test basis $\Psi$: $\mathrm{encode}(q)=\Psi^\top q$,
-  $\mathrm{decode}(z)=\Phi(\Psi^\top\Phi)^{-1}z$.
-* [`PolynomialProjection`](src/nitrom/projections/polynomial_projection.py) — linear
-  encoder with a **polynomial-manifold decoder**
-  $\mathrm{decode}(z)=\Phi S z + \mathbb{P}\sum_k A_k z^{\otimes k}$, where the
-  complementary projector $\mathbb{P} = I - \Phi S\Psi^\top$ guarantees
-  $\mathrm{encode}(\mathrm{decode}(z))=z$.
+$$
+z = \Psi^\top x, \qquad
+\hat{x} = \Phi(\Psi^\top\Phi)^{-1}z.
+$$
 
-### Latent-space models
+With `biorthogonalize="encoder"`, the inverse instead appears in the encoder:
+$z=(\Psi^\top\Phi)^{-1}\Psi^\top x$ and $\hat{x}=\Phi z$. Operators must be expressed
+in the coordinates used by the projection.
 
-* [`PolynomialModel`](src/nitrom/latent_space_models/polynomial_model.py) —
-  $f(z,u) = A_1 z + A_2 : zz^\top + \dots + Bu$ for any set of polynomial degrees, with
-  analytic Jacobians, adjoint RHS, and parameter VJPs.
-* [`GasPolynomialModel`](src/nitrom/latent_space_models/gas_polynomial_model.py) —
-  the same dynamics reparameterized through free variables $(K, R, Q, S)$ so that the
-  assembled operators are **globally asymptotically stable by construction**:
-  $A = ((K-K^\top) - R^{-1}R^{-\top})\tilde{Q}$ and
-  $H_{ijk} = (S_{ilk}-S_{lik})\tilde{Q}_{lj}$ with $\tilde{Q}=Q^{-1}Q^{-\top}$.
-  `retract_general_tensors_to_gas_tensors` maps an existing (possibly unstable) $(A,H)$
-  onto this manifold via a Lyapunov solve, so a Galerkin or OpInf model can be used as
-  a warm start.
+[`PolynomialProjection`](src/nitrom/projections/polynomial_projection.py) adds
+polynomial decoder terms in the complementary space, preserving
+`encode(decode(z)) == z` up to roundoff. Projection methods take a vector `(N,)`
+or `(r,)`, or a batch with the coordinate axis last: `(batch, N)` or `(batch, r)`.
+Transpose a single trajectory to encode or decode it, as in the quick start.
 
-### ParamRegistry
+### Latent dynamics
 
-[`ParamRegistry`](src/nitrom/roms/param_registry.py) unifies the parameters of the model
-and the projection into a single optimization vector. Parameters appearing in *both*
-(e.g. a basis that also enters the latent dynamics) are registered once and marked
-shared, so a single variable feeds both sites and their gradients are summed.
+[`PolynomialModel`](src/nitrom/latent_space_models/polynomial_model.py) represents
 
-### Inference modules and training
+$$
+\dot{z} = \sum_{k\in\mathcal{K}} A_k z^{\otimes k} + Bu.
+$$
 
-Every trainable object subclasses
-[`InferenceModule`](src/nitrom/optimization/modules/base.py), a minimal `nn.Module`-like
-container that returns a scalar cost from `forward()` and its **analytic** gradient from
-`gradient()`. That single contract lets one training loop drive all of them:
+`poly_comp` selects the degrees: `[1, 2]` gives linear and quadratic terms;
+`[0, 1, 2]` also includes a constant. The dense degree-`k` tensor has shape
+`(r,) * (k + 1)`. Operators default to zero or can be supplied through `tensors`.
+For input terms, use `forcing_config={"forcing_exists": True, "m": input_dim}`
+and supply input callables with the training data. An optional `"B"` entry
+initializes the input operator; call `module.set_unlearnable("B")` to keep it
+fixed during fitting.
 
-| Module | Cost |
-| --- | --- |
-| `OpInfModule` | $J = \sum_i w_i\lVert \dot z_i - f(t_i,z_i)\rVert^2 + \lambda\sum_k\lVert A_k\rVert^2$ — least-squares fit of the projected derivatives |
-| `PolyManifoldInfModule` | $J = \sum_i w_i\lVert x_i - \mathrm{decode}(z_i)\rVert^2 + \lambda\sum_k\lVert A_k\rVert^2$ — nonlinear-manifold reconstruction error |
-| `NitromModule` | $J = \sum_j \alpha_j^{-1}\sum_i \lVert y^{(j)}(t_i) - \hat y^{(j)}(t_i)\rVert^2$ — output mismatch of the **time-marched** ROM, differentiated by the adjoint |
+[`GasPolynomialModel`](src/nitrom/latent_space_models/gas_polynomial_model.py)
+parameterizes linear/quadratic operators so the **unforced** origin is globally
+asymptotically stable. Its `retract_general_tensors_to_gas_tensors` method provides
+a constrained initialization from ordinary operators. External forcing changes
+the equilibrium behavior; the unforced guarantee does not imply convergence to
+the origin under sustained input.
 
-> **Large state dimensions: the Gram path of `NitromModule`.** When the decoder is linear
-> (`LinearProjection`) and the output is the state (the FOM sets `output_is_state = True`),
-> the mismatch is evaluated as
-> $\lVert x\rVert^2 - 2(Sz)^\top\Phi^\top x + (Sz)^\top\Phi^\top\Phi(Sz)$,
-> $S = (\Psi^\top\Phi)^{-1}$, so the `(ntraj, N, nt)` reconstruction and error are never
-> stored. It is the same full-space cost, just not materialized. **It requires both
-> linearities**; a nonlinear decoder, a linear output $y = Cx$, or a nonlinear output map
-> falls back to the general path automatically. Because it works by cancellation, pass
-> `gram=False` if a model ever fits the data to ~1e-6 relative accuracy or better.
+[`AtrPolynomialModel`](src/nitrom/latent_space_models/atr_polynomial_model.py)
+adds a learned shift and constant term to obtain an attracting trapping region
+for autonomous dynamics. It supports bounded behavior beyond convergence to a
+fixed origin, including models intended to describe oscillations. Neither
+constraint guarantees stability of a numerical rollout at an arbitrary step size.
 
-Common controls on any module:
+## Inference and training
 
-* `set_unlearnable("B")` / `set_learnable(...)` — freeze parameters (their gradients are
-  zeroed), e.g. to keep a fixed input operator $B = \Phi^\top B_{\text{fom}}$.
-* `set_manifold_types(["Phi", "Psi"], ["grassmann", "stiefel"])` — optimize bases on
-  matrix manifolds instead of Euclidean space.
+| Module | Learns | Objective |
+| --- | --- | --- |
+| `OpInfModule(data, model, projection, reg=...)` | Latent operators with a fixed projection | Weighted projected-derivative error plus operator penalties |
+| `PolyManifoldInfModule(data, nonlin_poly_comp, Phi, Psi, reg=...)` | Nonlinear decoder tensors with fixed bases | Weighted state reconstruction error plus decoder penalties |
+| `NitromModule(data, registry, fom=..., ...)` | Dynamics and projection parameters | Weighted output error of the integrated ROM plus regularization |
 
-[`train`](src/nitrom/optimization/train.py) runs Adam, SGD, or L-BFGS with optional
-restarts and multi-start perturbations, and records `loss_history` / `gradnorm_history`.
-On the PyTorch backend it uses `torch.optim` (plus LR schedulers and distributed
-all-reduce); on the NumPy backend every optimizer supplies only a search *direction* and
-the step comes from a strong-Wolfe line search with Armijo backtracking. Manifold-typed
-parameters are retracted and their gradients tangent-projected on both backends, with
-momentum buffers vector-transported between tangent spaces.
+[`ParamRegistry`](src/nitrom/roms/param_registry.py) combines model and projection
+parameters for NiTROM. Parameters with the same name in both components share one
+optimization variable and accumulate contributions from both.
 
-For the pure operator-inference problem,
-[`solve_opinf`](src/nitrom/optimization/opinf_solver.py) skips iteration entirely and
-returns the exact regularized weighted-least-squares solution, honouring frozen
-parameters.
+All inference modules expose a scalar `forward()`/`module()` and analytic
+`gradient()`. [`train`](src/nitrom/optimization/train.py) supports `"adam"`,
+`"sgd"`, and `"lbfgs"` on both backends and records `loss_history` and
+`gradnorm_history`. NumPy uses manifold search directions with a strong-Wolfe
+line search and Armijo fallback; PyTorch uses `torch.optim` with analytic gradients.
+Use `set_unlearnable("B")` / `set_learnable("B")` to freeze or unfreeze a parameter,
+and `set_manifold_types(...)` to select Euclidean, Grassmann, or Stiefel geometry.
+NumPy training also accepts `callback(module, iteration, loss, gradnorm)` for
+checkpointing; PyTorch training supports `scheduler_creator` for LR scheduling.
 
-### Time steppers
+### Operator inference
 
-[`solve_ivp`](src/nitrom/time_steppers/time_stepper.py) integrates batched IVPs with
-`rk2`, `rk4`, `backward_euler` (Newton, with batched Jacobians), or adaptive `rk45`
-(Dormand–Prince 5(4)), returning the solution interpolated onto the requested evaluation
-times. `solve_adjoint_ivp_discrete` provides the matching discrete adjoint, so NiTROM
-gradients can be taken either **discretely** (exactly consistent with the forward
-integrator) or **continuously** — selectable via `adjoint_method` on `NitromModule`.
+`OpInfModule` accepts nonnegative regularization weights by polynomial degree:
+`reg={2: 0.01}` penalizes the quadratic tensor and `reg={3: 0.01}` the cubic tensor.
+Omitted degrees and the input operator are unpenalized; `None` or `{}` disables
+regularization. Scalar weights are not accepted. Penalties use the Frobenius
+norms of the physical dense operator tensors, including for constrained models.
 
-### Backends
+For an ordinary `PolynomialModel`, [`solve_opinf`](src/nitrom/optimization/opinf_solver.py)
+fits the operators directly and honors frozen parameters. `solver="lstsq"` solves
+the augmented weighted least-squares system with SVD; its optional `rcond` sets
+the relative singular-value cutoff. The default `solver="normal"` uses normal
+equations. Both support NumPy, PyTorch, and distributed data; distributed `lstsq`
+combines local QR factors. GAS/ATR parameterizations require iterative `train`.
 
-All math is written against a thin [`Backend`](src/nitrom/backend.py) shim, so the same
-code runs on NumPy (light, CPU) or PyTorch (autograd, GPU). Select it once per process:
+### Trajectory matching
 
-```python
-from nitrom.backend import set_backend
-set_backend("numpy")   # or "torch"
+The `fom` argument to `NitromModule` supplies output evaluation through
+`compute_output(q)` and its Jacobian through `compute_output_derivative(q)`.
+For a constant linear output, return its `(n_outputs, N)` matrix. Alternatively,
+provide `apply_output_adjoint(e, q)` to apply the output Jacobian transpose
+without materializing it. Output evaluation operates on trajectory arrays of
+shape `(local_ntraj, N, nt)` and returns `(local_ntraj, n_outputs, nt)`.
+
+For `LinearProjection` and `fom.output_is_state = True`, NiTROM automatically
+uses a Gram formulation of the state error that avoids storing the full
+reconstruction and residual. Other output/decoder combinations use the general
+path. Set `gram=False` when cancellation affects accuracy at very small errors;
+`gram=True` requires the linear-decoder/state-output combination.
+
+## Integration and adjoints
+
+[`solve_ivp`](src/nitrom/time_steppers/integration.py) supports `rk2`, `rk4`,
+`backward_euler` with Newton solves, and adaptive Dormand–Prince `rk45`. It takes
+initial states `(r,)` or `(batch, r)` and returns `(r, nt)` or `(batch, r, nt)` at
+`t_eval`. `step` advances once; `solve_fixed_ivp` returns a `FixedStepSolution`
+with times `t`, states `X`, and optional Runge–Kutta stage states.
+
+`NitromModule` defaults to `time_stepper="rk4"` and `adjoint_method="discrete"`.
+For fixed-step training, `n_substeps` divides each measurement interval into
+that many steps, including on nonuniform measurement grids. Discrete adjoints
+differentiate the discretized loss. `adjoint_method="continuous"` instead uses
+continuous adjoint integration and `n_leggauss` quadrature nodes per interval
+for parameter-gradient integrals.
+
+Adaptive RK45 uses `atol` and `rtol`; its adjoint reconstructs measurement intervals
+and does not differentiate step acceptance or the step-size controller. Gradient
+agreement is therefore limited by adaptive solver tolerances.
+
+## Backends and parallel training
+
+Select `set_backend("numpy")` or `set_backend("torch")` before constructing data,
+models, and projections. Objects retain the backend selected at construction;
+changing the default does not convert them. Models and projections also accept
+an explicit `backend=` adapter. Use matching backend arrays, dtypes, and devices
+across components; Torch allocations use `device=` and Torch dtypes such as
+`torch.float64`. GPU training uses the same analytic-gradient interface.
+
+For a NumPy training script using `TrainingPool`, launch trajectory parallelism
+with MPI:
+
+```bash
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 mpiexec -n 4 python train_rom.py
 ```
 
-Objects bind to whichever backend is active *at construction time*.
-`setup_distributed()` / `cleanup_distributed()` wrap `torch.distributed` process-group
-setup (NCCL on CUDA, gloo otherwise) for `torchrun` jobs.
+For PyTorch, initialize the process group **before** constructing the pool:
 
----
+```python
+from nitrom import cleanup_distributed, set_backend, setup_distributed
+
+set_backend("torch")
+device, rank, world_size = setup_distributed()
+try:
+    # Construct the pool and model with device=device, then train on all ranks.
+    ...
+finally:
+    cleanup_distributed()
+```
+
+Launch that script with `torchrun --standalone --nproc_per_node=4 train_rom.py`.
+`setup_distributed` selects NCCL on CUDA or gloo on CPU. Data are sharded across
+ranks, while training reduces costs and gradients and runs optimizers in
+lockstep. Each rank must own at least one pool trajectory or virtual window,
+and initial parameters must agree across ranks. Explicit `comm=` groups are
+preserved through sharding and the associated collectives. A serial NumPy session
+does not initialize MPI.
 
 ## Examples
 
-Each directory under [examples/](examples/) is self-contained: generate data, train, then
-post-process.
+The [examples guide](examples/README.md) covers two workflows:
 
-* **[examples/toymodel/](examples/toymodel/)** — a 3-state cubic ODE reduced to $r=2$.
-  The fastest way to see the whole workflow: `generate_data.py` → `train_opinf.py` →
-  `train_nitrom.py` → `read_results.py`. Also includes `check_gradients.py`
-  (finite-difference validation of the adjoint gradients) and `train_opinf_sweep.py`
-  (regularization sweep).
-* **[examples/cavity/](examples/cavity/)** — 2D lid-driven cavity flow at $Re = 8300$ on
-  a $100\times100$ grid (Numba-accelerated FOM), reduced to $r=50$.
-* **[examples/cavity_30/](examples/cavity_30/)** — the same cavity case at $r=30$.
+- [Forced three-state ODE](examples/toymodel/README.md): POD-Galerkin, OpInf,
+  GAS-OpInf, NiTROM, and GAS-NiTROM.
+- [Complex Ginzburg–Landau equation](examples/cgl/README.md): POD and empirically
+  balanced cubic OpInf models, followed by NiTROM refinement of each.
 
-The training scripts compare Galerkin projection, OpInf, GAS-OpInf, NiTROM, and
-GAS-NiTROM side by side, and save self-contained ROM checkpoints (bases + operators) as
-pickles.
-
-[`nitrom.plotting.set_plot_style`](src/nitrom/plotting.py) applies the shared
-publication figure style used by the post-processing scripts (requires a working LaTeX
-installation, since `text.usetex` is enabled).
-
----
-
-## Tests
+After installing `.[plot]`, run a small complete workflow from the repository root:
 
 ```bash
-pytest                        # full suite
-pytest tests/optimization -q  # just the optimization tests
+python examples/toymodel/generate_data.py --smoke
+python examples/toymodel/train_models.py --smoke
+python examples/toymodel/plot_results.py --smoke
 ```
 
-The suite covers the backend shim, training-data sharding, projections, latent-space
-models, time steppers and their adjoints, manifold geometry, the Riemannian L-BFGS, and
-finite-difference gradient checks for every inference module
-([tests/optimization/modules/_gradcheck.py](tests/optimization/modules/_gradcheck.py)).
-Linting uses `ruff` with the configuration in [pyproject.toml](pyproject.toml).
+Replace `toymodel` with `cgl` for the CGL workflow. Omit `--smoke` from **all three**
+commands for the full settings. Outputs go to each example's ignored
+`outputs/smoke/` or `outputs/full/`; use the same `--output-dir` across stages to
+choose another location.
 
----
+Matching NiTROM checkpoints continue from saved parameters automatically;
+`train_models.py --fresh` restarts the fits. Optimizer state is not restored.
+Plotting reads saved predictions and works without LaTeX; `--tex` enables
+publication styling. The smoke profiles exercise every model and figure but do
+not establish full-profile scientific accuracy.
+
+## Development and tests
+
+Install `.[dev,plot]` for CPU development and the example workflows. Add `torch`
+for backend agreement checks and `mpi` for MPI tests.
+
+```bash
+python -m pytest -q                              # default CPU checks
+python -m pytest -q tests/examples               # tutorial workflow checks
+python -m pytest -q -m 'not distributed and not gpu'  # include slow CPU checks
+python -m pytest -q -m distributed               # MPI/Torch communication tests
+python -m pytest -q -m gpu                       # CUDA checks
+python -m pytest -q -m ''                        # all applicable checks
+ruff check src tests
+ruff format --check src tests
+```
+
+`slow`, `distributed`, and `gpu` tests are excluded by default. Optional test
+requirements depend on the suite; CUDA and communication checks need their
+corresponding hardware/runtime. Pytest imports this checkout's `src` tree.
+Parallel test execution is opt-in with `python -m pytest -n auto`; limit BLAS
+threads when using many workers.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT; see [LICENSE](LICENSE).

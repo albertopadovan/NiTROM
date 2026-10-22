@@ -6,7 +6,6 @@ and all other parameters live on the Euclidean manifold.
 
 import numpy as np
 import pytest
-import torch
 
 from nitrom.latent_space_models.gas_polynomial_model import GasPolynomialModel
 from nitrom.latent_space_models.polynomial_model import PolynomialModel
@@ -21,6 +20,8 @@ from ._gradcheck import (
     LinearOutputFOM,
     random_basis,
 )
+
+torch = pytest.importorskip("torch")
 
 N, R, NTRAJ, NT, M, NO = 5, 2, 2, 4, 1, 3
 
@@ -261,9 +262,7 @@ def test_nitrom_manifold_optimization_run(optimizer_type):
 
     # Grassmann check: Phi^T @ grad_Phi = 0
     grassmann_check = module.Phi.T @ module.Phi.grad
-    assert torch.allclose(
-        grassmann_check, torch.zeros(R, R, dtype=DTYPE), atol=1e-6
-    )
+    assert torch.allclose(grassmann_check, torch.zeros(R, R, dtype=DTYPE), atol=1e-6)
 
     # Stiefel check: Psi^T @ grad_Psi + grad_Psi^T @ Psi = 0
     stiefel_check = module.Psi.T @ module.Psi.grad
@@ -273,3 +272,5 @@ def test_nitrom_manifold_optimization_run(optimizer_type):
         atol=1e-6,
     )
 
+
+pytestmark = pytest.mark.usefixtures("torch_backend")

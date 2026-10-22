@@ -4,17 +4,19 @@ Quartic manifold: the quadratic, cubic, and quartic tensors (A2, A3, A4) are
 learned.  Ambient dimension N = 5, latent dimension r = 2.
 """
 
-import torch
+import pytest
 
 from nitrom.optimization import PolyManifoldInfModule
+from tests._support import finite_diff_grad
 
 from ._gradcheck import (
     DTYPE,
     Data,
     assert_grad_close,
-    finite_diff_grad,
     random_basis,
 )
+
+torch = pytest.importorskip("torch")
 
 N, R, NTRAJ, NT = 5, 2, 2, 6
 NONLIN_POLY_COMP = [2, 3, 4]
@@ -35,7 +37,11 @@ def test_gradient_quartic_manifold():
     ]
 
     module = PolyManifoldInfModule(
-        data, NONLIN_POLY_COMP, Phi, Psi=Phi, reg=0.01,
+        data,
+        NONLIN_POLY_COMP,
+        Phi,
+        Psi=Phi,
+        reg=0.01,
         initial_guess=initial_guess,
     )
 
@@ -43,3 +49,6 @@ def test_gradient_quartic_manifold():
     assert len(list(module.parameters())) == len(NONLIN_POLY_COMP)
 
     assert_grad_close(module.gradient(), finite_diff_grad(module))
+
+
+pytestmark = pytest.mark.usefixtures("torch_backend")

@@ -1,9 +1,10 @@
 import pytest
-import torch
-import torch.nn as nn
 
 from nitrom.optimization import train
 from nitrom.optimization.modules.base import InferenceModule
+
+torch = pytest.importorskip("torch")
+nn = torch.nn
 
 
 class DummyManifoldModule(InferenceModule):
@@ -110,3 +111,6 @@ def test_partial_manifold_assignment():
     assert torch.allclose(
         skew + skew.T, torch.zeros(2, 2, dtype=torch.float64), atol=1e-7
     )
+
+
+pytestmark = pytest.mark.usefixtures("torch_backend")

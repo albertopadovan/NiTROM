@@ -1,89 +1,68 @@
+"""Generate training trajectories and held-out step responses in physical units."""
+
+import time as clock
+
 import dill
 import numpy as np
+from _utils import prepare, write_json
+from model import ToyModel
+from settings import arguments, configuration
 
-import fom_class
 from nitrom.backend import set_backend
-from nitrom.time_steppers.time_stepper import solve_ivp
+from nitrom.time_steppers import solve_ivp
 
-# Pure-numpy CPU run.
-set_backend("numpy")
 
-# %% Instantiate the full-order model class
-
-dtype = np.float64
-
-n = 3
-beta = 20.0
-A2 = np.diag(np.array([-1.0, -2.0, -5.0], dtype=dtype))
-A3 = np.zeros((n, n, n), dtype=dtype)
-A3[:, :, -1] = np.diag(np.array([beta, beta, 0.0], dtype=dtype))
-B = np.ones((n, 1), dtype=dtype)
-C = np.ones((1, n), dtype=dtype)
-time = np.linspace(0.0, 10.0, 100, dtype=dtype)
-
-fom = fom_class.full_order_model(A2, A3, B, C, dtype=dtype)
-
-# %% Generate training trajectories and save to file
-
-traj_path = "./trajectories/"
-
-fname_traj = traj_path + "traj_%03d.npy"
-fname_weight = traj_path + "weight_%03d.npy"
-fname_forcing = traj_path + "forcing_%03d.pkl"
-fname_deriv = traj_path + "deriv_%03d.npy"
-fname_time = traj_path + "time.npy"
-
-betas = np.array([0.01, 0.1, 0.2, 0.248], dtype=dtype)
-n_traj = len(betas)
-
-# Fixed-step RK4 sub-step used to integrate the FOM between saved snapshots.
-dt = float((time[1] - time[0]) / 100)
-
-for k in range(n_traj):
-    b = float(betas[k])
-
-    # Full-space forcing field f(t) = B u = b * ones(n) that drives the FOM.
-    u = lambda t, b=b: b * np.ones(n, dtype=dtype)
-
-    # Integrate dx/dt = A2 x + A3 : x x^T + f(t) with the RK4 stepper.  The
-    # forcing is baked into the RHS closure (rather than passed as an extra
-    # positional arg) so it does not collide with the stepper's newton params.
-    def rhs(t, x, _u=u):
-        return fom.evaluate_fom_dynamics(t, x, _u)
-
-    X = solve_ivp(
-        rhs,
-        np.zeros(n, dtype=dtype),
-        float(time[0]),
-        float(time[-1]),
-        dt,
-        time,
-        "rk4",
-    )  # (n, n_time)
-
-    # Time derivatives at the saved snapshots.
-    dX = np.zeros_like(X)
-    for j in range(time.shape[0]):
-        dX[:, j] = fom.evaluate_fom_dynamics(float(time[j]), X[:, j], u)
-
-    # Analytic steady state -> trajectory weight = ||C x_ss||^2.
-    id_ss = np.array(
-        [
-            -b / (-1 + beta / 5 * b),
-            -b / (-2 + beta / 5 * b),
-            b / 5,
-        ],
-        dtype=dtype,
+def main(argv=None):
+    settings, directory, _ = arguments(__doc__, argv)
+    set_backend("numpy")
+    start = clock.perf_counter()
+    prepare(directory)
+    data = directory / "data"
+    fom = ToyModel(settings.beta)
+    time = np.linspace(0, settings.train_end, settings.train_snapshots)
+    amplitudes = np.array([0.01, 0.1, 0.2, 0.248])
+    for j, b in enumerate(amplitudes):
+        X = solve_ivp(
+            fom.rhs,
+            np.zeros(3),
+            0,
+            time[-1],
+            (time[1] - time[0]) / 100,
+            time,
+            "rk4",
+            forcing=b * fom.B[:, 0],
+        )
+        np.save(data / f"train_traj_{j:03d}.npy", X)
+        np.save(data / f"train_deriv_{j:03d}.npy", fom.rhs(0, X.T, b * fom.B[:, 0]).T)
+        np.save(data / f"train_weight_{j:03d}.npy", np.array([fom.steady_weights(b)]))
+        with (data / f"train_forcing_{j:03d}.pkl").open("wb") as stream:
+            dill.dump(lambda t, b=float(b): np.array([b]), stream, recurse=True)
+    np.save(data / "time.npy", time)
+    np.save(data / "train_amplitudes.npy", amplitudes)
+    test_time = np.linspace(0, settings.test_end, settings.test_snapshots)
+    test_amplitudes = 0.24 * np.random.default_rng(settings.seed).random(
+        settings.n_test
     )
-    weight = np.linalg.norm(fom.compute_output(id_ss)) ** 2
+    X_test = solve_ivp(
+        fom.rhs,
+        np.zeros((settings.n_test, 3)),
+        0,
+        test_time[-1],
+        (test_time[1] - test_time[0]) / 5,
+        test_time,
+        "rk4",
+        forcing=test_amplitudes[:, None] * fom.B[:, 0],
+    )
+    np.savez(
+        data / "testing.npz",
+        time=test_time,
+        X=X_test,
+        amplitudes=test_amplitudes,
+        weights=fom.steady_weights(test_amplitudes),
+    )
+    write_json(data / "settings.json", configuration(settings))
+    print(f"Data: {data} ({clock.perf_counter() - start:.2f} s)")
 
-    # Saved forcing is the m = 1 ROM input u(t) = b (multiplied by B_r downstream).
-    u_save = lambda t, b=b: b * np.ones(1)
 
-    np.save(fname_traj % k, X)
-    np.save(fname_deriv % k, dX)
-    np.save(fname_weight % k, np.array([float(weight)]))
-    with open(fname_forcing % k, "wb") as f:
-        dill.dump(u_save, f)
-
-np.save(fname_time, time)
+if __name__ == "__main__":
+    main()

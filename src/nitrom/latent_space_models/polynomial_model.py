@@ -45,6 +45,8 @@ class PolynomialModel(Model):
         instability_threshold: float = 1e6,
         tensors: list | None = None,
         forcing_config: dict | None = None,
+        *,
+        backend=None,
     ):
         forcing_exists = forcing_config is not None and forcing_config.get(
             "forcing_exists", False
@@ -57,7 +59,7 @@ class PolynomialModel(Model):
         param_names = [f"A_{k}" for k in poly_comp]
         if forcing_exists:
             param_names.append("B")
-        super().__init__(r, param_names, device, dtype)
+        super().__init__(r, param_names, device, dtype, backend=backend)
 
         self.poly_comp = poly_comp
         self.thresh = instability_threshold
@@ -70,9 +72,7 @@ class PolynomialModel(Model):
         # Initialize tensors (zero, or the fixed B) if not provided
         if tensors is None:
             tensors = [
-                self.backend.zeros(
-                    (r,) * (k + 1), dtype=self.dtype, device=self.device
-                )
+                self.backend.zeros((r,) * (k + 1), dtype=self.dtype, device=self.device)
                 for k in poly_comp
             ]
             if forcing_exists:
@@ -85,9 +85,7 @@ class PolynomialModel(Model):
                 else:
                     m = forcing_config["m"]
                     tensors.append(
-                        self.backend.zeros(
-                            (r, m), dtype=self.dtype, device=self.device
-                        )
+                        self.backend.zeros((r, m), dtype=self.dtype, device=self.device)
                     )
         self.update_params(tensors)
         # A supplied fixed B always overrides any value from tensors.
@@ -118,7 +116,9 @@ class PolynomialModel(Model):
             return None
         tensors = self.get_params()[: len(self.poly_comp)]
         cache = getattr(self, "_flat_cache", None)
-        if cache is None or any(a is not b for a, b in zip(cache[0], tensors)):
+        if cache is None or any(
+            a is not b for a, b in zip(cache[0], tensors, strict=False)
+        ):
             flats = [t.reshape(t.shape[0], -1) for t in tensors]
             self._flat_cache = (list(tensors), flats)
         return self._flat_cache[1]
@@ -150,9 +150,7 @@ class PolynomialModel(Model):
         self.einsum_ss = tuple(ss)
 
         # RHS:  A_k (z, ..., z)
-        self._rhs_eq = tuple(
-            ",".join(parts) for parts in self.einsum_ss
-        )
+        self._rhs_eq = tuple(",".join(parts) for parts in self.einsum_ss)
         self._rhs_eq_batched = tuple(
             ",".join([parts[0]] + [f"...{p}" for p in parts[1:]])
             for parts in self.einsum_ss
@@ -187,13 +185,9 @@ class PolynomialModel(Model):
             if k > 1:
                 for comb in combinations(input_chars, k - 1):
                     free = next(c for c in input_chars if c not in comb)
-                    terms.append(
-                        ",".join([input_chars, *comb]) + "->" + free
-                    )
+                    terms.append(",".join([input_chars, *comb]) + "->" + free)
                     terms_b.append(
-                        ",".join(
-                            [f"...{input_chars}", *(f"...{c}" for c in comb)]
-                        )
+                        ",".join([f"...{input_chars}", *(f"...{c}" for c in comb)])
                         + f"->...{free}"
                     )
             adj.append(tuple(terms))
@@ -262,9 +256,12 @@ class PolynomialModel(Model):
             flats = self._torch_flat_operators()
             if flats is not None:
                 dzdt = None
-                for k, M in zip(self.poly_comp, flats):
-                    zk = z if k == 1 else (
-                        z[:, :, None] * z[:, None, :]).reshape(z.shape[0], -1)
+                for k, M in zip(self.poly_comp, flats, strict=False):
+                    zk = (
+                        z
+                        if k == 1
+                        else (z[:, :, None] * z[:, None, :]).reshape(z.shape[0], -1)
+                    )
                     term = zk @ M.T
                     dzdt = term if dzdt is None else dzdt + term
                 return self._masked(dzdt, z)
@@ -436,13 +433,15 @@ class PolynomialModel(Model):
             if flats is not None:
                 xp = bkend.xp
                 dzdt = None
-                for k, M in zip(self.poly_comp, flats):
+                for k, M in zip(self.poly_comp, flats, strict=False):
                     if k == 1:
                         term = z @ M
                     else:
                         G = (z @ M).reshape(z.shape[0], z.shape[1], z.shape[1])
-                        term = (xp.bmm(Z[:, None, :], G)[:, 0, :]
-                                + xp.bmm(G, Z[:, :, None])[:, :, 0])
+                        term = (
+                            xp.bmm(Z[:, None, :], G)[:, 0, :]
+                            + xp.bmm(G, Z[:, :, None])[:, :, 0]
+                        )
                     dzdt = term if dzdt is None else dzdt + term
                 return self._masked(dzdt, z)
 

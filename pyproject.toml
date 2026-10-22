@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=64", "wheel"]
+requires = ["setuptools>=77.0.3", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Non-intrusive Trajectory-based Reduced-Order Modelling"
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Alberto Padovan", email = "alberto.padovan.94@gmail.com" },
     { name = "Cole Errico", email = "cerrico2@illinois.edu" },
@@ -16,13 +17,13 @@ requires-python = ">=3.10"
 dependencies = [
     "numpy",
     "scipy",
-    "numba",
-    "matplotlib",
-    "torch",
     "dill",
 ]
 
 [project.optional-dependencies]
+torch = ["torch"]
+mpi = ["mpi4py"]
+plot = ["matplotlib"]
 dev = [
     "pytest",
     "pytest-xdist",
@@ -34,12 +35,13 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# The finite-difference gradient checks are independent and CPU-bound, so the
-# suite parallelizes almost perfectly.  "-n logical" uses every available core
-# (SLURM/cgroup limits are respected); "-p no:cacheprovider" keeps concurrent
-# workers from racing on .pytest_cache.  Override with "-n 0" to run serially,
-# e.g. when using a debugger.
-addopts = "-n logical -p no:cacheprovider"
+pythonpath = ["src"]
+addopts = "-m 'not slow and not distributed and not gpu'"
+markers = [
+    "slow: exhaustive gradient checks and numerical convergence studies",
+    "distributed: tests launching multiple MPI or Torch processes",
+    "gpu: tests requiring CUDA hardware",
+]
 
 [tool.ruff]
 target-version = "py310"

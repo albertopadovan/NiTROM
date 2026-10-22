@@ -1,20 +1,21 @@
 """Tests for the PolynomialProjection class."""
 
-import pytest
-import numpy as np
-import torch
 from string import ascii_lowercase
+
+import numpy as np
+import pytest
 
 from nitrom.projections.polynomial_projection import PolynomialProjection
 
+torch = pytest.importorskip("torch")
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 N = 10  # full-space dimension
-R = 3   # reduced-space dimension
-M = 5   # batch size
+R = 3  # reduced-space dimension
+M = 5  # batch size
 
 
 def _random_tensors(n, r, nonlin_poly_comp, seed=42):
@@ -43,8 +44,8 @@ def proj(request):
 # Basic / construction tests
 # ---------------------------------------------------------------------------
 
-class TestBasic:
 
+class TestBasic:
     def test_param_names(self, proj):
         proj_obj, nonlin = proj
         expected = ["Phi", "Psi"] + [f"A{k}" for k in nonlin]
@@ -69,8 +70,8 @@ class TestBasic:
 # encode tests
 # ---------------------------------------------------------------------------
 
-class TestEncode:
 
+class TestEncode:
     def test_unbatched_shape(self, proj):
         proj_obj, _ = proj
         q = torch.randn(N, dtype=torch.float64)
@@ -86,7 +87,9 @@ class TestEncode:
         q = torch.randn(N, dtype=torch.float64)
         expected = proj_obj.Psi.T @ q
         np.testing.assert_allclose(
-            proj_obj.encode(q).numpy(), expected.numpy(), rtol=1e-12,
+            proj_obj.encode(q).numpy(),
+            expected.numpy(),
+            rtol=1e-12,
         )
 
 
@@ -94,8 +97,8 @@ class TestEncode:
 # decode tests
 # ---------------------------------------------------------------------------
 
-class TestDecode:
 
+class TestDecode:
     def test_unbatched_shape(self, proj):
         proj_obj, _ = proj
         z = torch.randn(R, dtype=torch.float64)
@@ -118,7 +121,9 @@ class TestDecode:
         S = torch.linalg.inv(Psi.T @ Phi)
         expected = Phi @ (S @ z)
         np.testing.assert_allclose(
-            proj_obj.decode(z).numpy(), expected.numpy(), rtol=1e-12,
+            proj_obj.decode(z).numpy(),
+            expected.numpy(),
+            rtol=1e-12,
         )
 
 
@@ -126,8 +131,8 @@ class TestDecode:
 # encode-decode consistency
 # ---------------------------------------------------------------------------
 
-class TestEncodeDecode:
 
+class TestEncodeDecode:
     def test_encode_decode_identity_in_reduced_space(self, proj):
         r"""encode(decode(z)) = z because Psi^T P = 0."""
         proj_obj, _ = proj
@@ -146,8 +151,8 @@ class TestEncodeDecode:
 # update tests
 # ---------------------------------------------------------------------------
 
-class TestUpdate:
 
+class TestUpdate:
     def test_update_changes_params(self, proj):
         proj_obj, nonlin = proj
         old_Phi = proj_obj.Phi.clone()
@@ -162,7 +167,9 @@ class TestUpdate:
         proj_obj.update(new_tensors)
         expected_S = torch.linalg.inv(new_tensors[1].T @ new_tensors[0])
         np.testing.assert_allclose(
-            proj_obj.S.numpy(), expected_S.numpy(), rtol=1e-12,
+            proj_obj.S.numpy(),
+            expected_S.numpy(),
+            rtol=1e-12,
         )
 
 
@@ -170,8 +177,8 @@ class TestUpdate:
 # vjp_encode tests (autograd)
 # ---------------------------------------------------------------------------
 
-class TestVjpEncode:
 
+class TestVjpEncode:
     def _autograd_check(self, proj_obj, z_shape):
         rng = np.random.default_rng(500)
         Psi = proj_obj.Psi.clone().requires_grad_(True)
@@ -192,11 +199,15 @@ class TestVjpEncode:
         grads = proj_obj.vjp_encode(q, v)
         # grad_Phi should be zero
         np.testing.assert_allclose(
-            grads[0].numpy(), 0.0, atol=1e-15,
+            grads[0].numpy(),
+            0.0,
+            atol=1e-15,
         )
         # grad_Psi
         np.testing.assert_allclose(
-            grads[1].numpy(), grad_auto.numpy(), rtol=1e-10,
+            grads[1].numpy(),
+            grad_auto.numpy(),
+            rtol=1e-10,
         )
         # grad_A_k should all be zero
         for g in grads[2:]:
@@ -215,8 +226,8 @@ class TestVjpEncode:
 # vjp_decode tests (autograd)
 # ---------------------------------------------------------------------------
 
-class TestVjpDecode:
 
+class TestVjpDecode:
     def _decode_autograd(self, Phi, Psi, A_tensors, nonlin, z, v):
         """Compute autograd gradients of v^T decode(z)."""
         Phi_ = Phi.clone().requires_grad_(True)
@@ -250,9 +261,7 @@ class TestVjpDecode:
             J = torch.sum(v * q)
 
         J.backward()
-        return [Phi_.grad.clone(), Psi_.grad.clone()] + [
-            a.grad.clone() for a in As_
-        ]
+        return [Phi_.grad.clone(), Psi_.grad.clone()] + [a.grad.clone() for a in As_]
 
     def _check(self, proj_obj, nonlin, unbatched):
         rng = np.random.default_rng(600)
@@ -265,12 +274,17 @@ class TestVjpDecode:
 
         A_tensors = [getattr(proj_obj, f"A{k}") for k in nonlin]
         grads_auto = self._decode_autograd(
-            proj_obj.Phi, proj_obj.Psi, A_tensors, nonlin, z, v,
+            proj_obj.Phi,
+            proj_obj.Psi,
+            A_tensors,
+            nonlin,
+            z,
+            v,
         )
         grads_analytic = proj_obj.vjp_decode(z, v)
 
         names = ["Phi", "Psi"] + [f"A{k}" for k in nonlin]
-        for name, ga, gad in zip(names, grads_analytic, grads_auto):
+        for name, ga, gad in zip(names, grads_analytic, grads_auto, strict=False):
             np.testing.assert_allclose(
                 ga.detach().numpy(),
                 gad.detach().numpy(),
@@ -286,3 +300,6 @@ class TestVjpDecode:
     def test_batched(self, proj):
         proj_obj, nonlin = proj
         self._check(proj_obj, nonlin, unbatched=False)
+
+
+pytestmark = pytest.mark.usefixtures("torch_backend")

@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 from typing import Any
 
-from ..backend import get_backend
 from ..latent_space_models.model import Model
 from ..projections.projection import Projection
 
@@ -51,6 +50,8 @@ class ParamRegistry:
     """
 
     def __init__(self, model: Model, projection: Projection):
+        self.backend = model.backend
+        self.backend.validate_components(projection)
         self._model = model
         self._projection = projection
 
@@ -64,9 +65,7 @@ class ParamRegistry:
         entries: list[RegisteredParam] = []
         for name in model_names:
             if name in self._shared_names:
-                entries.append(
-                    RegisteredParam(name, True, ("model", "projection"))
-                )
+                entries.append(RegisteredParam(name, True, ("model", "projection")))
             else:
                 entries.append(RegisteredParam(name, False, ("model",)))
         for name in proj_names:
@@ -154,9 +153,15 @@ class ParamRegistry:
     def _component_values(self, component: str) -> dict[str, Any]:
         """Map ``name -> tensor`` for the given component."""
         if component == "model":
-            return dict(zip(self._model.param_names, self._model.get_params()))
+            return dict(
+                zip(self._model.param_names, self._model.get_params(), strict=False)
+            )
         return dict(
-            zip(self._projection.param_names, self._projection.get_params())
+            zip(
+                self._projection.param_names,
+                self._projection.get_params(),
+                strict=False,
+            )
         )
 
     def assert_shared_consistent(self, atol: float = 0.0, rtol: float = 1e-12) -> None:
@@ -173,7 +178,7 @@ class ParamRegistry:
         model_vals = self._component_values("model")
         proj_vals = self._component_values("projection")
         for name in self.shared_names:
-            if not get_backend().allclose(
+            if not self.backend.allclose(
                 model_vals[name], proj_vals[name], atol=atol, rtol=rtol
             ):
                 raise ValueError(
@@ -204,7 +209,7 @@ class ParamRegistry:
                 f"Expected {len(self._entries)} values (one per registered "
                 f"parameter), got {len(values)}."
             )
-        vals = dict(zip(self.names, values))
+        vals = dict(zip(self.names, values, strict=False))
         self._model.update_params([vals[n] for n in self._model.param_names])
         self._projection.update([vals[n] for n in self._projection.param_names])
 
@@ -240,7 +245,5 @@ class ParamRegistry:
         self.scatter(values)
 
     def __repr__(self) -> str:
-        items = ", ".join(
-            f"{e.name}{'*' if e.shared else ''}" for e in self._entries
-        )
+        items = ", ".join(f"{e.name}{'*' if e.shared else ''}" for e in self._entries)
         return f"ParamRegistry([{items}])  (* = shared)"

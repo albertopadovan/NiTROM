@@ -1,18 +1,39 @@
-"""Shared pytest configuration.
-
-The library default backend is numpy, but the bulk of the test suite is written
-against torch (it constructs torch tensors and, for a few tests, uses autograd).
-This autouse fixture pins the torch backend before every test so those tests run
-as written; the backend-specific tests in ``test_backend.py`` set/restore the
-backend explicitly within each test, which composes fine with this pin.
-"""
+"""Explicit backend fixtures and isolation of process-global defaults."""
 
 import pytest
 
-from nitrom.backend import set_backend
+from nitrom.backend import get_backend, set_backend
 
 
 @pytest.fixture(autouse=True)
-def _pin_torch_backend():
-    set_backend("torch")
+def _restore_backend():
+    previous = get_backend()
     yield
+    set_backend(previous.name)
+
+
+@pytest.fixture
+def numpy_backend():
+    previous = get_backend()
+    backend = set_backend("numpy")
+    yield backend
+    set_backend(previous.name)
+
+
+@pytest.fixture
+def torch_backend():
+    pytest.importorskip("torch")
+    previous = get_backend()
+    backend = set_backend("torch")
+    yield backend
+    set_backend(previous.name)
+
+
+@pytest.fixture(params=["numpy", "torch"])
+def backend(request):
+    if request.param == "torch":
+        pytest.importorskip("torch")
+    previous = get_backend()
+    backend = set_backend(request.param)
+    yield backend
+    set_backend(previous.name)

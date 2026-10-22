@@ -30,7 +30,7 @@ class PolynomialProjection(Projection):
     :type tensors: list
     """
 
-    def __init__(self, nonlin_poly_comp: list[int], tensors: list):
+    def __init__(self, nonlin_poly_comp: list[int], tensors: list, *, backend=None):
         if nonlin_poly_comp != sorted(nonlin_poly_comp):
             raise ValueError(
                 f"nonlin_poly_comp must be in ascending order, got {nonlin_poly_comp}"
@@ -38,13 +38,14 @@ class PolynomialProjection(Projection):
         param_names = ["Phi", "Psi"] + [f"A{k}" for k in nonlin_poly_comp]
         Phi = tensors[0]
         n, r = Phi.shape
-        bkend = get_backend()
+        bkend = backend or get_backend()
         super().__init__(
             n,
             r,
             param_names=param_names,
             device=bkend.device_of(Phi),
             dtype=Phi.dtype,
+            backend=bkend,
         )
         self.nonlin_poly_comp = nonlin_poly_comp
         self._generate_einsum_subscripts()
@@ -109,10 +110,7 @@ class PolynomialProjection(Projection):
         """
         bkend = self.backend
         # Linear part: Phi S z
-        if z.ndim == 1:
-            q = self.Phi @ (self.S @ z)
-        else:
-            q = (self.Phi @ (self.S @ z.T)).T
+        q = self.Phi @ (self.S @ z) if z.ndim == 1 else (self.Phi @ (self.S @ z.T)).T
 
         # Nonlinear part: P @ sum_k A_k z^{otimes k}
         # P = I - Phi S Psi^T
@@ -151,10 +149,7 @@ class PolynomialProjection(Projection):
         :rtype: tuple
         """
         bkend = self.backend
-        if q.ndim == 1:
-            grad_Psi = bkend.outer(q, v)
-        else:
-            grad_Psi = q.T @ v
+        grad_Psi = bkend.outer(q, v) if q.ndim == 1 else q.T @ v
         grads = (bkend.zeros_like(self.Phi), grad_Psi)
         for k in self.nonlin_poly_comp:
             grads += (bkend.zeros_like(getattr(self, f"A{k}")),)
@@ -191,9 +186,7 @@ class PolynomialProjection(Projection):
         if z.ndim == 1:
             g = bkend.zeros((self._n,), dtype=self.dtype, device=self.device)
         else:
-            g = bkend.zeros(
-                (z.shape[0], self._n), dtype=self.dtype, device=self.device
-            )
+            g = bkend.zeros((z.shape[0], self._n), dtype=self.dtype, device=self.device)
         for i, k in enumerate(self.nonlin_poly_comp):
             A_k = getattr(self, f"A{k}")
             if z.ndim == 1:
@@ -252,12 +245,9 @@ class PolynomialProjection(Projection):
         PhiTW = self.Phi.T @ W  # (r, r)
         grad_Phi = W - self.Psi @ (self.S.T @ PhiTW)  # (N, r)
 
-        if v.ndim == 1:
-            grad_Psi = -bkend.outer(q_decoded, p)  # (N, r)
-        else:
-            grad_Psi = -q_decoded.T @ p.T  # (N, r)
+        grad_Psi = -bkend.outer(q_decoded, p) if v.ndim == 1 else -q_decoded.T @ p.T
 
-        return (grad_Phi, grad_Psi) + tuple(grad_As)
+        return (grad_Phi, grad_Psi, *tuple(grad_As))
 
     def vjp_decode_state(self, z: Any, v: Any) -> Any:
         r"""

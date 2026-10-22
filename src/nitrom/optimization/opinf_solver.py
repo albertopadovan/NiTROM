@@ -1,4 +1,9 @@
+from math import isfinite
+from numbers import Real
 from typing import Any
+
+import numpy as np
+
 from nitrom.optimization.modules.opinf_module import OpInfModule
 
 
@@ -16,7 +21,67 @@ def _kronecker_power(bkend: Any, Z: Any, d: int) -> Any:
     return out
 
 
-def solve_opinf(module: OpInfModule) -> OpInfModule:
+def _solve_lstsq(bkend, design, target, reg_diag, comm, rcond):
+    """Solve an augmented system, using local QR factors in distributed jobs."""
+    nrows = design.shape[0]
+    if bkend.is_numpy:
+        from nitrom.distributed import mpi_bcast, mpi_gather, mpi_rank_size
+
+        _, size = mpi_rank_size(comm)
+    else:
+        import torch.distributed as dist
+
+        size = dist.get_world_size(group=comm) if dist.is_initialized() else 1
+
+    if size > 1:
+        # QR preserves the least-squares minimizer without squaring the
+        # condition number. Communicate small factors rather than snapshots.
+        basis, factor = bkend.qr(design)
+        projected = bkend.mH(basis) @ target
+        local = (bkend.to_numpy(factor), bkend.to_numpy(projected), nrows)
+        if bkend.is_numpy:
+            summaries = mpi_bcast(mpi_gather(local, comm=comm), comm=comm)
+        else:
+            summaries = [None] * size
+            dist.all_gather_object(summaries, local, group=comm)
+        device, dtype = bkend.device_of(design), design.dtype
+        design = bkend.concatenate(
+            [bkend.asarray(s[0], dtype=dtype, device=device) for s in summaries], axis=0
+        )
+        target = bkend.concatenate(
+            [bkend.asarray(s[1], dtype=dtype, device=device) for s in summaries], axis=0
+        )
+        nrows = sum(s[2] for s in summaries)
+
+    if bool((reg_diag > 0).any()):
+        design = bkend.concatenate((design, bkend.diag(bkend.sqrt(reg_diag))), axis=0)
+        target = bkend.concatenate(
+            (
+                target,
+                bkend.zeros(
+                    (reg_diag.shape[0], target.shape[1]),
+                    dtype=target.dtype,
+                    device=bkend.device_of(target),
+                ),
+            ),
+            axis=0,
+        )
+        nrows += reg_diag.shape[0]
+
+    # Explicit SVD gives the same rank policy on NumPy, Torch CPU, and CUDA,
+    # including underdetermined and rank-deficient polynomial feature sets.
+    U, singular, Vh = bkend.svd(design, full_matrices=False)
+    if rcond is None:
+        rcond = bkend.xp.finfo(singular.dtype).eps * max(nrows, design.shape[1])
+    keep = singular > rcond * singular[0]
+    safe = bkend.where(keep, singular, bkend.ones_like(singular))
+    inverse = bkend.where(keep, 1.0 / safe, bkend.zeros_like(singular))
+    return bkend.mH(Vh) @ (inverse[:, None] * (bkend.mH(U) @ target))
+
+
+def solve_opinf(
+    module: OpInfModule, *, solver: str = "normal", rcond: float | None = None
+) -> OpInfModule:
     """
     Analytically solve the Operator Inference (OpInf) weighted least-squares problem.
 
@@ -25,13 +90,36 @@ def solve_opinf(module: OpInfModule) -> OpInfModule:
     any frozen (unlearnable) parameters and scaling weights.
 
     The optimal parameters S = [A_d1_flat, A_d2_flat, ..., B] satisfy:
-    S (Q W Q.T + reg * I) = tilde_dZ W Q.T
+    S (Q W Q.T + Lambda) = tilde_dZ W Q.T
+
+    Lambda applies ``module.reg[d]`` to each coefficient of degree d;
+    omitted degrees and the forcing operator are unpenalized.
 
     Updates the module's parameters in-place and syncs them to the ROM.
 
     :param module: the OpInfModule to solve
+    :param solver: ``"normal"`` (default) uses the existing normal-equations
+        eigensolve with a relative eigenvalue cutoff of 1e-12. ``"lstsq"``
+        solves the weighted, regularized augmented system directly using SVD.
+        Distributed least squares combines local QR factors over the module's
+        communicator without gathering all snapshots.
+    :param rcond: Relative singular-value cutoff for ``solver="lstsq"``.
+        Defaults to machine precision times the larger global augmented-system
+        dimension. Must be finite and nonnegative; unavailable for ``"normal"``.
     :returns: the updated OpInfModule (with optimized parameters)
     """
+    if solver not in ("normal", "lstsq"):
+        raise ValueError("solver must be 'normal' or 'lstsq'")
+    if rcond is not None:
+        if solver != "lstsq":
+            raise ValueError("rcond is only supported with solver='lstsq'")
+        if (
+            isinstance(rcond, bool)
+            or not isinstance(rcond, Real)
+            or not isfinite(rcond)
+            or rcond < 0
+        ):
+            raise ValueError("rcond must be finite and nonnegative")
     bkend = module.backend
     r = module.rom.state_dimension
     device = bkend.device_of(module.Z)
@@ -93,33 +181,7 @@ def solve_opinf(module: OpInfModule) -> OpInfModule:
     Q = bkend.concatenate(feature_list, axis=0)
     Q_dim = Q.shape[0]
 
-    # 5. Formulate and solve the least-squares problem: S A = B_sys
-    # A = Q_w @ Q.T + reg * I, where Q_w = Q @ W
-    # B_sys = tilde_dZ @ Q_w.T
-    w = module.w  # shape (N_s,)
-    Q_w = Q * w[None, :]
-    Q_w_Q_T = Q_w @ Q.T
-    B_sys = tilde_dZ @ Q_w.T
-
-    # Allreduce local contributions to get the global matrices in parallel runs
-    if bkend.is_numpy:
-        from nitrom.backend import mpi_allreduce_sum, mpi_rank_size
-        # Reduce over the communicator the pool was sharded on (see train.py).
-        comm = getattr(module, "comm", None)
-        _, size = mpi_rank_size(comm)
-        if size > 1:
-            Q_w_Q_T = mpi_allreduce_sum(Q_w_Q_T, comm=comm)
-            B_sys = mpi_allreduce_sum(B_sys, comm=comm)
-    else:
-        try:
-            import torch.distributed as dist
-            if dist.is_available() and dist.is_initialized():
-                dist.all_reduce(Q_w_Q_T, op=dist.ReduceOp.SUM)
-                dist.all_reduce(B_sys, op=dist.ReduceOp.SUM)
-        except ImportError:
-            pass
-
-    import numpy as np
+    # 5. Build the same degree-specific tensor penalty for either algorithm.
     reg_diag_np = np.zeros(Q_dim, dtype=float)
     offset = 0
     for name in learnable_params:
@@ -128,21 +190,48 @@ def solve_opinf(module: OpInfModule) -> OpInfModule:
         else:
             d = int(name.split("_")[1])
             num_cols = r**d
-            if d == 2:
-                reg_diag_np[offset : offset + num_cols] = module.reg
+            reg_diag_np[offset : offset + num_cols] = module.reg.get(d, 0.0)
         offset += num_cols
 
     reg_diag_tensor = bkend.asarray(reg_diag_np, dtype=dtype, device=device)
-    reg_matrix = bkend.diag(reg_diag_tensor)
-    A = Q_w_Q_T + reg_matrix
+    comm = getattr(module, "comm", None)
+    if solver == "lstsq":
+        with bkend.no_grad():
+            sqrt_w = bkend.sqrt(module.w)
+            S_T = _solve_lstsq(
+                bkend,
+                bkend.mH(Q) * sqrt_w[:, None],
+                bkend.mH(tilde_dZ) * sqrt_w[:, None],
+                reg_diag_tensor,
+                comm,
+                rcond,
+            )
+    else:
+        # Normal equations communicate only Gram matrices in parallel runs.
+        Q_w = Q * module.w[None, :]
+        Q_w_Q_T = Q_w @ bkend.mH(Q)
+        B_sys = tilde_dZ @ bkend.mH(Q_w)
+        if bkend.is_numpy:
+            from nitrom.distributed import mpi_allreduce_sum, mpi_rank_size
 
-    # Solve via eigh: A = V @ diag(val) @ V.T -> A_inv = (V * val_inv[None, :]) @ V.T
-    val, vec = bkend.eigh(A)
-    max_val = bkend.max(bkend.abs(val))
-    tol = 1e-12 * max_val
-    val_inv = bkend.where(val > tol, 1.0 / val, 0.0)
-    A_inv = (vec * val_inv[None, :]) @ bkend.mH(vec)
-    S_T = A_inv @ bkend.mH(B_sys)
+            _, size = mpi_rank_size(comm)
+            if size > 1:
+                Q_w_Q_T = mpi_allreduce_sum(Q_w_Q_T, comm=comm)
+                B_sys = mpi_allreduce_sum(B_sys, comm=comm)
+        else:
+            import torch.distributed as dist
+
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(Q_w_Q_T, op=dist.ReduceOp.SUM, group=comm)
+                dist.all_reduce(B_sys, op=dist.ReduceOp.SUM, group=comm)
+        A = Q_w_Q_T + bkend.diag(reg_diag_tensor)
+        val, vec = bkend.eigh(A)
+        tol = 1e-12 * bkend.max(bkend.abs(val))
+        keep = val > tol
+        safe = bkend.where(keep, val, bkend.ones_like(val))
+        val_inv = bkend.where(keep, 1.0 / safe, bkend.zeros_like(val))
+        A_inv = (vec * val_inv[None, :]) @ bkend.mH(vec)
+        S_T = A_inv @ bkend.mH(B_sys)
     S = bkend.mH(S_T)
 
     # 6. Slice and reshape S back into individual learnable parameters

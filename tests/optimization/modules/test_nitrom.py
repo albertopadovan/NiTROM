@@ -7,7 +7,6 @@ discretization accuracy).
 """
 
 import pytest
-import torch
 
 from nitrom.latent_space_models.atr_polynomial_model import AtrPolynomialModel
 from nitrom.latent_space_models.gas_polynomial_model import GasPolynomialModel
@@ -15,15 +14,17 @@ from nitrom.latent_space_models.polynomial_model import PolynomialModel
 from nitrom.optimization import NitromModule
 from nitrom.projections.linear_projection import LinearProjection
 from nitrom.roms.param_registry import ParamRegistry
+from tests._support import finite_diff_grad
 
 from ._gradcheck import (
     DTYPE,
     Data,
     LinearOutputFOM,
     assert_grad_close,
-    finite_diff_grad,
     random_basis,
 )
+
+torch = pytest.importorskip("torch")
 
 N, R, NTRAJ, NT, M, NO = 5, 2, 2, 4, 1, 3
 
@@ -94,8 +95,13 @@ def _reference_grad(module, model_factory, time_stepper, adjoint_method):
     """
     if adjoint_method == "discrete":
         return finite_diff_grad(module)
-    ref = _module(model_factory(), time_stepper=time_stepper,
-                  adjoint_method="discrete", atol=module.atol, rtol=module.rtol)
+    ref = _module(
+        model_factory(),
+        time_stepper=time_stepper,
+        adjoint_method="discrete",
+        atol=module.atol,
+        rtol=module.rtol,
+    )
     ref.n_substeps = module.n_substeps
     return ref.gradient()
 
@@ -106,16 +112,25 @@ def _n_substeps(adjoint_method: str, time_stepper: str) -> int:
     return _N_SUBSTEPS_CONTINUOUS[time_stepper]
 
 
-def _module(model, time_stepper="rk4", adjoint_method="discrete", atol=1e-6, rtol=1e-3) -> NitromModule:
+def _module(
+    model, time_stepper="rk4", adjoint_method="discrete", atol=1e-6, rtol=1e-3
+) -> NitromModule:
     registry = ParamRegistry(model, _projection())
     return NitromModule(
-        _data(), registry, fom=_fom(), reg=0.01,
+        _data(),
+        registry,
+        fom=_fom(),
+        reg=0.01,
         n_substeps=_n_substeps(adjoint_method, time_stepper),
         time_stepper=time_stepper,
-        n_leggauss=5, adjoint_method=adjoint_method, atol=atol, rtol=rtol,
+        n_leggauss=5,
+        adjoint_method=adjoint_method,
+        atol=atol,
+        rtol=rtol,
     )
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("adjoint_method", ["discrete", "continuous"])
 @pytest.mark.parametrize("time_stepper", ["rk4", "rk2", "backward_euler", "rk45"])
 def test_gradient_polynomial_rom(adjoint_method, time_stepper):
@@ -127,7 +142,10 @@ def test_gradient_polynomial_rom(adjoint_method, time_stepper):
             0.3 * torch.randn(R, M, generator=g, dtype=DTYPE),
         ]
         return PolynomialModel(
-            R, [1, 2], dtype=DTYPE, tensors=tensors,
+            R,
+            [1, 2],
+            dtype=DTYPE,
+            tensors=tensors,
             forcing_config={"forcing_exists": True, "m": M},
         )
 
@@ -136,8 +154,14 @@ def test_gradient_polynomial_rom(adjoint_method, time_stepper):
         atol, rtol = 1e-12, 1e-10
     else:
         atol, rtol = 1e-6, 1e-3
-    module = _module(model, time_stepper=time_stepper, adjoint_method=adjoint_method, atol=atol, rtol=rtol)
-    
+    module = _module(
+        model,
+        time_stepper=time_stepper,
+        adjoint_method=adjoint_method,
+        atol=atol,
+        rtol=rtol,
+    )
+
     # Continuous/discretization mismatch has larger tolerance requirements
     if adjoint_method == "continuous" and time_stepper == "backward_euler":
         rtol_check, atol_check = 3e-2, 3e-2
@@ -145,14 +169,16 @@ def test_gradient_polynomial_rom(adjoint_method, time_stepper):
         rtol_check, atol_check = 2e-3, 1e-6
     else:
         rtol_check, atol_check = 1e-4, 1e-6
-        
+
     assert_grad_close(
         module.gradient(),
         _reference_grad(module, make_model, time_stepper, adjoint_method),
-        rtol=rtol_check, atol=atol_check,
+        rtol=rtol_check,
+        atol=atol_check,
     )
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("adjoint_method", ["discrete", "continuous"])
 @pytest.mark.parametrize("time_stepper", ["rk4", "rk2", "backward_euler", "rk45"])
 def test_gradient_gas_rom(adjoint_method, time_stepper):
@@ -160,14 +186,17 @@ def test_gradient_gas_rom(adjoint_method, time_stepper):
         g = torch.Generator().manual_seed(3)
         eye = torch.eye(R, dtype=DTYPE)
         gas_params = [
-            0.3 * torch.randn(R, R, generator=g, dtype=DTYPE),        # K
+            0.3 * torch.randn(R, R, generator=g, dtype=DTYPE),  # K
             eye + 0.1 * torch.randn(R, R, generator=g, dtype=DTYPE),  # R
             eye + 0.1 * torch.randn(R, R, generator=g, dtype=DTYPE),  # Q
-            0.2 * torch.randn(R, R, R, generator=g, dtype=DTYPE),     # S
-            0.3 * torch.randn(R, M, generator=g, dtype=DTYPE),        # B
+            0.2 * torch.randn(R, R, R, generator=g, dtype=DTYPE),  # S
+            0.3 * torch.randn(R, M, generator=g, dtype=DTYPE),  # B
         ]
         return GasPolynomialModel(
-            R, [1, 2], dtype=DTYPE, gas_params=gas_params,
+            R,
+            [1, 2],
+            dtype=DTYPE,
+            gas_params=gas_params,
             forcing_config={"forcing_exists": True, "m": M},
         )
 
@@ -176,8 +205,14 @@ def test_gradient_gas_rom(adjoint_method, time_stepper):
         atol, rtol = 1e-12, 1e-10
     else:
         atol, rtol = 1e-6, 1e-3
-    module = _module(model, time_stepper=time_stepper, adjoint_method=adjoint_method, atol=atol, rtol=rtol)
-    
+    module = _module(
+        model,
+        time_stepper=time_stepper,
+        adjoint_method=adjoint_method,
+        atol=atol,
+        rtol=rtol,
+    )
+
     # S has diagonal entries S[i, i, k] that cancel exactly in the H = S - S^T
     # assembly (assemble_gas_tensors), so their true gradient is 0 -- both
     # adjoint methods agree on this.  The finite-difference reference is not
@@ -198,26 +233,31 @@ def test_gradient_gas_rom(adjoint_method, time_stepper):
     assert_grad_close(
         module.gradient(),
         _reference_grad(module, make_model, time_stepper, adjoint_method),
-        rtol=rtol_check, atol=atol_check,
+        rtol=rtol_check,
+        atol=atol_check,
     )
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("adjoint_method", ["discrete", "continuous"])
 def test_gradient_atr_rom(adjoint_method):
     def make_model():
         g = torch.Generator().manual_seed(5)
         eye = torch.eye(R, dtype=DTYPE)
         atr_params = [
-            0.3 * torch.randn(R, R, generator=g, dtype=DTYPE),         # K
-            eye + 0.1 * torch.randn(R, R, generator=g, dtype=DTYPE),   # R
-            eye + 0.1 * torch.randn(R, R, generator=g, dtype=DTYPE),   # Q
-            0.2 * torch.randn(R, R, R, generator=g, dtype=DTYPE),      # S
-            0.3 * torch.randn(R, generator=g, dtype=DTYPE),            # Bhat
-            0.3 * torch.randn(R, generator=g, dtype=DTYPE),            # m
-            0.3 * torch.randn(R, M, generator=g, dtype=DTYPE),         # B
+            0.3 * torch.randn(R, R, generator=g, dtype=DTYPE),  # K
+            eye + 0.1 * torch.randn(R, R, generator=g, dtype=DTYPE),  # R
+            eye + 0.1 * torch.randn(R, R, generator=g, dtype=DTYPE),  # Q
+            0.2 * torch.randn(R, R, R, generator=g, dtype=DTYPE),  # S
+            0.3 * torch.randn(R, generator=g, dtype=DTYPE),  # Bhat
+            0.3 * torch.randn(R, generator=g, dtype=DTYPE),  # m
+            0.3 * torch.randn(R, M, generator=g, dtype=DTYPE),  # B
         ]
         return AtrPolynomialModel(
-            R, [1, 2], dtype=DTYPE, atr_params=atr_params,
+            R,
+            [1, 2],
+            dtype=DTYPE,
+            atr_params=atr_params,
             forcing_config={"forcing_exists": True, "m": M},
         )
 
@@ -230,7 +270,8 @@ def test_gradient_atr_rom(adjoint_method):
     assert_grad_close(
         module.gradient(),
         _reference_grad(module, make_model, "rk4", adjoint_method),
-        rtol=1e-4, atol=5e-6,
+        rtol=1e-4,
+        atol=5e-6,
     )
 
 
@@ -243,29 +284,44 @@ def test_nitrom_h_regularization():
         0.3 * torch.randn(R, M, generator=g, dtype=DTYPE),
     ]
     model = PolynomialModel(
-        R, [1, 2], dtype=DTYPE, tensors=tensors,
+        R,
+        [1, 2],
+        dtype=DTYPE,
+        tensors=tensors,
         forcing_config={"forcing_exists": True, "m": M},
     )
-    
+
     proj = _projection()
     registry = ParamRegistry(model, proj)
-    
+
     # Create module with reg = 0.0 and reg = 0.5
     module_no_reg = NitromModule(
-        _data(), registry, fom=_fom(), reg=0.0,
-        n_substeps=10, time_stepper="rk4", adjoint_method="discrete"
+        _data(),
+        registry,
+        fom=_fom(),
+        reg=0.0,
+        n_substeps=10,
+        time_stepper="rk4",
+        adjoint_method="discrete",
     )
     module_with_reg = NitromModule(
-        _data(), registry, fom=_fom(), reg=0.5,
-        n_substeps=10, time_stepper="rk4", adjoint_method="discrete"
+        _data(),
+        registry,
+        fom=_fom(),
+        reg=0.5,
+        n_substeps=10,
+        time_stepper="rk4",
+        adjoint_method="discrete",
     )
-    
+
     loss_no_reg = module_no_reg()
     loss_with_reg = module_with_reg()
-    
+
     # Get H and check loss difference
     H = model.A_2
     expected_reg_term = 0.5 * torch.sum(H * H)
-    
+
     assert torch.allclose(loss_with_reg, loss_no_reg + expected_reg_term, rtol=1e-6)
 
+
+pytestmark = pytest.mark.usefixtures("torch_backend")

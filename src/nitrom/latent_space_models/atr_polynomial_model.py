@@ -94,6 +94,8 @@ class AtrPolynomialModel(GasPolynomialModel):
         atr_params: list | None = None,
         m0: Any = None,
         forcing_config: dict | None = None,
+        *,
+        backend=None,
     ):
         if not (1 in poly_comp and 2 in poly_comp):
             raise ValueError(
@@ -108,6 +110,7 @@ class AtrPolynomialModel(GasPolynomialModel):
             dtype=dtype,
             instability_threshold=instability_threshold,
             gas_params=atr_params,
+            backend=backend,
             forcing_config=forcing_config,
         )
 
@@ -153,11 +156,7 @@ class AtrPolynomialModel(GasPolynomialModel):
         H = bkend.einsum("ilk,lj->ijk", self._S_diff, Qtil)
 
         # Undo the shift: A = Ahat - H:(I x m) - H:(m x I).
-        A = (
-            Ahat
-            - bkend.einsum("ijk,k->ij", H, m)
-            - bkend.einsum("ikj,k->ij", H, m)
-        )
+        A = Ahat - bkend.einsum("ijk,k->ij", H, m) - bkend.einsum("ikj,k->ij", H, m)
         c = self.Bhat - Ahat @ m + bkend.einsum("ijk,j,k->i", H, m, m)
 
         # Cache the unshifted operators for the gradient projection.
@@ -210,7 +209,9 @@ class AtrPolynomialModel(GasPolynomialModel):
         i_A = self.poly_comp.index(1)
         i_H = self.poly_comp.index(2)
         grad_c, grad_A, grad_H = (
-            inner_grads[i_c], inner_grads[i_A], inner_grads[i_H],
+            inner_grads[i_c],
+            inner_grads[i_A],
+            inner_grads[i_H],
         )
 
         # Effective gradients w.r.t. the shifted-frame operators.
@@ -271,9 +272,7 @@ class AtrPolynomialModel(GasPolynomialModel):
         elif Z.ndim == 1:
             m = Z
         else:
-            raise ValueError(
-                f"Z must have 1, 2, or 3 dimensions, got {Z.ndim}."
-            )
+            raise ValueError(f"Z must have 1, 2, or 3 dimensions, got {Z.ndim}.")
         self.set_shift(m)
         return self.m
 
@@ -331,7 +330,7 @@ class AtrPolynomialModel(GasPolynomialModel):
         bkend = self.backend
         lam = bkend.eigh(0.5 * (self._Qtil + self._Qtil.T))[0]
         kappa = float(lam.max()) / float(lam.min())
-        return self.trapping_region_radius() * kappa ** 0.5
+        return self.trapping_region_radius() * kappa**0.5
 
     # ------------------------------------------------------------------
     # Retraction
@@ -380,7 +379,9 @@ class AtrPolynomialModel(GasPolynomialModel):
 
         if len(tensors) == 2:
             A, H = tensors
-            c = bkend.zeros((self.state_dimension,), dtype=self.dtype, device=self.device)
+            c = bkend.zeros(
+                (self.state_dimension,), dtype=self.dtype, device=self.device
+            )
         elif len(tensors) == 3:
             c, A, H = tensors
         else:
@@ -397,11 +398,7 @@ class AtrPolynomialModel(GasPolynomialModel):
         m = bkend.asarray(m, dtype=self.dtype, device=self.device).reshape(-1)
 
         # Shift into the frame centered on m.
-        Ahat = (
-            A
-            + bkend.einsum("ijk,k->ij", H, m)
-            + bkend.einsum("ikj,k->ij", H, m)
-        )
+        Ahat = A + bkend.einsum("ijk,k->ij", H, m) + bkend.einsum("ikj,k->ij", H, m)
         Bhat = c + A @ m + bkend.einsum("ijk,j,k->i", H, m, m)
 
         # Set the shift and constant first: the GAS retraction rebuilds only

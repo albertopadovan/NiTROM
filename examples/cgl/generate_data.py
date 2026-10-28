@@ -31,10 +31,13 @@ def main(argv=None):
             amplitude * columns[j % 2], settings.train_end, settings.save_every
         )
         training.append(X)
-        np.save(data / f"train_traj_{j:03d}.npy", X)
-        np.save(data / f"train_deriv_{j:03d}.npy", time_derivative(X, time))
-    np.save(data / "time.npy", time)
-    np.save(data / "train_amplitudes.npy", amplitudes)
+    np.savez(
+        data / "training.npz",
+        X=np.array(training),
+        dX=np.array([time_derivative(X, time) for X in training]),
+        time=time,
+        amplitudes=amplitudes,
+    )
     impulses = [training[2], training[7]]
     for initial in (0.3 * columns[0], 0.3 * direction):
         _, X = stepper.integrate(initial, settings.train_end, settings.save_every)

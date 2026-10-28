@@ -32,8 +32,6 @@ class Settings:
     adjoint_method: str = "discrete"
     balancing_checkpoints: int = 10
     balancing_stride: int = 5
-    nitrom_checkpoints: int = 1
-    nitrom_stride: int = 5
 
 
 def smoke_settings():

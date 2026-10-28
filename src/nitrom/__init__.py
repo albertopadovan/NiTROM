@@ -2,6 +2,18 @@
 
 from .backend import get_backend, set_backend
 from .bases import compute_data_driven_balancing, compute_pod
+from .checkpointing import (
+    Checkpoint,
+    load_checkpoint,
+    register_checkpoint_type,
+    save_checkpoint,
+)
+from .diagnostics import (
+    check_model_properties,
+    check_projection,
+    compare_gradients,
+    register_model_check,
+)
 from .distributed import cleanup_distributed, setup_distributed
 from .latent_space_models import (
     AtrPolynomialModel,
@@ -30,6 +42,7 @@ from .training_data import TrainingData, TrainingPool
 
 __all__ = [
     "AtrPolynomialModel",
+    "Checkpoint",
     "FixedStepSolution",
     "GasPolynomialModel",
     "InferenceModule",
@@ -44,10 +57,17 @@ __all__ = [
     "Projection",
     "TrainingData",
     "TrainingPool",
+    "check_model_properties",
+    "check_projection",
     "cleanup_distributed",
+    "compare_gradients",
     "compute_data_driven_balancing",
     "compute_pod",
     "get_backend",
+    "load_checkpoint",
+    "register_checkpoint_type",
+    "register_model_check",
+    "save_checkpoint",
     "set_backend",
     "setup_distributed",
     "solve_adjoint_ivp_discrete",

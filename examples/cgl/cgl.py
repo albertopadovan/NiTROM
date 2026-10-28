@@ -61,52 +61,30 @@ class CGL:
         self.A = self._linear_operator()
 
     def _first_derivative(self):
-        nx, dx = self.nx, self.dx
-        f, s = 1.0 / (12 * dx), 1.0 / (2 * dx)
-        rows, cols, data = [], [], []
-        for i in range(2, nx - 2):
-            rows += [i] * 4
-            cols += [i - 2, i - 1, i + 1, i + 2]
-            data += [f, -8 * f, 8 * f, -f]
-        i = 1
-        rows += [i] * 3
-        cols += [i - 1, i + 1, i + 2]
-        data += [-8 * f, 8 * f, -f]
-        i = nx - 2
-        rows += [i] * 3
-        cols += [i - 2, i - 1, i + 1]
-        data += [f, -8 * f, 8 * f]
-        rows += [0]
-        cols += [1]
-        data += [s]
-        rows += [nx - 1]
-        cols += [nx - 2]
-        data += [-s]
-        return sp.csc_array((data, (rows, cols)), shape=(nx, nx))
+        # Truncated fourth-order stencil, with second-order endpoint rows.
+        D = sp.diags(
+            [1, -8, 8, -1],
+            [-2, -1, 1, 2],
+            shape=(self.nx, self.nx),
+            format="lil",
+            dtype=float,
+        ) / (12 * self.dx)
+        D[0, :], D[-1, :] = 0, 0
+        D[0, 1], D[-1, -2] = 1 / (2 * self.dx), -1 / (2 * self.dx)
+        return D.tocsc()
 
     def _second_derivative(self):
-        nx, dx = self.nx, self.dx
-        f, s = 1.0 / (12 * dx**2), 1.0 / dx**2
-        rows, cols, data = [], [], []
-        for i in range(2, nx - 2):
-            rows += [i] * 5
-            cols += [i - 2, i - 1, i, i + 1, i + 2]
-            data += [-f, 16 * f, -30 * f, 16 * f, -f]
-        i = 1
-        rows += [i] * 4
-        cols += [i - 1, i, i + 1, i + 2]
-        data += [16 * f, -30 * f, 16 * f, -f]
-        i = nx - 2
-        rows += [i] * 4
-        cols += [i - 2, i - 1, i, i + 1]
-        data += [-f, 16 * f, -30 * f, 16 * f]
-        rows += [0] * 2
-        cols += [0, 1]
-        data += [-2 * s, s]
-        rows += [nx - 1] * 2
-        cols += [nx - 2, nx - 1]
-        data += [s, -2 * s]
-        return sp.csc_array((data, (rows, cols)), shape=(nx, nx))
+        DD = sp.diags(
+            [-1, 16, -30, 16, -1],
+            [-2, -1, 0, 1, 2],
+            shape=(self.nx, self.nx),
+            format="lil",
+            dtype=float,
+        ) / (12 * self.dx**2)
+        DD[0, :], DD[-1, :] = 0, 0
+        DD[0, :2] = np.array([-2, 1]) / self.dx**2
+        DD[-1, -2:] = np.array([1, -2]) / self.dx**2
+        return DD.tocsc()
 
     def _linear_operator(self):
         muI = sp.diags(self.mu, offsets=0, format="csc")

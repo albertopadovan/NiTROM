@@ -1,15 +1,15 @@
 # Complex Ginzburg–Landau model reduction
 
-This example compares cubic ROMs of the stable complex Ginzburg–Landau equation:
-**balanced OpInf**, **POD OpInf**, and **NiTROM refinements of each**. It follows
-section 4 of Padovan, Vollmer and Bodony, *Data-Driven Model Reduction via
-Non-intrusive Optimization of Projection Operators and Reduced-Order Dynamics*,
-SIADS 23 (2024), [DOI: 10.1137/24M1628414](https://doi.org/10.1137/24M1628414).
-The settings preserve this repository's benchmark rather than exactly reproducing
-the paper's dataset or its TrOOP comparison.
+This example compares **balanced OpInf**, **POD OpInf**, and **NiTROM refinements
+of each** for the stable complex Ginzburg–Landau equation. It follows section 4
+of Padovan, Vollmer and Bodony, *Data-Driven Model Reduction via Non-intrusive
+Optimization of Projection Operators and Reduced-Order Dynamics*, SIADS 23
+(2024), [DOI: 10.1137/24M1628414](https://doi.org/10.1137/24M1628414).
+The settings define this repository's experiment rather than reproducing the
+paper's dataset or its TrOOP comparison.
 
-After installing this checkout with `python -m pip install -e '.[plot]'` from the
-repository root, run from this directory:
+Install from the repository root with `python -m pip install -e '.[plot]'`, then
+run from this directory:
 
 ```bash
 python generate_data.py
@@ -17,67 +17,61 @@ python train_models.py
 python plot_results.py
 ```
 
-`cgl.py` defines the full-order solver, actuator, and sensor. The full profile uses
-256 grid points on `[-50, 50]`, a 512-entry real state `[Re(q); Im(q)]`, and
-CN/AB2 integration with `dt=0.01`. Snapshots are spaced by `0.2`. There are eight
-training impulses: four signed amplitudes `{-1, 0.01, 0.1, 1}` on the actuator's
-real and imaginary columns. Impulse data extend to `t=500`; NiTROM trains through
-`t=200`. Testing includes unseen impulses, 50 seeded ensemble impulses, and six
-sinusoidal inputs through `t=300`. These parameters live in `settings.py`.
+Append `--smoke` to every command for a short run with every model and figure.
+The scripts are single-process; see the [MPI companion](../cgl_mpi/README.md)
+for distributed NiTROM training using the same data and plotting.
 
-`train_models.py` exposes basis construction, regularization selection, and the
-NiTROM setup. It uses public NiTROM APIs for POD, balancing, polynomial dynamics,
-projection, OpInf, and training. Small array-backed views in `_utils.py` provide
-in-memory data to those APIs without requiring a derivative cache for NiTROM.
-DOP853 evaluates ROM predictions with an explicit blow-up event.
+`cgl.py` defines the full-order solver, actuator, and sensor. The full profile
+uses 256 grid points on `[-50, 50]`, real state `[Re(q); Im(q)]`, and CN/AB2
+integration with `dt=0.01`. Snapshots are spaced by `0.2`. Eight training impulses
+use signed amplitudes `{-1, 0.01, 0.1, 1}` on the real and imaginary actuator
+columns. Impulse data extend to `t=500`; NiTROM uses one full trajectory window
+through `t=200`. Testing includes unseen impulses, 50 seeded ensemble impulses,
+and six sinusoidal inputs through `t=300`. Edit these controls in `settings.py`.
 
-Data and fitting conventions:
+`train_models.py` separates basis and OpInf initialization from NiTROM setup and
+training. All states and derivatives are stored in physical units. POD divides
+trajectories by absolute impulse amplitude. Balancing uses physical trajectories,
+ten checkpoints spaced by five samples, and families grouped by signed parent
+amplitude. There is no historical amplitude divide/multiply roundtrip, so
+rounding-sensitive balanced modes and fitted results can differ from older runs.
 
-- All saved states and derivatives are in **physical units**. Signed impulse
-  amplitudes are stored separately. Gaussian actuator profiles have unit norm.
-- POD divides physical trajectories by their absolute impulse amplitudes, preserving
-  the covariance of the former amplitude-normalized data. Balancing uses physical
-  trajectories, ten checkpoints spaced by five samples, and families determined
-  by each parent's signed amplitude. Its input retains the old divide/multiply
-  roundtrip: phase-paired singular values make the rank-5 cutoff sensitive to
-  tiny rounding changes.
-- OpInf omits two derivative samples at each endpoint. Its unaveraged derivative
-  residuals are weighted by inverse mean output energy. Cubic tensor penalties
-  are selected from `10**arange(-2, 9)` using training trajectories only.
-- NiTROM averages energy-normalized output errors over trajectories and samples.
-  Its default uses one full window per trajectory, three RK4 substeps, the discrete
-  adjoint, and 300 optimizer iterations. Trial and test bases are optimized on the
-  Grassmann and Stiefel manifolds; the test-basis QR also transforms the operators.
+OpInf trims two derivative samples from each endpoint. Its unaveraged derivative
+residuals are weighted by inverse mean output energy. Cubic penalties are selected
+from `10**arange(-2, 9)` using training rollouts. NiTROM averages energy-normalized
+output errors over trajectories and samples, using three RK4 substeps, the
+discrete adjoint, and 300 optimizer iterations. Trial and test bases use the
+Grassmann and Stiefel manifolds. Orthonormalizing the test basis also transforms
+the operators to preserve the initialized ROM.
 
-Outputs in `outputs/full/`:
+Training automatically continues each NiTROM refinement from its latest
+checkpoint, appending loss and gradient histories. `--fresh` restarts from
+OpInf. This restores parameters, not optimizer state. Only checkpoint dimensions
+are checked; use `--fresh` after changing the physical problem or training data.
 
-| Directory | Contents |
-| --- | --- |
-| `data/` | Physical trajectories, finite-difference derivatives, amplitudes, reference responses, and settings |
-| `models/` | Four checkpoints with bases, dense operators, selected regularization, histories, and run metadata |
-| `results/` | Cached impulse/forced/ensemble predictions, error curves, energies, and failure metrics |
-| `figures/` | Initial modes, impulse responses, sinusoidal responses, ensemble error, and training-energy plots |
+Outputs are saved under `outputs/full/` or `outputs/smoke/`:
 
-Matching NiTROM checkpoints continue automatically. `--fresh` restarts both
-refinements from their OpInf initializations. This is a parameter warm start;
-optimizer state is not restored. Data/settings mismatches are rejected with an
-instruction to use `--fresh`. Use `--output-dir /path/to/run` on all stages for an
-independent run.
+- `data/`: physical training arrays in `training.npz`, test responses, and settings.
+- `models/`: one current NPZ checkpoint per method, including bases, dense operators,
+  selected regularization where applicable, and loss/gradient histories.
+- `results/`: cached predictions, error curves, and energies.
+- `figures/`: modes, impulse responses, sinusoidal responses, ensemble error,
+  and training energies.
 
-Append `--smoke` to every command for 64 grid points, data through `t=40`, NiTROM
-and forced responses through `t=20`, two ensemble trajectories, and two optimizer
-iterations. Every model and figure remains included. During validation, generation
-took **1.1 s**, training/evaluation **3.2 s**, and first-time plotting **13 s**,
-including process startup and font-cache construction. Full training is much more
-expensive and depends on optimizer convergence; it is excluded from default pytest.
+The public `nitrom.solve_ivp` evaluates ROMs with RK4 and five integration steps
+per saved-sample interval, including during regularization selection. The
+polynomial model returns a zero RHS when the latent-state norm reaches `1e6`;
+integration continues and errors use the returned trajectories directly.
+POD OpInf can perform poorly; the comparison retains that result.
 
-Plotting reads cached results and works without LaTeX; `--tex` enables publication
-styling. Failed rollouts remain NaN, with failure counts in metrics and legends.
-For the ensemble error curve, failures contribute zero predicted output after
-failure rather than being dropped. POD OpInf can perform poorly with these
-settings; the workflow reports that result without retuning the baseline.
+The smoke profile uses 64 grid points, training data through `t=40`, NiTROM and
+forced responses through `t=20`, two ensemble trajectories, and two optimizer
+iterations. Full optimization is excluded from default pytest. Plotting reads
+cached results and works without LaTeX; `--tex` enables it. Use
+`--output-dir /path/to/run` consistently across stages for another run.
+Regenerate data from the old per-trajectory layout.
 
-Full-data migration checks used all eight 256-point training trajectories. Relative
-prediction differences against the compact reference fit were below `1e-10` for
-both bases; the representative NiTROM loss and gradients also agreed. This checks
-the fitting/data migration without running the two full 300-iteration refinements.
+Checkpoints use the public `nitrom.save_checkpoint` / `nitrom.load_checkpoint`
+API. Old `.pkl` checkpoints are not resumed; rerun training to create NPZ
+checkpoints. Plot styling lives in this example's `plot.mplstyle` and is scoped
+to its plotting call.

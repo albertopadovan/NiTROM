@@ -34,7 +34,8 @@ def solve_adjoint_ivp_discrete(
     :param Zint: forward trajectory states over the sub-grid: ``(B, n, n_substeps + 1)``
     :param sub_t: time values of the sub-grid: ``(n_substeps + 1,)``
     :param lam_init: initial adjoint seed state: ``(B, n)``
-    :param method: ``"rk4"``, ``"rk2"``, ``"backward_euler"``, or ``"rk45"``
+    :param method: ``"rk4"``, ``"rk2"``, or ``"backward_euler"``.
+        ``"rk45"`` raises :class:`NotImplementedError`.
     :param stages_G: forward Runge-Kutta stage states from
         :func:`solve_fixed_ivp`, shape ``(n_substeps, s, B, n)`` (or ``(n_substeps, s, n)`` unbatched).  When given,
         the stages are read from here instead of being recomputed, which for
@@ -46,11 +47,11 @@ def solve_adjoint_ivp_discrete(
     :returns: tuple of the final adjoint state and the accumulated parameter
         gradients, or ``None`` for the gradients when *collector* is used
     """
+    if method == "rk45" or method not in _BUTCHER_TABLEAUS:
+        raise NotImplementedError(f"Discrete adjoint not implemented for {method}")
+
     bkend = backend or get_backend()
     lam = bkend.copy(lam_init)
-
-    if method not in _BUTCHER_TABLEAUS:
-        raise NotImplementedError(f"Discrete adjoint not implemented for {method}")
 
     tableau = _BUTCHER_TABLEAUS[method]
     c = tableau["c"]

@@ -1,17 +1,18 @@
 # Examples
 
-Start with **[toymodel](toymodel/README.md)**: a three-state forced ODE and five
-ROMs, with their construction and training visible in one script. Then use
-**[cgl](cgl/README.md)** for a spatially distributed system, empirical balancing,
-cubic dynamics, and generalization to unseen impulses and sinusoidal inputs.
+Start with [toymodel](toymodel/README.md), a three-state forced ODE and five ROMs.
+Then use [cgl](cgl/README.md) for a spatially distributed system, empirical
+balancing, cubic dynamics, and generalization to unseen inputs.
+Use [lorenz96](lorenz96/README.md) for chaotic dynamics, ATR constraints,
+and an independent POD energy analysis before choosing a latent dimension.
 
-Install this checkout from the repository root:
+Install from the repository root:
 
 ```bash
 python -m pip install -e '.[plot]'
 ```
 
-Each example has the same three commands, run from its directory:
+Each single-process example has three stages, run from its directory:
 
 ```bash
 python generate_data.py
@@ -19,22 +20,37 @@ python train_models.py
 python plot_results.py
 ```
 
-Append `--smoke` to **all three commands** for a small installation check. Outputs
-are separated into `outputs/full/` and `outputs/smoke/`; `--output-dir /path/to/run`
-overrides the run directory. Scripts can also be launched by absolute path from
-another working directory. They import the installed package; an editable install
-ensures that package is this checkout.
+Lorenz-96 additionally provides `python pod_energy.py` and requires an explicit
+`--r <dimension>` for training. Its POD energy analysis is optional and does not
+control training. Lorenz-96 checkpoints also validate the training mean.
 
-`train_models.py` automatically continues matching NiTROM checkpoints. Use
-`--fresh` to start those fits from their documented initializations. Continuation
-restores parameters and appends histories; the optimizer starts anew. Data or
-settings mismatches require `--fresh`. Ordinary OpInf and GAS-OpInf are fit again.
+Append `--smoke` to all three commands for a small installation check. Outputs
+live in `outputs/full/` or `outputs/smoke/`. Use `--output-dir /path/to/run` on
+all stages to select another directory. Scripts also work when launched by
+absolute path from another working directory.
 
-Training saves checkpoints and predictions; plotting only reads saved results.
-Figures work without LaTeX. Add `--tex` to `plot_results.py` for publication styling.
-Generated outputs are ignored by Git. No downloaded dataset is required.
+Training automatically continues each NiTROM fit from its latest
+`models/<method>.npz`, using the public `nitrom.checkpointing` API and appending
+loss and gradient histories. The optimizer
+starts anew. `--fresh` ignores those parameters and uses the documented
+initializations. Baseline fits are recomputed on each run. Checkpoints check
+the reduced and full dimensions, plus the training mean for Lorenz-96.
+After changing the data or physical problem, use `--fresh`.
+There is no `--resume` flag.
 
-The smoke profiles exercise the whole workflow, including every model and figure;
-they do not establish the accuracy of the full scientific comparison. Run their
-integration tests with `pytest -q tests/examples`. Full optimization runs remain
-outside default pytest.
+Training data are plain arrays in `data/training.npz`; constant input functions
+are reconstructed from amplitudes. Regenerate data created by the older
+per-trajectory file layout. Training caches predictions and metrics, so plotting
+requires no new solves. Figures work without LaTeX; `--tex` enables it.
+Each example owns its `plot.mplstyle`; styles are scoped to its plotting call.
+Old `.pkl` checkpoints are left untouched and are not resumed. Rerun training
+to create the new NPZ checkpoints.
+
+For distributed training, use the separate [toy MPI companion](toymodel_mpi/README.md)
+or [CGL MPI companion](cgl_mpi/README.md). They reuse the single-process data,
+model construction, output directory, and plotting. The companions show trajectory
+sharding, collective training, and rank-zero saving explicitly.
+
+Smoke runs include every model and figure, but do not establish the accuracy of
+full optimization runs. Run their checks with `pytest -q tests/examples`.
+Generated outputs are ignored by Git.

@@ -309,6 +309,101 @@ Adaptive RK45 uses `atol` and `rtol`; its adjoint reconstructs measurement inter
 and does not differentiate step acceptance or the step-size controller. Gradient
 agreement is therefore limited by adaptive solver tolerances.
 
+## Checkpointing
+
+Use `save_checkpoint` and `load_checkpoint` from `nitrom` or
+`nitrom.checkpointing` to persist a model and an optional projection:
+
+```python
+from nitrom import save_checkpoint, load_checkpoint
+
+save_checkpoint(
+    "models/rom.npz", model, projection,
+    history={"loss": [1.0, 0.2]},
+    metadata={"experiment": "my_case", "reduced_dimension": model.state_dimension},
+)
+saved = load_checkpoint("models/rom.npz")
+model, projection = saved.model, saved.projection
+```
+
+The versioned NPZ archive stores named arrays and a JSON manifest, preserving
+`PolynomialModel`, `GasPolynomialModel`, or `AtrPolynomialModel` parameters and
+`LinearProjection` or `PolynomialProjection` configuration. This includes
+forcing operators, instability thresholds, nonlinear decoder tensors, and the
+linear projection's `biorthogonalize` convention. Cached matrices are rebuilt
+and shared parameters are linked on load. Writes replace the destination
+atomically after the complete archive is written.
+
+Loading uses the active construction backend and CPU by default. Pass
+`backend="numpy"` or `backend="torch"`, `device=...`, and/or `dtype="float32"`
+to convert explicitly, without changing the active backend. Histories and user
+metadata support nested string-keyed dictionaries, lists, tuples, real scalars,
+and numerical arrays; their arrays load as NumPy arrays. A `Checkpoint` record
+can also be passed directly to `save_checkpoint(path, saved)`.
+
+Custom component classes use
+`register_checkpoint_type(name, cls, dump=..., load=...)`. The dump adapter
+returns array/scalar/container state; the load adapter accepts
+`load(state, *, backend, device, dtype)` and reconstructs the component.
+Register adapters before saving or loading their types. Registration uses exact
+types, so a subclass is never silently restored as a built-in base class.
+
+These checkpoints support parameter continuation. Data, forcing callables,
+training-module constraints, and optimizer/scheduler state must be supplied
+again. After training, synchronize the inference module's current parameters
+into the model/projection before saving, as shown in the examples. Existing
+example `.pkl` files are not read by this API; rerun example training to create
+the new archives.
+
+## Setup diagnostics
+
+Run diagnostics explicitly before training or after changing a setup:
+
+```python
+from nitrom.diagnostics import check_model_properties, check_projection, compare_gradients
+
+projection_errors = check_projection(projection, n_samples=10, seed=0)
+gradient_errors = compare_gradients(rom)  # rom is a NitromModule
+stability_metrics = check_model_properties(model)  # GAS or ATR
+```
+
+Each function returns a compact dictionary and prints nothing. Projection and
+model-property failures raise `ValueError`. Gradient discrepancies never raise:
+`compare_gradients` returns overall and per-parameter errors in percent,
+`100 * norm(continuous - discrete) / norm(discrete)`, using the same solver
+settings for both adjoints. A zero discrete gradient gives zero percent if both
+are zero, otherwise infinity; nonfinite gradients give NaN. Frozen parameters
+remain zero, and the original adjoint setting is restored. Distributed gradient
+comparisons must be called on every rank and use globally summed gradients.
+
+`check_projection` checks several seeded standard-normal latent states, without
+changing global random state. Supply `z=` to check your own backend arrays.
+Each state must satisfy `norm(encode(decode(z)) - z) <= atol + rtol * norm(z)`.
+
+`check_model_properties` checks the **unforced** operators structurally. GAS
+requires a positive-definite Lyapunov metric, strictly dissipative linear dynamics,
+and a quadratic term that conserves Lyapunov energy. ATR applies these checks
+after shifting coordinates and reports the radius outside which the Lyapunov
+function decreases and the larger radius containing the trapping ellipsoid.
+The checks inspect the operators actually stored by the model, without
+reassembling them. Both projection and structural checks accept `atol=` and
+`rtol=` (defaults `1e-8` and `1e-5`); positive-definiteness is strict.
+They do not check stability of a chosen time discretization.
+
+Extend model diagnostics without editing a model class:
+
+```python
+from nitrom.diagnostics import register_model_check
+
+@register_model_check(MyModel)
+def check_my_model(model, *, atol, rtol):
+    # Check the model-specific conditions and raise ValueError on failure.
+    return {"margin": model.stability_margin()}
+```
+
+Registration dispatches by model type and follows inheritance. An unregistered
+model, including an ordinary `PolynomialModel`, raises `NotImplementedError`.
+
 ## Backends and parallel training
 
 Select `set_backend("numpy")` or `set_backend("torch")` before constructing data,
@@ -349,12 +444,15 @@ does not initialize MPI.
 
 ## Examples
 
-The [examples guide](examples/README.md) covers two workflows:
+The [examples guide](examples/README.md) covers three workflows:
 
 - [Forced three-state ODE](examples/toymodel/README.md): POD-Galerkin, OpInf,
   GAS-OpInf, NiTROM, and GAS-NiTROM.
 - [Complex Ginzburg–Landau equation](examples/cgl/README.md): POD and empirically
   balanced cubic OpInf models, followed by NiTROM refinement of each.
+- [Lorenz-96](examples/lorenz96/README.md): forced chaotic dynamics, ordinary and
+  ATR-constrained OpInf/NiTROM, and standalone POD energy analysis. Training
+  requires an explicit `--r <dimension>`.
 
 After installing `.[plot]`, run a small complete workflow from the repository root:
 
@@ -369,8 +467,13 @@ commands for the full settings. Outputs go to each example's ignored
 `outputs/smoke/` or `outputs/full/`; use the same `--output-dir` across stages to
 choose another location.
 
-Matching NiTROM checkpoints continue from saved parameters automatically;
-`train_models.py --fresh` restarts the fits. Optimizer state is not restored.
+NiTROM checkpoints continue from saved parameters automatically;
+`train_models.py --fresh` restarts the fits. Checkpoints validate dimensions and,
+for Lorenz-96, the training mean. Use `--fresh` after changing the physical
+problem or data. Optimizer state is not restored.
+The [toy MPI companion](examples/toymodel_mpi/README.md) and
+[CGL MPI companion](examples/cgl_mpi/README.md) introduce distributed NiTROM training
+using the same data generation, model construction, checkpoints, and plotting.
 Plotting reads saved predictions and works without LaTeX; `--tex` enables
 publication styling. The smoke profiles exercise every model and figure but do
 not establish full-profile scientific accuracy.
